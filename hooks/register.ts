@@ -263,8 +263,11 @@ async function rememberShellWrites<R extends { deny?: unknown; isError?: unknown
     if (result.deny === undefined && result.isError !== true) {
       await remember($, shellWrites(command).map(path => [path, languageOf(path) ?? 'other code']))
     }
-  } catch {
-    // A command this could not read is one fewer file in the review, not a stopped command.
+  } catch (err) {
+    // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.
+    try {
+      $.ui.status(`review-guard: could not record the files a shell command wrote (${err instanceof Error ? err.message : String(err)}); ask for a review by hand`)
+    } catch { /* the status line is best effort */ }
   }
   return result
 }

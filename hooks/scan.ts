@@ -440,9 +440,199 @@ const SHELL_WRITE = new RegExp([
 ].join('|'), 'i')
 
 /**
+ * A here-document body and, from its opener's line, the command that reads it (`python -I -`, `cat > n.md`).
+ * `quoted` is `<<'EOF'`: bash then takes the body as it is, with no `$`, backtick or backslash expansion.
+ */
+type Heredoc = { text: string; reader: string; piped: boolean; quoted: boolean }
+
+/**
+ * A command's own lines with every here-document body taken out, and the bodies on their own. Openers
+ * are looked for only outside quotes and `#` comments, so `echo "use <<EOF"` or `cout << endl` in a string
+ * opens nothing, and a body ends only on a line that is exactly its terminator, as in bash (leading tabs
+ * dropped for `<<-`). `complete` is false when the split is a guess: a body with no terminator, a quote
+ * left open at the end of a line, a backtick, or process substitution. Nothing may be trusted on a guess.
+ */
+function heredocs(command: string): { outside: string; bodies: Heredoc[]; complete: boolean } {
+  const lines = command.split('\n')
+  const outside: string[] = []
+  const bodies: Heredoc[] = []
+  let complete = true
+  for (let i = 0; i < lines.length; i++) {
+    const line = (lines[i] ?? '').replace(/\r$/, '')
+    outside.push(line)
+    const masked = line
+      .replace(/<<(-?)\s*(["'])([A-Za-z_][\w-]*)\2/g, '<<$1\x01$3') // keep a quoted terminator's name, marked
+      .replace(/"[^"]*"|'[^']*'/g, '""')
+      .replace(/(^|\s)#.*$/, '$1')
+    // A backslash can escape a quote (`-"\" <<EOF"`), which the masking above can't follow.
+    if (/["'`\\]/.test(masked.replace(/""/g, '')) || line.includes('\\') || /[<>]\(/.test(masked)) complete = false
+    for (const m of masked.matchAll(/(?<!<)<<(?!<)(-?)\s*(\x01?)([A-Za-z_][\w-]*)/g)) {
+      const before = masked.slice(0, m.index).split(/[;&|(]/).pop() ?? ''
+      const after = masked.slice((m.index ?? 0) + m[0].length).split(/[;&]/)[0] ?? ''
+      const ends = (l: string) => (m[1] ? l.replace(/^\t+/, '') : l).replace(/\r$/, '') === m[3]
+      const body: string[] = []
+      while (i + 1 < lines.length && !ends(lines[i + 1] ?? '')) body.push(lines[++i] ?? '')
+      if (i + 1 < lines.length) i++ // the terminator line
+      else complete = false
+      const [reads = '', ...rest] = after.split('|')
+      bodies.push({ text: body.join('\n'), reader: `${before} ${reads}`.trim(), piped: rest.length > 0, quoted: m[2] !== '' })
+    }
+  }
+  return { outside: outside.join('\n'), bodies, complete }
+}
+
+// Strip a command's path and `.exe`: `.venv/bin/python3.exe` is `python3`.
+const commandName = (word: string) => word.replace(/^.*[\/\\]/, '').replace(/\.exe$/i, '').toLowerCase()
+// Interpreters whose script, run outside the here-documents, is only run. perl is left out on purpose
+// (`perl -pi -e ... app.py` edits the file it names), and so is deno (`deno eval` runs inline code).
+const INTERPRETER = /^(?:python[\d.]*|py|node|bun|bash|sh|zsh|pwsh|powershell)$/
+// Outside the here-documents, every command must be an interpreter or one of these, which write nothing
+// but their redirects (caught on their own). Anything else (`git checkout`, `rsync`, `unzip`, `ruff
+// format`, `chmod +x gen && ./gen`) might write code, so the exception is off.
+// (`sort -o` and `uniq in out` write, so they are not here.)
+const READ_ONLY = /^(?:cat|echo|printf|ls|dir|tail|head|grep|rg|wc|cd|pwd|true|get-content|get-childitem|select-object|select-string|write-output|write-host)$/
+// The flags an interpreter may have and still be running a file (or stdin), never inline code or a module.
+// Listing the bad ones misses spellings (`python -Ic`, `node -pe`, `node --eval`, `deno eval`), so these
+// are the only ones: Python's isolation, buffering and warning flags, the `py` launcher's version, and
+// PowerShell's `-File`. A flag that takes a value (`-X utf8`, `-W ignore`) takes the next word with it.
+const SAFE_FLAG = /^-(?:[IuBEsSO]+|OO|\d+(?:\.\d+)?(?:-(?:32|64))?|NoProfile|NonInteractive|NoLogo|File)$/i
+const FLAG_WITH_VALUE = /^-[XW]$/
+/**
+ * What an interpreter command runs: its script, `-` for stdin, `''` for nothing named (it reads stdin),
+ * or undefined when a flag is not on the list and might mean inline code or a module.
+ */
+function runTarget(words: string[]): string | undefined {
+  const takesFlags = /^(?:python[\d.]*|py|pwsh|powershell)$/.test(commandName(words[0] ?? '')) // node, bun, shells: none
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i] ?? ''
+    if (w === '-' || !w.startsWith('-')) return w
+    if (!takesFlags) return undefined
+    if (FLAG_WITH_VALUE.test(w)) i++
+    else if (!SAFE_FLAG.test(w)) return undefined
+  }
+  return ''
+}
+// Names that reach any function without calling it by a listed name (`eval`, `getattr`, `exec`,
+// `process`, `globalThis`, `fs['x']`, dynamic `import()`), or a `/`: Python's path join (`Path('a') / name`)
+// builds a name OPENS can't see. Division, a Node regex and a `//` comment are caught too: that only costs a review.
+const RISKY_CODE = /\b(?:exec|eval|compile|__import__|importlib|builtins|__builtins__|__dict__|__class__|getattr|setattr|delattr|globals|locals|vars|breakpoint|runpy|global|globalThis|process|module|Function|constructor|prototype|__proto__|Bun|Deno)\b|\bimport\s*\(|\b(?:fs|\))\s*\[|\//
+// Every call that opens a file, or loads a module, must take a plain string literal, then `,` or `)`.
+// Anything else (a slice, `%`, a variable, `scandir` entries, `o = open`) may name a code file.
+// A path takes exactly one: `Path('src', '..', 'app.py')` joins its parts.
+const OPENS = /\b(?:open|openSync|require|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream)\b(?!\s*\(\s*""\s*[,)])|\b(?:Path|PurePath|PosixPath|WindowsPath)\b(?!\s*\(\s*""\s*\))/
+// The file names those calls open, read from the unmasked body.
+const OPENED = /\b(?:open|openSync|Path|PurePath|PosixPath|WindowsPath|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream)\s*\(\s*(?:"([^"\n]*)"|'([^'\n]*)')/g
+// Modules a trusted body may load: none of them reaches a process or another file but through the calls below.
+const SAFE_MODULES = new Set(['json', 'datetime', 'pathlib', 'time', 'textwrap', 're', 'sys', 'fs', 'node:fs'])
+// The only functions and attributes a trusted body may use. Python and Node have more ways to write a
+// file than any list of them (`io.FileIO`, `fs.WriteStream`, `fs.truncateSync`), so instead every call
+// and every `.name` must be one of these: the openers above (which must take a literal), and calls that
+// read, format or print. A function the body defines itself is not here either, so it is not trusted.
+const SAFE_NAMES = new Set([
+  // control flow and Python builtins that write nothing
+  'if', 'elif', 'for', 'while', 'with', 'return', 'not', 'and', 'or', 'in', 'print', 'len', 'str', 'int', 'float',
+  'bool', 'list', 'dict', 'set', 'tuple', 'sorted', 'reversed', 'enumerate', 'range', 'zip', 'min', 'max', 'sum',
+  'any', 'all', 'isinstance', 'repr', 'round', 'abs', 'map', 'filter',
+  // opening (checked by OPENS) and reading or writing an opened file
+  'open', 'Path', 'pathlib', 'write', 'write_text', 'read', 'read_text', 'readlines', 'exists', 'is_file', 'is_dir',
+  'mkdir', 'require', 'writeFileSync', 'appendFileSync', 'readFileSync', 'existsSync', 'mkdirSync', 'fs',
+  // strings, lists and dicts (not `replace`: `Path('a').replace('b')` moves a file)
+  'strip', 'rstrip', 'lstrip', 'split', 'splitlines', 'lower', 'upper', 'title', 'startswith', 'endswith', 'encode',
+  'join', 'format', 'ljust', 'rjust', 'zfill',
+  'append', 'extend', 'insert', 'pop', 'get', 'items', 'keys', 'values', 'update', 'count', 'index', 'find',
+  'push', 'forEach', 'trim', 'includes', 'toString', 'padStart', 'padEnd', 'length',
+  // json, dates and console output
+  'json', 'dump', 'dumps', 'load', 'loads', 'JSON', 'stringify', 'parse', 'console', 'log', 'datetime', 'date',
+  'now', 'today', 'isoformat', 'strftime', 'toISOString', 'Date',
+  // regular expressions, and UTF-8 output on Windows (`sys.stdout.reconfigure(encoding='utf-8')`)
+  're', 'sub', 'match', 'search', 'findall', 'fullmatch', 'group', 'sys', 'stdout', 'reconfigure',
+])
+// A name the body calls (`name(`) or reaches (`.name`), or imports (`from os import truncate`).
+function usedNames(plain: string): string[] {
+  const names = [...plain.matchAll(/(?<![\w.])([A-Za-z_]\w*)\s*\(|\.\s*([A-Za-z_]\w*)/g)].map(m => m[1] ?? m[2] ?? '')
+  for (const m of plain.matchAll(/^\s*from\s+\S+\s+import\s+(.+)$/gm)) names.push(...(m[1] ?? '').split(/[\s,()]+/).filter(n => n && n !== 'as'))
+  return names
+}
+// Modules a body loads: `import a, b as c`, `from a.b import c`, `require('fs')`.
+function loadedModules(text: string): string[] {
+  const mods: string[] = []
+  for (const m of text.matchAll(/^\s*import\s+([^"'\n]+)$/gm)) mods.push(...(m[1] ?? '').split(',').map(s => s.trim().split(/\s+/)[0] ?? ''))
+  for (const m of text.matchAll(/^\s*from\s+(\S+)\s+import\b/gm)) mods.push(m[1] ?? '')
+  // Node: `require('fs')`, and for ES imports the module, not the name it is bound to (`import fs from 'x'`).
+  for (const m of text.matchAll(/\b(?:require\s*\(|from|import)\s*(?:"([^"\n]*)"|'([^'\n]*)')/g)) mods.push(m[1] ?? m[2] ?? '')
+  return mods
+}
+// The same file spelled two ways (`./gen.txt`, `gen.txt`, `GEN.TXT` on Windows) is one file.
+const sameFile = (name: string) => name.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').toLowerCase()
+
+const REDIRECT = /\d?>>?\s*([^\s<>]+)/g
+
+/**
+ * Code files that a command only runs, never writes, so they need no review, and the command's own text
+ * outside its here-documents (what the bodies say is not a mention). Kept narrow on purpose, as an
+ * allowlist: every command outside is an interpreter or a read-only tool, and every here-document is
+ * either `cat` data or Python/Node code read from stdin whose every file-opening call takes a plain
+ * literal that is not code (Claude writing notes, then running a script). Anything else, or anything the
+ * bodies write being run afterwards, and the run scripts count again.
+ */
+function onlyRun(command: string): { outside: string; runs: Map<string, number> } | undefined {
+  const { outside, bodies, complete } = heredocs(command)
+  if (!complete || outside.includes('$') || SHELL_WRITE.test(outside)) return undefined
+  const written = new Set<string>() // what the bodies write: running one of these runs new code
+  for (const body of bodies) {
+    if (body.piped) return undefined // `cat <<EOF | bash`: the body goes on to something else
+    if (!body.quoted && /[$`\\]/.test(body.text)) return undefined // bash expands an unquoted body first
+    const targets = [...body.reader.matchAll(REDIRECT)].map(m => m[1] ?? '')
+    const reader = body.reader.replace(REDIRECT, '').trim()
+    if (targets.includes('""')) return undefined // a quoted target was masked: its name is unknown
+    targets.forEach(t => written.add(sameFile(t)))
+    if (/^\S*?cat(?:\.exe)?(?:\s+-\S*)*$/i.test(reader)) continue // data, written where the redirect says
+    // Only Python or Node reading the body as its code: not a shell, a script reading stdin, or inline code.
+    const words = reader.split(/\s+/)
+    if (!/^(?:python[\d.]*|py|node|bun)$/.test(commandName(words[0] ?? '')) || !['', '-'].includes(runTarget(words) ?? 'x')) return undefined
+    const plain = body.text.replace(/"[^"\n]*"|'[^'\n]*'/g, '""')
+    // A name built in code (`'a' + b`, a slice, `%`, `'app.p' 'y'`) can't reach a write: OPENS wants a plain literal.
+    if (RISKY_CODE.test(plain) || OPENS.test(plain)) return undefined
+    if (usedNames(plain).some(n => !SAFE_NAMES.has(n)) || /\}\s*=/.test(plain)) return undefined // `{truncateSync} = require('fs')`
+    if (loadedModules(body.text).some(m => !SAFE_MODULES.has(m))) return undefined
+    for (const m of body.text.matchAll(OPENED)) {
+      const name = m[1] ?? m[2] ?? ''
+      // Plain ASCII only: an escape (`'app\x2epy'`) or another script could spell a code file's name. And
+      // no trailing dot or space: Windows opens `app.py.` and `app.py ` as `app.py`.
+      if (!/^[A-Za-z0-9 _.\/-]*[A-Za-z0-9_]$/.test(name) || languageOf(name)) return undefined
+      written.add(sameFile(name))
+    }
+  }
+  const masked = outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""').replace(/\d*>&\d+/g, '')
+  const runs = new Map<string, number>()
+  for (const cmd of masked.split(/&&|\|\||[;&\n]/)) {
+    for (const [i, part] of cmd.split('|').entries()) {
+      const words = part.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(REDIRECT, '')
+      if (words.includes('<')) return undefined // `bash < gen.txt` runs a file the bodies may have written
+      const argv = words.trim().split(/\s+/)
+      const name = commandName(argv[0] ?? '')
+      if (!name) continue
+      if (!INTERPRETER.test(name)) {
+        if (READ_ONLY.test(name)) continue
+        return undefined
+      }
+      const target = runTarget(argv)
+      if (i > 0 || target === undefined) return undefined // reads a pipe, or a flag that may be inline code
+      if (target) runs.set(target, (runs.get(target) ?? 0) + 1)
+    }
+  }
+  // Any word naming a file the bodies wrote may run it (`python -X utf8 gen.txt`, `sh ./gen`).
+  const words = outside.replace(REDIRECT, '').split(/[\s;&|()]+/).map(w => sameFile(w.replace(/["']/g, '')))
+  if (words.some(w => written.has(w))) return undefined
+  return { outside, runs }
+}
+
+/**
  * The code files a shell command writes, as the command names them. A redirect counts for its target
- * alone. Any other writing command counts for every code file it names, which can include one it only
- * reads: an extra review is the safer mistake than a change nobody looked at.
+ * alone. When anything else in the command writes, every code file it names counts, which can include
+ * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
+ * safer mistake than a change nobody looked at. The one exception is `onlyRun`: a script run after
+ * here-documents that only write notes.
  */
 export function shellWrites(fullCommand: string): string[] {
   const command = localPart(fullCommand) // what ssh runs on another machine writes no file here
@@ -455,12 +645,15 @@ export function shellWrites(fullCommand: string): string[] {
     if (languageOf(target)) out.add(target)
   }
   if (SHELL_WRITE.test(command)) {
+    const trusted = onlyRun(command)
     // Shell words, quotes kept together: "$DST/hooks/a.ts" is one word, not "$DST" and "/hooks/a.ts".
-    for (const raw of command.match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
+    const mentions = new Map<string, number>()
+    for (const raw of (trusted?.outside ?? command).match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
       if (notAName(raw)) continue
       const word = raw.replace(/["']/g, '')
-      if (word.length > 2 && !word.startsWith('-') && languageOf(word)) out.add(word)
+      if (word.length > 2 && !word.startsWith('-') && languageOf(word)) mentions.set(word, (mentions.get(word) ?? 0) + 1)
     }
+    for (const [word, count] of mentions) if ((trusted?.runs.get(word) ?? 0) < count) out.add(word)
   }
   return [...out]
 }
