@@ -282,6 +282,37 @@ test('fixes made during a review are not sent back, however the reports arrive',
   expect(next?.includes('app.py')).toBe(false)
 })
 
+test('a reload of the mod in the middle of a review does not send its fixes for another review', async ($, on) => {
+  // The copy of the mod before the reload left this in the session's state; this copy starts fresh.
+  let seeded = false
+  on('state.get', ($, e, next) => {
+    if (seeded) return next(e)
+    seeded = true
+    return { value: { value: { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' } }, version: 0 } }
+  })
+  const { out, edit, stop } = cycle($, on)
+  out.agents = [{ status: 'running' }]
+  // The review's fix, made after the reload while a reviewer is still out.
+  await edit('C:/proj/app.py')
+  expect(await stop()).toBe(undefined)
+  // The last report, and the review ends: still no second review of its fixes.
+  out.agents = [{ status: 'completed' }]
+  await edit('C:/proj/app.py')
+  expect(await stop()).toBe(undefined)
+  // New work after it is reviewed as usual.
+  await edit('C:/proj/next.py')
+  const prompt = await stop()
+  expect(prompt?.includes('next.py')).toBe(true)
+  expect(prompt?.includes('app.py')).toBe(false)
+})
+
+test('edits that finish at the same moment are all remembered', async ($, on) => {
+  const { edit, stop } = cycle($, on)
+  await Promise.all(['a.py', 'b.py', 'c.py', 'd.py'].map(f => edit(`C:/proj/${f}`)))
+  const prompt = await stop()
+  for (const f of ['a.py', 'b.py', 'c.py', 'd.py']) expect(prompt?.includes(f)).toBe(true)
+})
+
 test('a new request in the middle of a review gets its own review', async ($, on) => {
   const { out, edit, stop } = cycle($, on)
   await edit('C:/proj/app.py')

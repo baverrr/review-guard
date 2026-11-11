@@ -1,5 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { REVIEW_AGENTS } from './agents'
+import type { Cycle } from '../types'
 import {
   isNewRequest,
   type Finding,
@@ -33,15 +34,47 @@ type Config = { personal: string[]; allowNetworkInfo: string[]; allowValues: str
 
 const CONFIG_NAME = '.claude/review-guard.json'
 
-const changed = new Map<string, string>() // path -> language, the code edits not yet sent for review
-let reviewing = false // a review this mod asked for is running: its own fixes aren't sent for another
-let held = false // the user interrupted a turn: no review is asked for until work on code picks up again
-let underReview = new Map<string, string>() // what the running review covers, put back if it is interrupted
+// The review cycle's memory lives in the session's state, not in module variables: the engine
+// reloads the module whenever its files change (and when its worker is lost), and a reload in the
+// middle of a review used to forget the review was running, so its own fixes were reviewed again.
+const CYCLE = { plugin: 'review-guard', key: 'cycle' } as const
+const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {} }
 
-/** A code file was just changed: it waits for a review, and an interrupted task has picked up again. */
-function remember(path: string, lang: string): void {
-  changed.set(path, lang)
-  held = false
+/** The cycle as stored, with anything missing or malformed read as empty. */
+async function readCycle($: EngineInterface): Promise<{ cycle: Cycle; version: number }> {
+  const { value, version } = await $.state.get(CYCLE)
+  const files = (v: unknown): Record<string, string> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
+      : {}
+  const cycle: Cycle = value === undefined
+    ? { ...EMPTY }
+    : { reviewing: value.reviewing === true, held: value.held === true, changed: files(value.changed), underReview: files(value.underReview) }
+  return { cycle, version }
+}
+
+/**
+ * Reads the cycle, lets `change` edit a copy, and writes it back only if nobody wrote in between
+ * (two tool calls can finish at once); on a clash it reads again and redoes the change.
+ * Resolves what `change` returned on the attempt that was written.
+ */
+async function updateCycle<T>($: EngineInterface, change: (c: Cycle) => T): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const { cycle, version } = await readCycle($)
+    const result = change(cycle)
+    const { isSet } = await $.state.set(CYCLE, cycle, { ifVersion: version })
+    if (isSet) return result
+    if (attempt >= 8) throw new Error('review-guard: the review state kept changing underneath it')
+  }
+}
+
+/** Code files were just changed: they wait for a review, and an interrupted task has picked up again. */
+async function remember($: EngineInterface, files: [string, string][]): Promise<void> {
+  if (files.length === 0) return
+  await updateCycle($, c => {
+    for (const [path, lang] of files) c.changed[path] = lang
+    c.held = false
+  })
 }
 
 const BUSY = new Set(['pending', 'running', 'waiting']) // an agent that has not handed back yet
@@ -203,10 +236,10 @@ async function findingsFor($: EngineInterface, action: GitAction, config: Config
  * Code is also changed from a shell (sed -i, a redirect, a script that writes files). Once a shell
  * command has run, the code files it wrote are remembered for the review. Never throws: it only remembers.
  */
-function rememberShellWrites<R extends { deny?: unknown; isError?: unknown }>(result: R, command: string): R {
+async function rememberShellWrites<R extends { deny?: unknown; isError?: unknown }>($: EngineInterface, result: R, command: string): Promise<R> {
   try {
     if (result.deny === undefined && result.isError !== true) {
-      for (const path of shellWrites(command)) remember(path, languageOf(path) ?? 'other code')
+      await remember($, shellWrites(command).map(path => [path, languageOf(path) ?? 'other code']))
     }
   } catch {
     // A command this could not read is one fewer file in the review, not a stopped command.
@@ -234,13 +267,16 @@ export const register: Register = on => {
 
   // --- 1. remember the code a turn changes --------------------------------------------------
 
-  on('prompt.submit', ($, e, next) => {
+  on('prompt.submit', async ($, e, next) => {
     // A new request from the user in the middle of a review ends it early, so the edits that follow
     // get a review of their own. Reports, notices and anything unlabelled are part of the review.
     const asUser = e.origin.kind === 'plugin' && e.origin.asUser === true
-    if (reviewing && isNewRequest(e.origin.kind, e.isMeta === true, asUser)) {
-      reviewing = false
-      changed.clear() // what the review's own agents wrote (scratch files, fixes) is not new work
+    if (isNewRequest(e.origin.kind, e.isMeta === true, asUser)) {
+      await updateCycle($, c => {
+        if (!c.reviewing) return
+        c.reviewing = false
+        c.changed = {} // what the review's own agents wrote (scratch files, fixes) is not new work
+      })
     }
     return next(e)
   }).catch(($, e, next) => next(e)) // only keeps a flag: a failure must never stop a prompt
@@ -250,7 +286,7 @@ export const register: Register = on => {
     if (result.deny === undefined && result.isError !== true) {
       const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
       const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
-      if (lang) remember(path, lang)
+      if (lang) await remember($, [[path, lang]])
     }
     return result
   }).catch(($, e, next) => next(e)) // only remembers: a failure must never stop an edit
@@ -258,11 +294,13 @@ export const register: Register = on => {
   // The user stopped the main turn part way: the work is unfinished, so no review is asked for yet.
   // A review that was itself interrupted gives its files back to the queue.
   // A review whose turn died on an API error or a refusal also gives its files back, without the hold.
-  on('turn.complete', ($, e, next) => {
+  on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && e.reason !== 'answer') {
-      if (reviewing) for (const [path, lang] of underReview) if (!changed.has(path)) changed.set(path, lang)
-      reviewing = false
-      if (e.reason === 'aborted') held = true
+      await updateCycle($, c => {
+        if (c.reviewing) for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
+        c.reviewing = false
+        if (e.reason === 'aborted') c.held = true
+      })
     }
     return next(e)
   }).catch(($, e, next) => next(e)) // only keeps flags: a failure must never change how a turn ends
@@ -272,28 +310,36 @@ export const register: Register = on => {
   on('classic.Stop', async ($, e, next) => {
     const settled = await next(e)
     if (settled.block) return settled
-    if (reviewing) {
-      // The review is over at the first stop with no agent still out. Until then the reviewers'
-      // reports come back as turns of this review. Its own fixes are not sent for another review.
-      // If the agents cannot be listed, the review ends here rather than holding every later review back.
-      const agents = await $.agent.list().catch(() => [])
-      if (agents.some(a => BUSY.has(a.status))) return settled
-      reviewing = false
-      changed.clear()
+    // Read once, outside the update, so the agent list is not asked for again on a write clash.
+    const { cycle } = await readCycle($)
+    // If the agents cannot be listed, the review ends here rather than holding every later review back.
+    const busy = cycle.reviewing && (await $.agent.list().catch(() => [])).some(a => BUSY.has(a.status))
+    const ask = await updateCycle($, (c): string | undefined => {
+      if (c.reviewing) {
+        // The review is over at the first stop with no agent still out. Until then the reviewers'
+        // reports come back as turns of this review. Its own fixes are not sent for another review.
+        if (!busy) {
+          c.reviewing = false
+          c.changed = {}
+        }
+        return undefined
+      }
+      // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
+      const files = Object.keys(c.changed).length
+      if (c.held && files > 0) return `held:${files}`
+      if (e.stop_hook_active || files === 0) return undefined
+      const prompt = reviewPrompt(new Map(Object.entries(c.changed)))
+      c.underReview = c.changed
+      c.changed = {}
+      c.reviewing = true
+      return prompt
+    })
+    if (ask?.startsWith('held:')) {
+      // The status line says so, so the queue is never silent.
+      $.ui.status(`review-guard: review of ${ask.slice(5)} changed file(s) held after your interrupt; it runs when work on code resumes`)
       return settled
     }
-    // After an interrupt the files stay queued, and the review comes with the next turn that changes
-    // code. The status line says so, so the queue is never silent.
-    if (held && changed.size > 0) {
-      $.ui.status(`review-guard: review of ${changed.size} changed file(s) held after your interrupt; it runs when work on code resumes`)
-      return settled
-    }
-    if (e.stop_hook_active || changed.size === 0) return settled
-    const prompt = reviewPrompt(changed)
-    underReview = new Map(changed)
-    changed.clear()
-    reviewing = true
-    return { ...settled, block: prompt }
+    return ask === undefined ? settled : { ...settled, block: ask }
   }).catch(($, e, next) => next(e)) // a failed check lets the turn end as it would have
 
   // --- 3. keep secrets and personal data out of GitHub ---------------------------------------
@@ -308,7 +354,7 @@ export const register: Register = on => {
       if (local !== e.command && /\bgit\b[^;&|\n]*\b(?:commit|push)\b/.test(e.command)) {
         $.ui.status('review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here')
       }
-      return rememberShellWrites(await next(e), e.command)
+      return rememberShellWrites($, await next(e), e.command)
     }
     let remotes: string[] = []
     let toGitHub = false
@@ -319,7 +365,7 @@ export const register: Register = on => {
       // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
       toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
     }
-    if (!toGitHub && !gh) return rememberShellWrites(await next(e), e.command)
+    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command)
     const { config, note } = await loadConfig($)
     const notes = note ? [note] : []
     const found: Finding[] = []
@@ -331,7 +377,7 @@ export const register: Register = on => {
     $.ui.status(notes.length > 0
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
       : `review-guard: ${what} checked, nothing personal or secret found`)
-    return rememberShellWrites(await next(e), e.command)
+    return rememberShellWrites($, await next(e), e.command)
   }).catch(($, e, next) =>
     next.called ? next(e) : {
       deny: `review-guard could not check this command, so it stopped it (${next.error.message ?? next.error.kind}). If the command names ` +
