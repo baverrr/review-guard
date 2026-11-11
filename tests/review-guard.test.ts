@@ -239,6 +239,19 @@ test('registers the five review agents when the mod loads, for sessions already 
 
 type Status = 'pending' | 'running' | 'waiting' | 'idle' | 'completed'
 
+/**
+ * Plays back what the mod's copy before a reload stored: the first read of the review state answers
+ * `value` (as an unwritten key would, at version 0), and every later read goes to the kit's store.
+ */
+function seed(on: On, value: unknown) {
+  let seeded = false
+  on('state.get', ($, e, next) => {
+    if (seeded || e.plugin !== 'review-guard' || e.key !== 'cycle') return next(e)
+    seeded = true
+    return { value: { value: value as never, version: 0 } }
+  })
+}
+
 /** Stands for the engine under the review cycle; `agents` is what is still out, changed by the test. */
 function cycle($: Engine, on: On) {
   const out = { agents: [] as { status: Status }[] }
@@ -284,12 +297,7 @@ test('fixes made during a review are not sent back, however the reports arrive',
 
 test('a reload of the mod in the middle of a review does not send its fixes for another review', async ($, on) => {
   // The copy of the mod before the reload left this in the session's state; this copy starts fresh.
-  let seeded = false
-  on('state.get', ($, e, next) => {
-    if (seeded) return next(e)
-    seeded = true
-    return { value: { value: { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' } }, version: 0 } }
-  })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' } })
   const { out, edit, stop } = cycle($, on)
   out.agents = [{ status: 'running' }]
   // The review's fix, made after the reload while a reviewer is still out.
@@ -304,6 +312,31 @@ test('a reload of the mod in the middle of a review does not send its fixes for 
   const prompt = await stop()
   expect(prompt?.includes('next.py')).toBe(true)
   expect(prompt?.includes('app.py')).toBe(false)
+})
+
+for (const [name, bad] of [['null', null], ['a list', []], ['text', 'x'], ['wrong types', { reviewing: 'yes', changed: ['x'], underReview: { 'a.py': 5 } }]] as const) {
+  test(`a stored value that is ${name} is read as empty, and reviews carry on`, async ($, on) => {
+    seed(on, bad)
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/a.py')
+    expect((await stop())?.includes('a.py')).toBe(true)
+  })
+}
+
+test('a save that fails loses no edit and says so', async ($, on) => {
+  const status: string[] = []
+  on('state.set', () => ({ deny: 'refused' }))
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/a.py')
+  await edit('C:/proj/b.py')
+  const prompt = await stop()
+  expect(prompt?.includes('a.py')).toBe(true)
+  expect(prompt?.includes('b.py')).toBe(true)
+  expect(status.some(s => s.includes('could not save'))).toBe(true)
 })
 
 test('edits that finish at the same moment are all remembered', async ($, on) => {

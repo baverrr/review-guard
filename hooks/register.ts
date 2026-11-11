@@ -34,38 +34,57 @@ type Config = { personal: string[]; allowNetworkInfo: string[]; allowValues: str
 
 const CONFIG_NAME = '.claude/review-guard.json'
 
-// The review cycle's memory lives in the session's state, not in module variables: the engine
-// reloads the module whenever its files change (and when its worker is lost), and a reload in the
-// middle of a review used to forget the review was running, so its own fixes were reviewed again.
+// The review cycle. The module keeps it in memory, where changes cannot clash (the module runs one
+// thing at a time), and copies each change to the session's state, which outlives a reload: the
+// engine reloads the module whenever its files change, and a reload in the middle of a review used
+// to forget the review was running, so its own fixes were reviewed again. After a reload the first
+// hook reads the copy back. A failed copy loses nothing now; it only risks that after a reload.
 const CYCLE = { plugin: 'review-guard', key: 'cycle' } as const
 const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {} }
 
-/** The cycle as stored, with anything missing or malformed read as empty. */
-async function readCycle($: EngineInterface): Promise<{ cycle: Cycle; version: number }> {
-  const { value, version } = await $.state.get(CYCLE)
-  const files = (v: unknown): Record<string, string> =>
-    typeof v === 'object' && v !== null && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
-      : {}
-  const cycle: Cycle = value === undefined
-    ? { ...EMPTY }
-    : { reviewing: value.reviewing === true, held: value.held === true, changed: files(value.changed), underReview: files(value.underReview) }
-  return { cycle, version }
+let cycle: Cycle = copyOf(EMPTY)
+let loaded: Promise<void> | undefined // reading the copy back, once per load of the module
+let saving: Promise<void> = Promise.resolve() // the copies, written one after another
+
+function copyOf(c: Cycle): Cycle {
+  return { reviewing: c.reviewing, held: c.held, changed: { ...c.changed }, underReview: { ...c.underReview } }
 }
 
-/**
- * Reads the cycle, lets `change` edit a copy, and writes it back only if nobody wrote in between
- * (two tool calls can finish at once); on a clash it reads again and redoes the change.
- * Resolves what `change` returned on the attempt that was written.
- */
+/** A stored value as a cycle, with anything missing or malformed (null, wrong types) read as empty. */
+export function cycleFrom(value: unknown): Cycle {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return copyOf(EMPTY)
+  const v = value as Record<string, unknown>
+  const files = (x: unknown): Record<string, string> =>
+    typeof x === 'object' && x !== null && !Array.isArray(x)
+      ? Object.fromEntries(Object.entries(x).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
+      : {}
+  return { reviewing: v.reviewing === true, held: v.held === true, changed: files(v.changed), underReview: files(v.underReview) }
+}
+
+/** Reads the copy back after a reload; every hook waits for it before using the cycle. */
+function ensureLoaded($: EngineInterface): Promise<void> {
+  loaded ??= $.state.get(CYCLE).then(
+    ({ value }) => { cycle = cycleFrom(value) },
+    () => { $.ui.status('review-guard: could not read back its review state; a review running before the reload may be asked for again') },
+  )
+  return loaded
+}
+
+/** Copies the cycle as it stands when the write runs, after any earlier write; says so if it fails. */
+function save($: EngineInterface): Promise<void> {
+  saving = saving.then(() => $.state.set(CYCLE, copyOf(cycle))).then(
+    () => undefined,
+    () => { $.ui.status('review-guard: could not save its review state; if the mod reloads now, a running review may be asked for again') },
+  )
+  return saving
+}
+
+/** Applies `change` to the cycle once it is loaded, saves the copy, and resolves what `change` returned. */
 async function updateCycle<T>($: EngineInterface, change: (c: Cycle) => T): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    const { cycle, version } = await readCycle($)
-    const result = change(cycle)
-    const { isSet } = await $.state.set(CYCLE, cycle, { ifVersion: version })
-    if (isSet) return result
-    if (attempt >= 8) throw new Error('review-guard: the review state kept changing underneath it')
-  }
+  await ensureLoaded($)
+  const result = change(cycle)
+  await save($)
+  return result
 }
 
 /** Code files were just changed: they wait for a review, and an interrupted task has picked up again. */
@@ -76,6 +95,9 @@ async function remember($: EngineInterface, files: [string, string][]): Promise<
     c.held = false
   })
 }
+
+/** What the end of a turn asks for: a review, a word that one is held, or nothing. */
+type StopAsk = { kind: 'review'; prompt: string } | { kind: 'held'; files: number } | undefined
 
 const BUSY = new Set(['pending', 'running', 'waiting']) // an agent that has not handed back yet
 
@@ -310,11 +332,10 @@ export const register: Register = on => {
   on('classic.Stop', async ($, e, next) => {
     const settled = await next(e)
     if (settled.block) return settled
-    // Read once, outside the update, so the agent list is not asked for again on a write clash.
-    const { cycle } = await readCycle($)
+    await ensureLoaded($)
     // If the agents cannot be listed, the review ends here rather than holding every later review back.
     const busy = cycle.reviewing && (await $.agent.list().catch(() => [])).some(a => BUSY.has(a.status))
-    const ask = await updateCycle($, (c): string | undefined => {
+    const ask = await updateCycle($, (c): StopAsk => {
       if (c.reviewing) {
         // The review is over at the first stop with no agent still out. Until then the reviewers'
         // reports come back as turns of this review. Its own fixes are not sent for another review.
@@ -326,20 +347,20 @@ export const register: Register = on => {
       }
       // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
       const files = Object.keys(c.changed).length
-      if (c.held && files > 0) return `held:${files}`
+      if (c.held && files > 0) return { kind: 'held', files }
       if (e.stop_hook_active || files === 0) return undefined
       const prompt = reviewPrompt(new Map(Object.entries(c.changed)))
       c.underReview = c.changed
       c.changed = {}
       c.reviewing = true
-      return prompt
+      return { kind: 'review', prompt }
     })
-    if (ask?.startsWith('held:')) {
+    if (ask?.kind === 'held') {
       // The status line says so, so the queue is never silent.
-      $.ui.status(`review-guard: review of ${ask.slice(5)} changed file(s) held after your interrupt; it runs when work on code resumes`)
+      $.ui.status(`review-guard: review of ${ask.files} changed file(s) held after your interrupt; it runs when work on code resumes`)
       return settled
     }
-    return ask === undefined ? settled : { ...settled, block: ask }
+    return ask === undefined ? settled : { ...settled, block: ask.prompt }
   }).catch(($, e, next) => next(e)) // a failed check lets the turn end as it would have
 
   // --- 3. keep secrets and personal data out of GitHub ---------------------------------------
