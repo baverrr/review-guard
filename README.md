@@ -5,6 +5,10 @@
 A mod for Claude Code. After Claude changes code it sends Claude back to review the change, and before any
 commit or push to GitHub it checks what would go out for keys, IP and MAC addresses and your personal details.
 
+<p align="center">
+  <img src="docs/images/demo.gif" alt="Claude is asked to commit a notes file; review-guard stops the commit because the file holds an IP and a MAC address, and Claude explains the choices" width="860">
+</p>
+
 > [!TIP]
 > It needs no setup to start: install it and the reviews and the GitHub check begin in your next session.
 > Add your own name and email to a small config file (see [How to use it](#how-to-use-it)) so it can watch for those too.
