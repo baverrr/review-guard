@@ -1,0 +1,9 @@
+{
+  "name": "review-guard",
+  "version": "0.1.0",
+  "description": "After code changes, sends Claude to review them (pr-review-toolkit plus a per-language security review), and stops git commits and pushes that would send secrets, keys, MAC or IP addresses, or your personal details to GitHub.",
+  "author": {
+    "name": "baverrr"
+  },
+  "license": "MIT"
+}

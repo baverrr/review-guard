@@ -1,0 +1,5 @@
+{
+  "name": "review-guard",
+  "owner": { "name": "baverrr" },
+  "plugins": [{ "name": "review-guard", "source": "./" }]
+}

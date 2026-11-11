@@ -1,0 +1,515 @@
+// review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
+//
+// What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
+// assignments, MAC and IPv4 addresses, sensitive file names, and the person's own terms
+// (name, email, usernames) read from a local config file, never written in this code.
+
+export type Finding = {
+  kind: string
+  where: string // "path:line", "commit message", "author", ...
+  network?: boolean // a MAC or IP: allowed in repos the config lists
+  value?: string // what matched: compared with allowValues, never shown
+}
+
+type Detector = { kind: string; re: RegExp; network?: boolean; keep?: (m: RegExpExecArray, line: string) => boolean }
+
+const IPV4 = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g
+
+// Addresses that say nothing about anyone's network: loopback, "any", broadcast, and the three
+// ranges set aside for documentation and examples (RFC 5737), which no real network uses.
+function isHarmlessIp(ip: string, line: string, index: number): boolean {
+  if (/^(127\.|0\.0\.0\.0$|255\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)/.test(ip)) return true
+  // A version number like "v1.2.3.4" or "2.16.0.1-beta" is not an address.
+  const before = line.slice(Math.max(0, index - 1), index)
+  if (/[vV.\d]/.test(before)) return true
+  // "version" counts only just before the number ("version": "1.2.3.4"), not anywhere on the line,
+  // so a one-line JSON file with a version field and a real address still has the address caught.
+  return /\bversion\b\W{0,6}$/i.test(line.slice(Math.max(0, index - 16), index))
+}
+
+const PLACEHOLDER = /(\$\{|\$\(|os\.environ|getenv|process\.env|<[^>]*>|example|changeme|your[_-]|x{6,}|\*{4,}|placeholder|dummy|redacted|\.\.\.)/i
+
+const DETECTORS: Detector[] = [
+  { kind: 'private key', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g },
+  { kind: 'AWS access key', re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
+  { kind: 'GitHub token', re: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})/g },
+  { kind: 'API key (sk-...)', re: /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g },
+  { kind: 'Slack token', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/g },
+  { kind: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}\b/g },
+  { kind: 'JSON web token', re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
+  {
+    kind: 'secret in an assignment',
+    re: /\b(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|auth[_-]?key|access[_-]?key|client[_-]?secret)[A-Za-z_]*["']?\s*[:=]\s*["']?([A-Za-z0-9_\-\/+=.]{16,})/gi,
+    keep: (m, line) => {
+      const value = m[1] ?? ''
+      return /[A-Za-z]/.test(value) && /\d/.test(value) && !PLACEHOLDER.test(line)
+    },
+  },
+  {
+    kind: 'MAC address',
+    re: /\b[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}\b/g,
+    network: true,
+    // 00:00:5e:00:53:xx is set aside for documentation (RFC 7042): no real device has it.
+    // One run straight into more octets (00:00:5e:00:53:aa:bb:...) is not a documentation address.
+    keep: (m, line) =>
+      !/^00[:-]00[:-]5e[:-]00[:-]53[:-]/i.test(m[0]) || /^[:-][0-9A-Fa-f]{2}/.test(line.slice(m.index + m[0].length)),
+  },
+  { kind: 'IP address', re: IPV4, network: true, keep: (m, line) => !isHarmlessIp(m[0], line, m.index) },
+]
+
+const SENSITIVE_FILE = /(^|\/)(\.env(\.(?!example$|sample$|template$)[^/]*)?|id_(rsa|ed25519|ecdsa|dsa)|[^/]+\.(pem|key|p12|pfx|kdbx)|\.netrc|\.npmrc|credentials(\.json)?)$/i
+
+export function sensitiveFile(path: string): boolean {
+  return SENSITIVE_FILE.test(path.replace(/\\/g, '/'))
+}
+
+/** Findings in one line of text; `where` says where it came from. */
+export function scanLine(line: string, where: string, personal: readonly string[]): Finding[] {
+  const out: Finding[] = []
+  for (const d of DETECTORS) {
+    d.re.lastIndex = 0
+    for (let m = d.re.exec(line); m; m = d.re.exec(line)) {
+      if (!d.keep || d.keep(m, line)) {
+        // Every match is kept: if the first is one the user allowed, a second on the same line must still be seen.
+        out.push({ kind: d.kind, where, network: d.network, value: d.kind === 'secret in an assignment' ? m[1] : m[0] })
+      }
+      if (m[0].length === 0) d.re.lastIndex++
+    }
+  }
+  const lower = line.toLowerCase()
+  personal.forEach((term, i) => {
+    if (term && lower.includes(term.toLowerCase())) out.push({ kind: `your personal info (term ${i + 1} in the config)`, where })
+  })
+  return out
+}
+
+/** Findings in a unified diff: only added lines, with their file and new line number. */
+export function scanDiff(diff: string, personal: readonly string[]): Finding[] {
+  const out: Finding[] = []
+  let file = '(unknown file)'
+  let lineNo = 0
+  for (const raw of diff.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    const header = /^\+\+\+ (?:b\/)?(.*)$/.exec(line)
+    if (header) {
+      const name = header[1] ?? ''
+      file = name === '/dev/null' || name === '' ? file : name
+      if (sensitiveFile(file)) out.push({ kind: 'a sensitive file (keys, .env or credentials)', where: file })
+      continue
+    }
+    // A binary file has no "+++" line, so a key store (.p12, .kdbx) is named only here.
+    const start = /^diff --git a\/.* b\/(.*)$/.exec(line)
+    if (start) {
+      file = start[1] ?? file
+      if (sensitiveFile(file)) out.push({ kind: 'a sensitive file (keys, .env or credentials)', where: file })
+      continue
+    }
+    if (line.startsWith('--- ')) continue
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line)
+    if (hunk) {
+      lineNo = Number(hunk[1])
+      continue
+    }
+    if (line.startsWith('+')) {
+      out.push(...scanLine(line.slice(1), `${file}:${lineNo}`, personal))
+      lineNo++
+    } else if (!line.startsWith('-') && !line.startsWith('\\')) {
+      lineNo++
+    }
+  }
+  return out
+}
+
+/** Findings in a whole file's text (an untracked file about to be added). */
+export function scanFile(path: string, text: string, personal: readonly string[]): Finding[] {
+  const out: Finding[] = sensitiveFile(path) ? [{ kind: 'a sensitive file (keys, .env or credentials)', where: path }] : []
+  text.split('\n').forEach((line, i) => out.push(...scanLine(line, `${path}:${i + 1}`, personal)))
+  return out
+}
+
+/**
+ * Findings in a tool call's input or a command: every text value, line by line, so one long JSON
+ * line cannot hide a quoted secret, and every `path` checked as a file name.
+ */
+export function scanValue(value: unknown, where: string, personal: readonly string[]): Finding[] {
+  if (typeof value === 'string') {
+    const lines = value.split('\n')
+    return lines.flatMap((l, i) => scanLine(l, lines.length > 1 ? `${where}, line ${i + 1}` : where, personal))
+  }
+  if (Array.isArray(value)) return value.flatMap((v, i) => scanValue(v, `${where}[${i}]`, personal))
+  if (typeof value !== 'object' || value === null) return []
+  return Object.entries(value).flatMap(([key, v]) => [
+    ...(key === 'path' && typeof v === 'string' && sensitiveFile(v) ? [{ kind: 'a sensitive file (keys, .env or credentials)', where: v }] : []),
+    ...scanValue(v, `${where} "${key}"`, personal),
+  ])
+}
+
+/** Keeps one finding per kind and place. Drops network findings where allowed, and any
+ * whose matched value the user listed in allowValues. */
+export function settle(findings: Finding[], allowNetwork: boolean, allowValues: readonly string[] = []): Finding[] {
+  const seen = new Set<string>()
+  const allowed = new Set(allowValues.map(v => v.toLowerCase()))
+  return findings.filter(f => {
+    if (allowNetwork && f.network) return false
+    if (f.value !== undefined && allowed.has(f.value.toLowerCase())) return false
+    const key = `${f.kind}|${f.where}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** What the model is told: kinds and places only, never the value found. */
+export function report(findings: Finding[], action: string): string {
+  const shown = findings.slice(0, 25).map(f => `- ${f.kind} at ${f.where}`)
+  const more = findings.length > 25 ? [`- and ${findings.length - 25} more`] : []
+  return [
+    `review-guard stopped this ${action}: it would send personal or secret data to GitHub.`,
+    ...shown,
+    ...more,
+    'Remove or replace each one (write where a secret lives, never its value; write %USERPROFILE% or ~ instead',
+    'of a home folder path), then try again. Do not try to get around this check. If one is a false alarm, tell the',
+    'user which and why: only they decide, by adding it to "allowValues" in ~/.claude/review-guard.json.',
+  ].join('\n')
+}
+
+/** "owner/repo" from a GitHub remote URL or from a config entry, lower case; undefined when it is neither. */
+export function githubRepo(urlOrName: string): string | undefined {
+  const m = /(?:github\.com[:/]+)?([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/i.exec(urlOrName.trim())
+  return m?.[1]?.toLowerCase()
+}
+
+/** MAC and IP addresses may go out only when every GitHub remote is a repository the user listed, by its exact name. */
+export function networkAllowed(remotes: readonly string[], allowed: readonly string[]): boolean {
+  const names = new Set(allowed.map(githubRepo).filter(Boolean))
+  return remotes.length > 0 && remotes.every(u => names.has(githubRepo(u)))
+}
+
+// Where a prompt comes from when the user asked for something: typed, from a phone, a schedule
+// they set, a Slack message of theirs. Everything else (an agent's report, a task notice, another
+// session, an unlabelled engine message) is part of whatever is already running.
+const USER_REQUEST = new Set(['composer', 'bridge', 'sdk', 'scheduled-trigger', 'slack-ping', 'channel'])
+
+/**
+ * Whether a prompt is a new request from the user. One that arrives during a review ends it early,
+ * so what follows gets a review of its own. A review also ends by itself once no agent is still out,
+ * so a report of a kind this list does not know cannot hold a review open.
+ */
+export function isNewRequest(originKind: string, isMeta: boolean, asUser = false): boolean {
+  if (isMeta) return false
+  return USER_REQUEST.has(originKind) || (originKind === 'plugin' && asUser)
+}
+
+// --- reading git commands -----------------------------------------------------------------
+
+export type GitAction = {
+  kind: 'commit' | 'push' // the label: 'push' when the command does both
+  commits: boolean
+  pushes: boolean
+  dir?: string
+  addsFiles: boolean
+  message: string
+  /** What a push names to send (`git push origin main` gives ['main']); empty means the current branch. */
+  refs: string[]
+  allBranches: boolean
+  tags: boolean
+}
+
+function unquote(s: string): string {
+  return s.replace(/^"(.*)"$/s, '$1').replace(/^'(.*)'$/s, '$1')
+}
+
+/** Git Bash paths (/c/Users/...) as native git on Windows reads them. */
+export function nativePath(p: string): string {
+  const m = /^\/([a-zA-Z])\/(.*)$/.exec(p)
+  return m ? `${(m[1] ?? '').toUpperCase()}:/${m[2] ?? ''}` : p
+}
+
+/**
+ * The folder a command names, as git on this machine reads it. No shell runs the check, so `~` and
+ * `$HOME` are filled in here; Git Bash paths become native on Windows only (on Linux /d/work is a real folder).
+ */
+export function resolveDir(dir: string, home: string | undefined, windows: boolean): string {
+  const d = home ? dir.replace(/^(~|\$HOME|\$\{HOME\})(?=$|[\\/])/, () => home.replace(/\\/g, '/')) : dir
+  return windows ? nativePath(d) : d
+}
+
+// Words that come before the program a command runs, in Bash and PowerShell.
+const BEFORE_PROGRAM = new Set(['sudo', 'exec', 'command', 'time', 'env', 'nohup', '{', '!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until'])
+
+/**
+ * The command with everything ssh runs on another machine blanked out (same length, so positions
+ * hold): the rest of that one command, and a heredoc fed to it. What is left runs here, so
+ * `ssh host 'x' && git push` keeps its local push.
+ *
+ * When in doubt it blanks nothing: a quote that never closes, or a heredoc whose end line never
+ * comes, leaves the whole command visible. A remote command checked by mistake is the safe error;
+ * a local push hidden by mistake is not.
+ */
+export function localPart(command: string): string {
+  const n = command.length
+  const chars = command.split('')
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to; k++) if (chars[k] !== '\n') chars[k] = ' '
+  }
+  // Steps over quoted text, escapes and # comments, and stops at the first character outside them
+  // that `stops` matches. `open` says whether a quote was still open at the end.
+  const until = (i: number, stops: (c: string, at: number) => boolean): { at: number; open: boolean } => {
+    let quote = ''
+    for (; i < n; i++) {
+      const c = command[i] ?? ''
+      if (quote) {
+        if (c === quote) quote = ''
+        else if (c === '\\' && quote === '"') i++
+      } else if (c === '"' || c === "'") quote = c
+      else if (c === '\\') i++
+      else if (stops(c, i)) break
+      else if (c === '#' && /\s/.test(command[i - 1] ?? ' ')) {
+        // A comment runs to the end of the line; an apostrophe in it opens no quote.
+        const nl = command.indexOf('\n', i)
+        i = (nl === -1 ? n : nl) - 1
+      }
+    }
+    return { at: Math.min(i, n), open: quote !== '' }
+  }
+  const wordEnd = (i: number) => until(i, c => /[\s;|&()<>]/.test(c)).at
+  // A command ends at ; | & or a newline; the & of 2>&1 and &> is not an end.
+  const commandEnd = (i: number) =>
+    until(i, (c, at) => c === ';' || c === '|' || c === '\n' || (c === '&' && command[at - 1] !== '>' && command[at + 1] !== '>'))
+  // The end word of a heredoc started in command[from, to), outside quotes; `<<<` is a here-string, not one.
+  const heredocWord = (from: number, to: number): string | undefined => {
+    let word: string | undefined
+    until(from, (c, at) => {
+      if (at >= to) return true
+      if (c === '<' && command[at + 1] === '<' && command[at + 2] !== '<' && command[at - 1] !== '<') {
+        const m = /^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|([^\s'"<>;|&()]+))/.exec(command.slice(at, to))
+        word = m?.[1] ?? m?.[2] ?? m?.[3]
+        if (word !== undefined) return true
+      }
+      return false
+    })
+    return word
+  }
+
+  // Only a real ssh command counts: the program a command runs, outside quotes. The word "ssh" in
+  // another command's text (`echo "use ssh"`, a commit message, GIT_SSH_COMMAND=...) blanks nothing.
+  let i = 0
+  let first = true // the next word is the program a command runs
+  while (i < n) {
+    const c = command[i] ?? ''
+    if (c === '>' || c === '<') {
+      i += command[i + 1] === '&' ? 2 : 1
+    } else if (c === '&' && command[i + 1] === '>') {
+      i += 2
+    } else if (c === ';' || c === '|' || c === '&' || c === '(' || c === ')' || c === '\n') {
+      first = true
+      i++
+    } else if (/\s/.test(c)) {
+      i++
+    } else {
+      const end = Math.max(wordEnd(i), i + 1)
+      const word = unquote(command.slice(i, end))
+      if (!first || BEFORE_PROGRAM.has(word) || /^[A-Za-z_]\w*=/.test(word)) {
+        i = end
+        continue
+      }
+      first = false
+      if (!/(?:^|[\\/])ssh(?:\.exe)?$/i.test(word)) {
+        i = end
+        continue
+      }
+      const stop = commandEnd(end)
+      if (stop.open) {
+        i = end // a quote that never closes: blank nothing
+        continue
+      }
+      const here = heredocWord(end, stop.at)
+      if (here === undefined) {
+        blank(i, stop.at)
+        i = stop.at
+        continue
+      }
+      // A heredoc fed to it starts on the next line and runs to its end word alone on a line.
+      const body = command.indexOf('\n', stop.at)
+      const escaped = here.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const close = body === -1 ? null : new RegExp(String.raw`\n[ \t]*${escaped}[ \t]*(?=\n|$)`).exec(command.slice(body))
+      if (body === -1 || !close) {
+        i = end // its end line never comes: blank nothing
+        continue
+      }
+      blank(i, stop.at)
+      const after = body + close.index + close[0].length
+      blank(body, after)
+      i = after
+    }
+  }
+  return chars.join('')
+}
+
+/** A commit or push this shell command is about to make on this machine, and where. */
+export function gitAction(command: string): GitAction | undefined {
+  const cmd = localPart(command.replace(/\\\n/g, ' '))
+  const push = /\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)/.exec(cmd)
+  const ghPush = /\bgh\s+repo\s+create\b[^;&|\n]*--push\b/.exec(cmd)
+  const commit = /\bgit\b[^;&|\n]*\bcommit\b/.exec(cmd)
+  const isPush = push !== null || ghPush !== null
+  const isCommit = commit !== null
+  if (!isPush && !isCommit) return undefined
+  const path = String.raw`("[^"]+"|'[^']+'|[^\s;&|]+)`
+  // The folder in effect at the first commit or push: the last one changed to before it, not after.
+  const at = Math.min(...[push, ghPush, commit].filter(m => m !== null).map(m => m.index))
+  let dir: string | undefined
+  for (const m of cmd.matchAll(new RegExp(String.raw`\b(?:cd|pushd|Set-Location)\s+(?:-(?:Literal)?Path\s+)?` + path, 'gi'))) {
+    if (m.index < at) dir = unquote(m[1] ?? '')
+  }
+  const dashC = new RegExp(String.raw`\bgit\s+-C\s+` + path).exec(cmd)
+  if (dashC) dir = unquote(dashC[1] ?? '')
+  const source = new RegExp(String.raw`--source[=\s]+` + path).exec(cmd)
+  if (source) dir = unquote(source[1] ?? '')
+  const messages = [...cmd.matchAll(/(?:-m|--message)[=\s]+("(?:[^"\\]|\\.)*"|'[^']*'|\S+)/g)].map(m => unquote(m[1] ?? ''))
+  const heredoc = /<<-?\s*'?(\w+)'?\n([\s\S]*?)\n\1\b/.exec(cmd)
+  if (heredoc && /\bcommit\b/.test(cmd)) messages.push(heredoc[2] ?? '')
+  // What the push names: `git push [options] <remote> <ref>...`. Words that are not plain ref names
+  // (a redirect, a variable) are left out, and the current branch is checked instead.
+  const words = (push?.[1] ?? '').trim().split(/\s+/).filter(Boolean).map(unquote)
+  const deletes = words.some(w => w === '--delete' || w === '-d')
+  const refs = deletes ? [] : words.filter(w => !w.startsWith('-')).slice(1)
+    .map(w => w.replace(/^\+/, '').split(':')[0] ?? '')
+    .filter(w => /^[\w./@-]+$/.test(w))
+  return {
+    kind: isPush ? 'push' : 'commit',
+    commits: isCommit,
+    pushes: isPush,
+    dir, // as written in the command: resolveDir makes it a path git can open
+    addsFiles: /\bgit\b[^;&|\n]*\badd\b/.test(cmd) || /\bcommit\b[^;&|\n]*\s-(?:a|am|[a-z]*a[a-z]*)\b/.test(cmd) || /\bcommit\b[^;&|\n]*--all\b/.test(cmd),
+    message: messages.join('\n'),
+    refs,
+    allBranches: words.some(w => w === '--all' || w === '--mirror' || w === '--branches'),
+    tags: words.some(w => w === '--tags' || w === '--follow-tags' || w === '--mirror'),
+  }
+}
+
+/**
+ * Whether a shell command writes text to GitHub through the gh tool (a pull request, an issue, a
+ * comment, a release, a gist, an API write): its own text is then what gets checked.
+ */
+export function ghWrites(command: string): boolean {
+  if (/\bgh\s+(?:pr|issue|release|gist|label|discussion)\s+(?:create|edit|comment|review|close|reopen|merge|upload)\b/.test(command)) return true
+  return /\bgh\s+api\b/.test(command) && /(?:\s-X\s*|--method[=\s]+)(?:POST|PUT|PATCH|DELETE)\b|\s(?:-f|-F|--field|--raw-field|--input)\b/i.test(command)
+}
+
+// --- which reviews a change needs -----------------------------------------------------------
+
+const LANGUAGES: [RegExp, string][] = [
+  [/(^|\/)(Dockerfile[^/]*|[^/]*compose[^/]*\.ya?ml)$/i, 'Docker'],
+  [/\.py$/i, 'Python'],
+  [/\.(ts|tsx|mts|cts)$/i, 'TypeScript'],
+  [/\.(js|jsx|mjs|cjs)$/i, 'JavaScript'],
+  [/\.(html?|jinja2?|j2|vue|svelte)$/i, 'HTML templates'],
+  [/\.cs$/i, 'C#'],
+  [/\.(c|cc|cpp|cxx|h|hpp)$/i, 'C/C++'],
+  [/\.(sh|bash|zsh)$/i, 'Shell'],
+  [/\.(ps1|psm1|psd1)$/i, 'PowerShell'],
+  [/\.sql$/i, 'SQL'],
+  [/\.go$/i, 'Go'],
+  [/\.rs$/i, 'Rust'],
+  [/\.(java|kt|kts)$/i, 'Java/Kotlin'],
+  [/\.(rb|php|swift|lua|dart)$/i, 'other code'],
+  [/(^|\/)\.github\/workflows\/[^/]+\.ya?ml$/i, 'GitHub Actions'],
+  [/\.(ya?ml|toml|ini|conf)$/i, 'config'],
+  [/\.css$/i, 'CSS'],
+]
+
+/** The language of a code file, or undefined for notes, data and everything else. */
+export function languageOf(path: string): string | undefined {
+  const p = path.replace(/\\/g, '/')
+  if (/(^|\/)(\.git|node_modules|\.venv|dist|build|__pycache__)\//.test(p)) return undefined
+  return LANGUAGES.find(([re]) => re.test(p))?.[1]
+}
+
+// Commands that write files without the Edit or Write tool: in-place editors, copies, patches,
+// PowerShell's file cmdlets, and scripts that open a file for writing.
+const SHELL_WRITE = new RegExp([
+  String.raw`\bsed\s+(?:-\S+\s+)*-[a-zA-Z]*i`, String.raw`\bperl\s+(?:-\S+\s+)*-[a-zA-Z]*i`, String.raw`\btee\b`,
+  String.raw`\b(?:cp|mv|patch)\s`, String.raw`\bgit\s+apply\b`,
+  String.raw`\b(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item)\b`,
+  String.raw`\bwrite_(?:text|bytes)\b`, String.raw`\bwriteFile(?:Sync)?\b`, String.raw`\bWriteAll(?:Text|Lines|Bytes)\b`,
+  String.raw`\bopen\([^)]*,\s*["'][wax]`, String.raw`\.write\(`,
+  // Formatters and fixers rewrite the files they are given.
+  String.raw`--write\b`, String.raw`--fix\b`, String.raw`\b(?:black|autopep8|rustfmt)\s`, String.raw`\bgofmt\s+-\w*w`, String.raw`\bdotnet\s+format\b`,
+].join('|'), 'i')
+
+/**
+ * The code files a shell command writes, as the command names them. A redirect counts for its target
+ * alone. Any other writing command counts for every code file it names, which can include one it only
+ * reads: an extra review is the safer mistake than a change nobody looked at.
+ */
+export function shellWrites(fullCommand: string): string[] {
+  const command = localPart(fullCommand) // what ssh runs on another machine writes no file here
+  // A wildcard, a variable or a sed pattern is not a file name: `src/*.ts`, `$DIR/a.py`, `hooks\/a.ts`.
+  const notAName = (raw: string) => /[*?^$]|\\\//.test(raw)
+  const out = new Set<string>()
+  for (const m of command.matchAll(/(?<![0-9&>])>>?\s*(?!&)("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)) {
+    if (notAName(m[1] ?? '')) continue
+    const target = unquote(m[1] ?? '')
+    if (languageOf(target)) out.add(target)
+  }
+  if (SHELL_WRITE.test(command)) {
+    // Shell words, quotes kept together: "$DST/hooks/a.ts" is one word, not "$DST" and "/hooks/a.ts".
+    for (const raw of command.match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
+      if (notAName(raw)) continue
+      const word = raw.replace(/["']/g, '')
+      if (word.length > 2 && !word.startsWith('-') && languageOf(word)) out.add(word)
+    }
+  }
+  return [...out]
+}
+
+const SECURITY: Record<string, string> = {
+  Python: 'SQL built from strings, shell=True or os.system with input, eval/exec, pickle or yaml.load, path traversal, requests to URLs from input (SSRF), weak crypto. Run `bandit -q` on the changed files if bandit is installed.',
+  TypeScript: 'XSS (innerHTML, dangerouslySetInnerHTML), eval or new Function, child_process with input, prototype pollution, unchecked JSON. Run `npm audit` if a lockfile changed.',
+  JavaScript: 'XSS (innerHTML, dangerouslySetInnerHTML), eval or new Function, child_process with input, prototype pollution, unchecked JSON. Run `npm audit` if a lockfile changed.',
+  'HTML templates': 'autoescape turned off or |safe on user data, unquoted attributes, inline scripts, forms without CSRF tokens.',
+  'C#': 'SQL built from strings, BinaryFormatter or other unsafe deserialization, Process.Start with input, path traversal, secrets in appsettings.',
+  'C/C++': 'buffer overflows, format strings, integer overflow, use after free, unchecked lengths.',
+  Shell: 'unquoted variables, eval, curl | sh, secrets on command lines, rm with variable paths.',
+  PowerShell: 'Invoke-Expression, unquoted paths, secrets on command lines, -ExecutionPolicy Bypass, downloads run without checks.',
+  SQL: 'dynamic SQL, missing constraints, grants that are too wide.',
+  Go: 'SQL built from strings, exec.Command with input, unchecked errors on security paths, TLS InsecureSkipVerify.',
+  Rust: 'unsafe blocks, unwrap on untrusted input, Command with input.',
+  'Java/Kotlin': 'SQL built from strings, deserialization, XXE in XML parsers, Runtime.exec with input.',
+  Docker: 'load the docker-skills:docker-build-strategies skill. Check: non-root user, base images pinned by digest, no secrets in layers or build args, ports bound to 127.0.0.1, cap_drop ALL, read_only, no-new-privileges.',
+  'GitHub Actions': 'pull_request_target with checkout of the PR, actions not pinned to a commit, secrets echoed to logs, write permissions wider than needed.',
+  config: 'secrets in config files, debug modes left on, permissions or CORS wider than needed.',
+  'other code': 'injection (SQL, shell, template), unsafe deserialization, path traversal, secrets in code.',
+  CSS: 'nothing security-specific beyond the general review.',
+}
+
+/** The text that sends the model into a review of the files it changed this turn. */
+export function reviewPrompt(changed: ReadonlyMap<string, string>): string {
+  const byLang = new Map<string, string[]>()
+  for (const [path, lang] of changed) byLang.set(lang, [...(byLang.get(lang) ?? []), path])
+  const files = [...byLang].map(([lang, paths]) =>
+    `- ${lang}: ${paths.slice(0, 8).join(', ')}${paths.length > 8 ? ` and ${paths.length - 8} more` : ''}`)
+  const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang] ?? SECURITY['other code']}`)
+  return [
+    `review-guard: code changed in ${changed.size} file(s) this turn. Before you finish, review it:`,
+    ...files,
+    '',
+    '1. Run the pr-review-toolkit agents on these changes, in parallel with the Agent tool: code-reviewer,',
+    '   silent-failure-hunter and pr-test-analyzer, plus comment-analyzer where comments or docs changed and',
+    '   type-design-analyzer where types or models changed. Use the pr-review-toolkit:<name> agent type when',
+    '   this session lists it. Otherwise use review-guard:<name>: the same agents, which this mod loads into',
+    '   every session. Do not hand their work to general-purpose agents.',
+    '2. Security review, for each language changed (also run the security-review skill on the pending changes',
+    '   when it is listed, and any enabled security plugin\'s reviewer):',
+    ...security,
+    '   If no listed plugin or skill covers one of these languages well, use SearchPlugins to look for a',
+    '   security plugin for it and offer the best match with SuggestPluginInstall.',
+    '3. Check each finding against the code before acting on it. Fix the confirmed ones, rerun the tests,',
+    '   and tell the user what was found and fixed. Commit or push nothing as part of this review unless',
+    '   the user asked for that.',
+    'If this turn only changed files the user told you not to review, or was itself this review, say so',
+    'in one line and stop.',
+  ].join('\n')
+}

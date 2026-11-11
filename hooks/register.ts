@@ -1,0 +1,360 @@
+import type { EngineInterface, Register } from 'claude-code'
+import { REVIEW_AGENTS } from './agents'
+import {
+  isNewRequest,
+  type Finding,
+  ghWrites,
+  gitAction,
+  type GitAction,
+  languageOf,
+  localPart,
+  networkAllowed,
+  report,
+  resolveDir,
+  reviewPrompt,
+  scanDiff,
+  scanFile,
+  scanLine,
+  scanValue,
+  settle,
+  shellWrites,
+} from './scan'
+
+// review-guard:
+// 1. Remembers the code files Claude changes in a turn. When the turn ends, sends Claude back
+//    to review them with the pr-review-toolkit agents plus a security review for each language.
+// 2. Stops a git commit or push (and GitHub MCP writes) that would send secrets, keys, MAC or
+//    IP addresses, or the person's own details to a repository with a GitHub remote.
+//
+// The person's own details live in ~/.claude/review-guard.json, never in this code:
+//   { "personal": ["name", "email", ...], "allowNetworkInfo": ["owner/repo"], "allowValues": [] }
+
+type Config = { personal: string[]; allowNetworkInfo: string[]; allowValues: string[] }
+
+const CONFIG_NAME = '.claude/review-guard.json'
+
+const changed = new Map<string, string>() // path -> language, the code edits not yet sent for review
+let reviewing = false // a review this mod asked for is running: its own fixes aren't sent for another
+let held = false // the user interrupted a turn: no review is asked for until work on code picks up again
+let underReview = new Map<string, string>() // what the running review covers, put back if it is interrupted
+
+/** A code file was just changed: it waits for a review, and an interrupted task has picked up again. */
+function remember(path: string, lang: string): void {
+  changed.set(path, lang)
+  held = false
+}
+
+const BUSY = new Set(['pending', 'running', 'waiting']) // an agent that has not handed back yet
+
+async function homeDir($: EngineInterface): Promise<string | undefined> {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+  return home?.replace(/\\/g, '/')
+}
+
+async function configPath($: EngineInterface): Promise<string | undefined> {
+  const home = await homeDir($)
+  return home ? `${home}/${CONFIG_NAME}` : undefined
+}
+
+const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues'] as const
+
+/**
+ * The user's config. With no file to read, the secret checks still run and `note` says what was skipped.
+ * A file that is there but wrong (bad JSON, a misspelt key, a value that is not a list of text) throws,
+ * which stops the command: a typo must not quietly turn the personal checks off.
+ */
+async function loadConfig($: EngineInterface): Promise<{ config: Config; note?: string }> {
+  const empty: Config = { personal: [], allowNetworkInfo: [], allowValues: [] }
+  const note = 'personal details were NOT checked (no readable ~/.claude/review-guard.json)'
+  const path = await configPath($)
+  if (!path) return { config: empty, note }
+  let text: string
+  try {
+    text = await $.fs.read(path)
+  } catch {
+    return { config: empty, note }
+  }
+  const raw: unknown = JSON.parse(text)
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('review-guard.json must be a JSON object')
+  const fields = raw as Record<string, unknown>
+  const unknown = Object.keys(fields).filter(k => !(CONFIG_KEYS as readonly string[]).includes(k))
+  if (unknown.length > 0) throw new Error(`review-guard.json has a key it does not know: ${unknown.join(', ')}`)
+  const list = (key: (typeof CONFIG_KEYS)[number]): string[] => {
+    const v = fields[key]
+    if (v === undefined) return []
+    if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) throw new Error(`review-guard.json: "${key}" must be a list of text values`)
+    return (v as string[]).filter(x => x.trim() !== '')
+  }
+  return { config: { personal: list('personal'), allowNetworkInfo: list('allowNetworkInfo'), allowValues: list('allowValues') } }
+}
+
+async function git($: EngineInterface, dir: string | undefined, args: string[], timeoutMs = 60_000) {
+  return $.process.run(dir ? ['git', '-C', dir, ...args] : ['git', ...args], { timeoutMs })
+}
+
+/** The repository's GitHub remote URLs, or [] when it has none (then nothing goes to GitHub). */
+async function githubRemotes($: EngineInterface, dir: string | undefined): Promise<string[]> {
+  const r = await git($, dir, ['remote', '-v'])
+  if (r.exitCode !== 0) {
+    // Not a repository: git itself will refuse the commit or push. Any other failure (a folder this
+    // check could not open) must not pass as "no GitHub remote", so it stops the command.
+    if (/not a git repository/i.test(r.stderr)) return []
+    throw new Error(`git remote failed in ${dir ?? 'the session folder'}: ${r.stderr.slice(0, 200)}`)
+  }
+  return [...new Set(r.stdout.split('\n').map(l => l.split(/\s+/)[1] ?? '').filter(u => /github\.com/i.test(u)))]
+}
+
+const MAX_NEW_FILES = 300
+
+/** Runs git and throws when it fails: a check that could not run must stop the command, not pass it. */
+async function gitOk($: EngineInterface, dir: string | undefined, args: string[], what: string, timeoutMs = 60_000) {
+  const r = await git($, dir, args, timeoutMs)
+  if (r.exitCode !== 0) throw new Error(`${what} failed: ${r.stderr.slice(0, 200)}`)
+  return r
+}
+
+const TOO_MUCH = (what: string): Finding => ({ kind: `more ${what} than can be checked at once (do it in smaller steps)`, where: 'this command' })
+
+/** `notes` collects what could only be partly checked, for the user to see. */
+async function findingsFor($: EngineInterface, action: GitAction, config: Config, notes: string[]): Promise<Finding[]> {
+  const { dir } = action
+  const out: Finding[] = []
+  // Who the commits will say made them.
+  for (const v of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+    const r = await git($, dir, ['var', v])
+    if (r.exitCode === 0) out.push(...scanLine(r.stdout, `the commit's ${v === 'GIT_AUTHOR_IDENT' ? 'author' : 'committer'}`, config.personal))
+  }
+  if (action.message) action.message.split('\n').forEach(l => out.push(...scanLine(l, 'the commit message', config.personal)))
+
+  // A command can do both (`git commit ... && git push`): then the staged changes and the commits
+  // already waiting are each checked.
+  if (action.commits) {
+    const diffArgs = ['-c', 'core.quotePath=false', 'diff', '--no-color', '--no-ext-diff', '-U0']
+    const staged = await gitOk($, dir, [...diffArgs, '--cached'], 'git diff --cached')
+    if (staged.isStdoutTruncated) out.push(TOO_MUCH('staged changes'))
+    out.push(...scanDiff(staged.stdout, config.personal))
+    if (action.addsFiles) {
+      // The same command stages more first: scan the working tree's changes and new files too.
+      const tracked = await gitOk($, dir, diffArgs, 'git diff')
+      if (tracked.isStdoutTruncated) out.push(TOO_MUCH('changes'))
+      out.push(...scanDiff(tracked.stdout, config.personal))
+      // New files are listed from the top of the repository, not the command's folder: `git add -A`
+      // stages all of them, and the names git prints are then relative to where they are read from.
+      const top = (await gitOk($, dir, ['rev-parse', '--show-toplevel'], 'git rev-parse')).stdout.trim()
+      const untracked = await gitOk($, top, ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], 'git ls-files')
+      const files = untracked.stdout.split('\n').filter(Boolean)
+      if (untracked.isStdoutTruncated || files.length > MAX_NEW_FILES) out.push(TOO_MUCH('new files'))
+      let nameOnly = 0
+      for (const rel of files.slice(0, MAX_NEW_FILES)) {
+        try {
+          out.push(...scanFile(rel, await $.fs.read(`${top}/${rel}`), config.personal))
+        } catch {
+          // Over 4 MiB or unreadable: still check its name, and say so.
+          out.push(...scanFile(rel, '', config.personal))
+          nameOnly++
+        }
+      }
+      if (nameOnly > 0) notes.push(`${nameOnly} new file(s) too large or unreadable were checked by name only`)
+    }
+  }
+  if (action.pushes) {
+    // What the push sends: the commits no remote has yet, with their metadata. A push that names
+    // what to send (`origin main`, `--all`, `--tags`) is checked for exactly that.
+    const logArgs = ['-c', 'core.quotePath=false', 'log', '-p', '--no-color', '--no-ext-diff', '-U0',
+      '--format=COMMIT %h%nAUTHOR %an <%ae>%nCOMMITTER %cn <%ce>%n%B']
+    const upstream = await git($, dir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+    const current = upstream.exitCode === 0 ? ['@{u}..HEAD'] : ['HEAD', '--not', '--remotes']
+    const named = action.refs.length > 0 || action.allBranches || action.tags
+    const heads = action.refs.length > 0 ? action.refs : action.allBranches ? [] : ['HEAD']
+    const wanted = [...heads, ...(action.allBranches ? ['--branches'] : []), ...(action.tags ? ['--tags'] : []), '--not', '--remotes']
+    let log = await git($, dir, [...logArgs, ...(named ? wanted : current)], 120_000)
+    // A branch the same command creates does not exist yet: check the current one instead.
+    if (log.exitCode !== 0 && named) log = await git($, dir, [...logArgs, ...current], 120_000)
+    if (log.exitCode !== 0) {
+      // A repository with no commit yet has nothing waiting; the commit this command makes was checked above.
+      const empty = /does not have any commits yet|unknown revision|bad revision/i.test(log.stderr)
+      if (!(empty && action.commits)) throw new Error(`git log failed: ${log.stderr.slice(0, 200)}`)
+      log = { ...log, stdout: '' }
+    }
+    if (log.isStdoutTruncated) out.push({ kind: 'more history than can be checked at once (push in smaller steps)', where: 'the push' })
+    // Each commit is: COMMIT, AUTHOR, COMMITTER, its message, then its diff.
+    let commit = '?'
+    let inMessage = false
+    for (const line of log.stdout.split('\n')) {
+      const c = /^COMMIT (\w+)$/.exec(line)
+      if (c) {
+        commit = c[1] ?? '?'
+        inMessage = false
+      } else if (/^(AUTHOR|COMMITTER) /.test(line)) {
+        out.push(...scanLine(line, `commit ${commit}'s ${line.startsWith('A') ? 'author' : 'committer'}`, config.personal))
+        inMessage = line.startsWith('COMMITTER')
+      } else if (line.startsWith('diff --git')) {
+        inMessage = false
+      } else if (inMessage) {
+        out.push(...scanLine(line, `commit ${commit}'s message`, config.personal))
+      }
+    }
+    out.push(...scanDiff(log.stdout, config.personal))
+  }
+  return out
+}
+
+/**
+ * Code is also changed from a shell (sed -i, a redirect, a script that writes files). Once a shell
+ * command has run, the code files it wrote are remembered for the review. Never throws: it only remembers.
+ */
+function rememberShellWrites<R extends { deny?: unknown; isError?: unknown }>(result: R, command: string): R {
+  try {
+    if (result.deny === undefined && result.isError !== true) {
+      for (const path of shellWrites(command)) remember(path, languageOf(path) ?? 'other code')
+    }
+  } catch {
+    // A command this could not read is one fewer file in the review, not a stopped command.
+  }
+  return result
+}
+
+export const register: Register = on => {
+  // --- 0. the review agents, in every session ------------------------------------------------
+
+  // A new session reads them from agents/*.md. A session that was already open when the mod loaded
+  // does not, so they are registered here too, at each load: the same names, so nothing doubles.
+  on('session.start', async ($, e, next) => {
+    const failed: string[] = []
+    for (const agent of REVIEW_AGENTS) {
+      try {
+        await $.agent.register(agent)
+      } catch {
+        failed.push(agent.name)
+      }
+    }
+    if (failed.length > 0) $.ui.status(`review-guard: could not load its review agents (${failed.join(', ')}); a new session will have them`)
+    return next(e)
+  }).catch(($, e, next) => next(e)) // a session must start whether or not the agents load
+
+  // --- 1. remember the code a turn changes --------------------------------------------------
+
+  on('prompt.submit', ($, e, next) => {
+    // A new request from the user in the middle of a review ends it early, so the edits that follow
+    // get a review of their own. Reports, notices and anything unlabelled are part of the review.
+    const asUser = e.origin.kind === 'plugin' && e.origin.asUser === true
+    if (reviewing && isNewRequest(e.origin.kind, e.isMeta === true, asUser)) {
+      reviewing = false
+      changed.clear() // what the review's own agents wrote (scratch files, fixes) is not new work
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e)) // only keeps a flag: a failure must never stop a prompt
+
+  on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit'] }, async ($, e, next) => {
+    const result = await next(e)
+    if (result.deny === undefined && result.isError !== true) {
+      const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
+      const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
+      if (lang) remember(path, lang)
+    }
+    return result
+  }).catch(($, e, next) => next(e)) // only remembers: a failure must never stop an edit
+
+  // The user stopped the main turn part way: the work is unfinished, so no review is asked for yet.
+  // A review that was itself interrupted gives its files back to the queue.
+  // A review whose turn died on an API error or a refusal also gives its files back, without the hold.
+  on('turn.complete', ($, e, next) => {
+    if (e.agentId === undefined && e.reason !== 'answer') {
+      if (reviewing) for (const [path, lang] of underReview) if (!changed.has(path)) changed.set(path, lang)
+      reviewing = false
+      if (e.reason === 'aborted') held = true
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e)) // only keeps flags: a failure must never change how a turn ends
+
+  // --- 2. at the end of the turn, send Claude back to review it ------------------------------
+
+  on('classic.Stop', async ($, e, next) => {
+    const settled = await next(e)
+    if (settled.block) return settled
+    if (reviewing) {
+      // The review is over at the first stop with no agent still out. Until then the reviewers'
+      // reports come back as turns of this review. Its own fixes are not sent for another review.
+      // If the agents cannot be listed, the review ends here rather than holding every later review back.
+      const agents = await $.agent.list().catch(() => [])
+      if (agents.some(a => BUSY.has(a.status))) return settled
+      reviewing = false
+      changed.clear()
+      return settled
+    }
+    // After an interrupt the files stay queued, and the review comes with the next turn that changes
+    // code. The status line says so, so the queue is never silent.
+    if (held && changed.size > 0) {
+      $.ui.status(`review-guard: review of ${changed.size} changed file(s) held after your interrupt; it runs when work on code resumes`)
+      return settled
+    }
+    if (e.stop_hook_active || changed.size === 0) return settled
+    const prompt = reviewPrompt(changed)
+    underReview = new Map(changed)
+    changed.clear()
+    reviewing = true
+    return { ...settled, block: prompt }
+  }).catch(($, e, next) => next(e)) // a failed check lets the turn end as it would have
+
+  // --- 3. keep secrets and personal data out of GitHub ---------------------------------------
+
+  // Both shells: on Windows the PowerShell tool runs git as often as Bash does.
+  on('tool.call', { tool: ['Bash', 'PowerShell'] }, async ($, e, next) => {
+    // What ssh runs on another machine is left alone (the user's choice): it cannot be checked from here.
+    const local = localPart(e.command)
+    const action = gitAction(e.command)
+    const gh = ghWrites(local)
+    if (!action && !gh) {
+      if (local !== e.command && /\bgit\b[^;&|\n]*\b(?:commit|push)\b/.test(e.command)) {
+        $.ui.status('review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here')
+      }
+      return rememberShellWrites(await next(e), e.command)
+    }
+    let remotes: string[] = []
+    let toGitHub = false
+    if (action) {
+      const home = await homeDir($)
+      if (action.dir) action.dir = resolveDir(action.dir, home, /^[A-Za-z]:\//.test(home ?? ''))
+      remotes = await githubRemotes($, action.dir)
+      // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
+      toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
+    }
+    if (!toGitHub && !gh) return rememberShellWrites(await next(e), e.command)
+    const { config, note } = await loadConfig($)
+    const notes = note ? [note] : []
+    const found: Finding[] = []
+    if (gh) found.push(...scanValue(local, 'the gh command', config.personal))
+    if (action && toGitHub) found.push(...(await findingsFor($, action, config, notes)))
+    const left = settle(found, networkAllowed(remotes, config.allowNetworkInfo), config.allowValues)
+    const what = action && toGitHub ? (action.commits && action.pushes ? 'commit and push' : action.kind) : 'gh command'
+    if (left.length > 0) return { deny: report(left, what) }
+    $.ui.status(notes.length > 0
+      ? `review-guard: ${what} checked, but ${notes.join('; ')}`
+      : `review-guard: ${what} checked, nothing personal or secret found`)
+    return rememberShellWrites(await next(e), e.command)
+  }).catch(($, e, next) =>
+    next.called ? next(e) : {
+      deny: `review-guard could not check this command, so it stopped it (${next.error.message ?? next.error.kind}). If the command names ` +
+        'its folder with a variable or a relative path, run it again with `git -C <absolute path>`. If the reason is about ' +
+        'review-guard.json, tell the user what is wrong in it. Otherwise tell the user: the check itself failed.',
+    },
+  )
+
+  // GitHub MCP tools that write (files, pull requests, issues, comments, reviews) send their text
+  // straight to GitHub: check all of it. The ones that only read are left alone.
+  on('tool.call', { tool: /^mcp__.*github.*__(?!get_|list_|search_|issue_read$|pull_request_read$)\w+$/ }, async ($, e, next) => {
+    const { config, note } = await loadConfig($)
+    if (note) $.ui.status(`review-guard: ${note}`)
+    const found = settle(scanValue(e, `the ${String(e.tool).split('__').pop()} call`, config.personal), false, config.allowValues)
+    return found.length > 0 ? { deny: report(found, 'GitHub write') } : next(e)
+  }).catch(($, e, next) =>
+    next.called ? next(e) : { deny: `review-guard could not check this GitHub write, so it stopped it (${next.error.message ?? next.error.kind}).` },
+  )
+
+  // The allowlist is the user's to edit, not Claude's.
+  on('tool.call', { tool: ['Edit', 'Write'] }, ($, e, next) =>
+    /(^|[\\/])\.claude[\\/]review-guard\.json$/i.test(e.file_path)
+      ? { deny: 'review-guard: ~/.claude/review-guard.json is the user\'s to edit. Tell them what to change instead.' }
+      : next(e),
+  ).catch(($, e, next) => (next.called ? next(e) : { deny: 'review-guard: its guard failed.' }))
+}
