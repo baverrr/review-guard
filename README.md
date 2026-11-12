@@ -21,8 +21,11 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 ## What it does
 
-- **Reviews every code change.** When a turn ends with code changed, Claude is sent back once to run review
-  agents on it (code review, hidden errors, test gaps) and to fix what they confirm.
+- **Reviews every code change.** When a turn ends with code changed, Claude is sent back to review it, once
+  per turn, with review agents (code review, hidden errors, test gaps).
+- **Leaves no finding behind.** Low and style warnings count like serious ones. Claude fixes each real one,
+  says why for any that isn't real, and names any it can't fix yet. Then it reruns the tests and scanners
+  and tells you the outcome of every finding.
 - **Adds a security check per language.** Python, TypeScript, Docker, shell, C# and others each get their own
   short list of things to look for.
 - **Brings its own reviewers.** It ships five review agents, so the review works even where the
@@ -34,8 +37,8 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 - **Uses the scanners you have.** The review lists ready-to-run commands for the ones installed that suit the
   changed files: [bandit](https://github.com/PyCQA/bandit) for Python, [Semgrep](https://semgrep.dev) for
   most languages, [zizmor](https://github.com/zizmorcore/zizmor) for GitHub Actions and
-  [Trivy](https://github.com/aquasecurity/trivy) for dependency files and Dockerfiles. Missing ones are named,
-  never silently skipped.
+  [Trivy](https://github.com/aquasecurity/trivy) for dependency files and Dockerfiles. Their warnings are
+  handled like any other finding. Missing ones are named, never silently skipped.
 - **Knows when to wait.** If you stop Claude part way, it waits until work picks up again before asking for
   a review.
 
@@ -120,4 +123,5 @@ the mod off for a while, set `"review-guard@review-guard": false` under `enabled
 MIT. See [LICENSE](LICENSE).
 
 The five agents in `agents/` are copies of the pr-review-toolkit plugin's agents by Anthropic, under the
-Apache License 2.0 (`licenses/`). Not affiliated with Anthropic.
+Apache License 2.0 (`licenses/`), changed so they report every finding (see `licenses/NOTICE.md`). Not
+affiliated with Anthropic.

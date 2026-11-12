@@ -1,8 +1,12 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  addedLines, ghWrites, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, report, resolveDir, reviewPrompt, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, ghWrites, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan'
+import { REVIEW_AGENTS } from '../hooks/agents'
+
+// The review prompt is wrapped at a fixed width; tests read it as one line so a rewrap breaks nothing.
+const flat = (text: string) => text.replace(/\s+/g, ' ')
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners'
 
 // Every value here is made up: fake key shapes, made-up addresses, placeholder names.
@@ -240,6 +244,42 @@ describe('review prompt', () => {
     expect(prompt.includes('review-guard:<name>')).toBe(true)
     expect(prompt.includes('Do not hand their work to general-purpose agents')).toBe(true)
   })
+
+  test('every finding is acted on, low ones included, and each ends in one stated outcome', async () => {
+    const text = flat(reviewPrompt(new Map([['a.py', 'Python']])))
+    // The agents get a sentence to pass on that overrides their own cutoffs.
+    expect(text.includes(`prompt word for word: "${REPORT_EVERYTHING}"`)).toBe(true)
+    expect(REPORT_EVERYTHING.includes('overrides any confidence threshold')).toBe(true)
+    for (const part of [
+      'Act on every finding, whatever its severity: low, info and style ones',
+      '"Minor", "style" or "fine here" alone is never a reason to leave one',
+      'Fixed: say which file and line changed',
+      'Does not hold up: show why in one line, with the code, path or output that proves it',
+      'Holds up but is not fixed here',
+      'never count it as fixed',
+      'If an agent or scanner fails or returns nothing, say which one and why',
+      'Rerun the tests (if the project has none, say so) and the scanners',
+      'Stop after three rounds and list what is still open',
+      'Tell the user every finding and its outcome',
+      'Commit or push nothing as part of this review unless the user asked for that',
+      'was itself this review, say so in one line and stop',
+    ]) expect(text.includes(part)).toBe(true)
+    // The steps come once each, in order.
+    const at = ['1. Run the', '2. Security review', '3. Act on every finding', '4. Rerun', '5. Tell the user'].map(s => text.indexOf(s))
+    expect(at.every((n, i) => n >= 0 && (i === 0 || n > at[i - 1]))).toBe(true)
+    // No file is cut from the list: a file left off would get no findings.
+    const many = new Map(Array.from({ length: 12 }, (_, i) => [`f${i}.py`, 'Python']))
+    expect(reviewPrompt(many).includes('f11.py')).toBe(true)
+  })
+
+  test("the mod's own reviewers report low findings too", async () => {
+    const prompt = (name: string) => REVIEW_AGENTS.find(a => a.name === name)?.prompt ?? ''
+    expect(prompt('code-reviewer').includes('Only report issues with confidence')).toBe(false)
+    expect(prompt('code-reviewer').includes('Report every issue you find, at any confidence')).toBe(true)
+    expect(prompt('code-reviewer').includes('filter aggressively')).toBe(false)
+    expect(prompt('pr-test-analyzer').includes('**Minor Gaps**')).toBe(true)
+    expect(prompt('pr-test-analyzer').includes('overly pedantic')).toBe(false)
+  })
 })
 
 test('registers the five review agents when the mod loads, for sessions already open', async ($, on) => {
@@ -456,7 +496,7 @@ test('knows which code files a shell command writes', async () => {
   expect(shellWrites(notes + 'python -I .scripts/memory-map.py 2>&1 | tail -2')).toEqual([])
   expect(shellWrites(notes + '.venv/bin/python run.py && node build.js; pwsh -NoProfile -File deploy.ps1')).toEqual([])
   expect(shellWrites(notes.replace("'notes.md'", "'Changes/Change log.md'") + 'python -I .scripts/memory-map.py')).toEqual([])
-  expect(shellWrites(notes.replace('\r', '').replace(/\n/g, '\r\n') + 'python run.py')).toEqual([]) // CRLF
+  expect(shellWrites(notes.replace(/\n/g, '\r\n') + 'python run.py')).toEqual([]) // CRLF
   expect(shellWrites("cat > notes.md <<'EOF'\nsee app.py\nEOF\npython app.py")).toEqual([]) // nothing writes code; the target is a note
   // `cat` passes data on, and what a trusted body says is not a mention of the script.
   expect(shellWrites("cat > plan.md <<'EOF'\nrun app.py\nEOF\n" + notes + 'python app.py')).toEqual([])
@@ -946,8 +986,14 @@ describe('outside scanners', () => {
     expect(scannerCommand('bandit', 'bandit', ["it's $HOME/a.py"])).toBe("'bandit' -q 'it'\\''s $HOME/a.py'")
     expect(scannerCommand('semgrep', 'semgrep', ['a.py']).includes('--metrics=off')).toBe(true)
     const prompt = reviewPrompt(changed, steps)
-    expect(prompt.includes('Also run these scanners')).toBe(true)
-    expect(reviewPrompt(changed).includes('Also run these scanners')).toBe(false)
+    expect(flat(prompt).includes('What they report is a finding like any other')).toBe(true)
+    // The commands come before the step that says to act on what they find.
+    expect(prompt.indexOf("'C:/Tools/bandit.exe'") < prompt.indexOf('3. Act on every finding')).toBe(true)
+    expect(reviewPrompt(changed).includes('Scanners for these files')).toBe(false)
+    // With none installed, the prompt still names them as skipped and does not claim any are installed.
+    const none = reviewPrompt(changed, scannerSteps(changed, new Map()))
+    expect(none.includes('Not installed here')).toBe(true)
+    expect(none.includes('installed on this machine')).toBe(false)
   })
 
   test("gitleaks' report becomes findings at the right place; an empty or broken report is handled", async () => {

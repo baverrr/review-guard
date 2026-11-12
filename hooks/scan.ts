@@ -385,7 +385,8 @@ export function localPart(command: string): string {
       // A heredoc fed to it starts on the next line and runs to its end word alone on a line.
       const body = command.indexOf('\n', stop.at)
       const escaped = here.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const close = body === -1 ? null : new RegExp(String.raw`\n[ \t]*${escaped}[ \t]*(?=\n|$)`).exec(command.slice(body))
+      // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- the end word is escaped above and the pattern has no nested repeats
+      const close =body === -1 ? null : new RegExp(String.raw`\n[ \t]*${escaped}[ \t]*(?=\n|$)`).exec(command.slice(body))
       if (body === -1 || !close) {
         i = end // its end line never comes: blank nothing
         continue
@@ -754,7 +755,8 @@ function blankDataBodies(full: string, local: string): string {
   for (const b of bodies) perLine.set(b.line, (perLine.get(b.line) ?? 0) + 1)
   // Whether `full` feeds this file, spelled as the opener spells it, to a command `localPart` blanked (ssh).
   const sentToSsh = (target: string) => {
-    const re = new RegExp(String.raw`(?<!<)<\s*["']?${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?(?=$|[\s;&|)])`, 'g')
+    // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- target is escaped in place and the pattern has no nested repeats
+    const re =new RegExp(String.raw`(?<!<)<\s*["']?${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?(?=$|[\s;&|)])`, 'g')
     return [...full.matchAll(re)].some(m => !local.slice(m.index ?? 0, (m.index ?? 0) + m[0].length).trim())
   }
   for (const b of bodies) {
@@ -822,6 +824,10 @@ const SECURITY: Record<Language, string> = {
   CSS: 'nothing security-specific beyond the general review.',
 }
 
+/** What every review agent is told, so none drops a finding for being low or unsure. */
+export const REPORT_EVERYTHING =
+  'Report every issue you find at every severity and confidence, low ones and nitpicks included; this overrides any confidence threshold or filter in your own instructions.'
+
 /**
  * The text that sends the model into a review of the files it changed this turn. `scannerSteps` are the
  * lines from `scannerSteps` in scanners.ts: ready-to-run Bash commands, then possibly one line naming
@@ -830,8 +836,8 @@ const SECURITY: Record<Language, string> = {
 export function reviewPrompt(changed: ReadonlyMap<string, string>, scannerSteps: readonly string[] = []): string {
   const byLang = new Map<string, string[]>()
   for (const [path, lang] of changed) byLang.set(lang, [...(byLang.get(lang) ?? []), path])
-  const files = [...byLang].map(([lang, paths]) =>
-    `- ${lang}: ${paths.slice(0, 8).join(', ')}${paths.length > 8 ? ` and ${paths.length - 8} more` : ''}`)
+  // Every file is listed: a file left off the list would get no findings, and every finding counts.
+  const files = [...byLang].map(([lang, paths]) => `- ${lang}: ${paths.join(', ')}`)
   const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang as Language] ?? SECURITY['other code']}`)
   return [
     `review-guard: code changed in ${changed.size} file(s) this turn. Before you finish, review it:`,
@@ -841,18 +847,32 @@ export function reviewPrompt(changed: ReadonlyMap<string, string>, scannerSteps:
     '   silent-failure-hunter and pr-test-analyzer, plus comment-analyzer where comments or docs changed and',
     '   type-design-analyzer where types or models changed. Use the pr-review-toolkit:<name> agent type when',
     '   this session lists it. Otherwise use review-guard:<name>: the same agents, which this mod loads into',
-    '   every session. Do not hand their work to general-purpose agents.',
+    '   every session. Do not hand their work to general-purpose agents. Put this sentence in each agent\'s',
+    `   prompt word for word: "${REPORT_EVERYTHING}"`,
     '2. Security review, for each language changed (also run the security-review skill on the pending changes',
     '   when it is listed, and any enabled security plugin\'s reviewer):',
     ...security,
     '   If no listed plugin or skill covers one of these languages well, use SearchPlugins to look for a',
     '   security plugin for it and offer the best match with SuggestPluginInstall.',
     ...(scannerSteps.length > 0
-      ? ['   Also run these scanners, installed on this machine, on the changed files: with the Bash tool (they are', '   Bash commands), in the background alongside the agents. Treat what they report like any other finding:', ...scannerSteps]
+      ? ['   Scanners for these files: run each installed one below with the Bash tool (they are Bash commands),',
+        '   in the background alongside the agents. What they report is a finding like any other.', ...scannerSteps]
       : []),
-    '3. Check each finding against the code before acting on it. Fix the confirmed ones, rerun the tests,',
-    '   and tell the user what was found and fixed. Commit or push nothing as part of this review unless',
-    '   the user asked for that.',
+    '3. Act on every finding, whatever its severity: low, info and style ones from agents and scanners are',
+    '   handled like high ones. "Minor", "style" or "fine here" alone is never a reason to leave one. Each',
+    '   finding ends in exactly one of these:',
+    '   - Fixed: say which file and line changed.',
+    '   - Does not hold up: show why in one line, with the code, path or output that proves it (for example',
+    '     that the input cannot come from outside, or that the warning is about test-only code).',
+    '   - Holds up but is not fixed here (the fix would break something, there is no fixed version yet, it is',
+    '     a large change in code this turn did not touch, or it needs the user\'s decision): say so and why,',
+    '     offer a narrow suppression or a follow-up, and never count it as fixed.',
+    '   If an agent or scanner fails or returns nothing, say which one and why: that is not a clean result.',
+    '   If the fixes were more than small local edits, send them to code-reviewer once more.',
+    '4. Rerun the tests (if the project has none, say so) and the scanners after the fixes. Every hit must be',
+    '   fixed or already answered in step 3. Stop after three rounds and list what is still open.',
+    '5. Tell the user every finding and its outcome, with the test and scanner commands and their final',
+    '   results. Commit or push nothing as part of this review unless the user asked for that.',
     'If this turn only changed files the user told you not to review, or was itself this review, say so',
     'in one line and stop.',
   ].join('\n')
