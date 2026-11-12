@@ -21,8 +21,8 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 ## What it does
 
-- **Reviews every code change.** When a turn ends with code changed, Claude is sent back to review it, once
-  per turn, with review agents (code review, hidden errors, test gaps).
+- **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it, once per
+  turn, with review agents (code review, hidden errors, test gaps). Claude's own scratch files are skipped.
 - **Leaves no finding behind.** Low and style warnings count like serious ones. Claude fixes each real one,
   says why for any that isn't real, and names any it can't fix yet. Then it reruns the tests and scanners
   and tells you the outcome of every finding.
@@ -103,8 +103,11 @@ Claude cannot edit this file; the mod stops it from trying. A typo in it stops c
 config file has a mistake. The message gives the reason. Run git with `git -C <full path>` or fix the file.
 
 **"It asks for a review I don't need."** Changes to notes and other non-code files are never reviewed, and
-neither is a script that a shell command only prints or sends to another machine over SSH. To turn
-the mod off for a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your settings.
+neither is a script that a shell command only prints or sends to another machine over SSH. Claude's own
+scratch files (its scratchpad in your temp folder) are left out, unless a command copies them somewhere.
+So is a script a command only runs, when its file is unchanged after the command (same time and size,
+and for small scripts the same text). The status line names each file left out. To turn the mod off for
+a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your settings.
 
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
 

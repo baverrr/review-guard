@@ -1,13 +1,13 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  addedLines, ghWrites, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan'
 import { REVIEW_AGENTS } from '../hooks/agents'
+import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners'
 
 // The review prompt is wrapped at a fixed width; tests read it as one line so a rewrap breaks nothing.
 const flat = (text: string) => text.replace(/\s+/g, ' ')
-import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners'
 
 // Every value here is made up: fake key shapes, made-up addresses, placeholder names.
 const PERSONAL = ['pat example', 'pat@example.org', 'patuser']
@@ -475,7 +475,249 @@ test('a shell command that was stopped or failed queues nothing, and a commit th
   expect(prompt?.includes('denied.py')).toBe(false)
 })
 
+// --- scratch files and scripts that are only run ---------------------------------------------
+
+const TEMP = 'C:/Users/pat/AppData/Local/Temp'
+const WIN: Paths = { windows: true, home: 'C:/Users/pat', userProfile: 'C:/Users/pat' }
+const LINUX: Paths = { windows: false, home: '/home/pat' }
+// Notes written by a here-document, then a script in the vault is run: the script is only run.
+const RUN_AFTER_NOTES = "cd \"$USERPROFILE/vault\"; python -I - <<'EOF'\nimport io\nio.open('log.md', 'a').write('x')\nEOF\npython -I .scripts/memory-map.py && git status --short"
+const MAP = 'C:/Users/pat/vault/.scripts/memory-map.py'
+// A here-document that writes, so the command counts as writing and its named code files are checked.
+const WRITES = "python - <<'EOF'\nopen(n, 'w').write('x')\nEOF\n"
+
+type FileState = { mtimeMs: number; size: number; text: string }
+
+/**
+ * A Windows machine (USERPROFILE and TEMP set) whose files are in `files` (path to modified time; each is
+ * 10 bytes of "print('x')"). A path in `changes` reads as in `files` before the command and with those
+ * fields changed after it: the command changed it. A path in `links` is a symbolic link. Any other path is
+ * missing. Returns the status lines shown.
+ */
+function disk(on: On, files: Record<string, number>, changes: Record<string, Partial<FileState>> = {}, links: string[] = []) {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP })
+  // A file is "after" once it has been looked at: its first stat (and read) are the snapshot before.
+  const looked = new Set<string>()
+  // On Linux the engine reads a Windows path as relative and puts its own folder first: drop that part.
+  const norm = (raw: string) => raw.replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/)/, '')
+  const state = (raw: string, first: boolean): FileState | undefined => {
+    const path = norm(raw)
+    const t = files[path]
+    if (t === undefined) return undefined
+    const base = { mtimeMs: t, size: 10, text: "print('x')" }
+    return first || !(path in changes) ? base : { ...base, ...changes[path] }
+  }
+  on('fs.stat', (_$, e) => {
+    const path = norm(e.path)
+    const s = state(path, !looked.has(path))
+    if (s === undefined) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+    return { value: { kind: 'file' as const, size: s.size, mtimeMs: s.mtimeMs, isLink: links.includes(path) } }
+  })
+  on('fs.read', (_$, e) => {
+    const path = norm(String(e.path))
+    const s = state(path, !looked.has(path))
+    looked.add(path) // the snapshot reads after its stat; the next look is after the command
+    if (s === undefined) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+    return { value: s.text }
+  })
+  const status: string[] = []
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  return status
+}
+
+test("Claude's scratch files are left out of the review, other temp files are not", async ($, on) => {
+  const status = disk(on, {})
+  const { edit, stop } = cycle($, on)
+  await edit(`${TEMP.replace(/\//g, '\\')}\\claude\\abc\\scratchpad\\notes.py`) // the Write tool's Windows path
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/a/b/' /c/Users/pat/AppData/Local/Temp/claude/x/build.mjs" }) // Git Bash
+  expect(await stop()).toBe(undefined)
+  expect(status.some(s => s.includes('not reviewed (scratch notes.py)'))).toBe(true) // never silent
+  await edit(`${TEMP}/pip-build/setup.py`) // in TEMP but not Claude's
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/a/b/' /tmp/clone/app.py" }) // a repo cloned to /tmp
+  await $.tool.call({ tool: 'PowerShell', command: "'x' | Set-Content /tmp/claude-1/tool.ps1" }) // C:\tmp in PowerShell
+  const prompt = await stop()
+  for (const f of ['setup.py', '/tmp/clone/app.py', 'tool.ps1']) expect(prompt?.includes(f)).toBe(true)
+})
+
+test('an edit only to scratch files does not lift a hold', async ($, on) => {
+  disk(on, {})
+  on('turn.complete', () => ({ text: '' }))
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/app.py')
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await edit(`${TEMP}/claude/x/scratchpad/n.py`)
+  expect(await stop()).toBe(undefined) // still held
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('a script a command only runs is left out; one it changed, or may have, is reviewed', async ($, on) => {
+  const T = 1_700_000_000_000
+  const status = disk(
+    on,
+    { [MAP]: T, 'C:/tools/gen.py': T, 'C:/tools/size.py': T, 'C:/tools/text.py': T, 'C:/tools/link.py': T, 'C:/proj/sub/gen.py': T },
+    {
+      'C:/tools/gen.py': { mtimeMs: T - 86_400_000 }, // changed to an older time (`cp -p`, `touch -d`)
+      'C:/tools/size.py': { size: 11 }, // same time, new size
+      'C:/tools/text.py': { text: "print('y')" }, // same time and size, new text (`cp -p` of a twin)
+    },
+    ['C:/tools/link.py'],
+  )
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES })
+  expect(await stop()).toBe(undefined)
+  expect(status.some(s => s.includes('only run .scripts/memory-map.py'))).toBe(true) // never silent
+  for (const [command, script] of [
+    [`${WRITES}python C:/tools/gen.py`, 'C:/tools/gen.py'], // changed while it ran, even to an older time
+    [`${WRITES}python C:/tools/size.py`, 'C:/tools/size.py'],
+    [`${WRITES}python C:/tools/text.py`, 'C:/tools/text.py'],
+    [`${WRITES}python C:/tools/link.py`, 'C:/tools/link.py'], // a link: its target's time proves nothing
+    ['sed -i x gen.py; cd /c/proj/sub && python gen.py', 'gen.py'], // named twice, and the cd is not first
+    ['cd /c/proj/sub && sed -i x gen.py && python gen.py', 'gen.py'], // named twice
+    [`cd /c/proj/sub; cd .. ; ${WRITES}python gen.py`, 'gen.py'], // two moves
+    [`${WRITES}python gen.py; cd /c/proj/sub`, 'gen.py'], // the move comes after
+    [`${WRITES}python gen.py`, 'gen.py'], // no cd: where the shell stands is unknown
+    [`cd /c/proj/sub && ${WRITES}python gen.py & sleep 1`, 'gen.py'], // a background job may write later
+    [`cd /c/proj/sub && nohup cp n.py x.py; ${WRITES}python gen.py`, 'gen.py'], // so may a detached one
+    [`cd /c/proj/sub && python - <<'EOF'\nopen('gen.py', 'w').write('x')\nEOF\npython gen.py`, 'gen.py'], // a body names it
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    const python = (await stop())?.split('\n').find(l => l.startsWith('- Python: ')) ?? ''
+    expect(python.slice('- Python: '.length).split(', ').includes(script)).toBe(true)
+    await stop(true)
+  }
+  // In the background the command has not finished when the hook looks, so nothing is left out.
+  await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES, run_in_background: true })
+  expect((await stop())?.includes('memory-map.py')).toBe(true)
+})
+
+/** A Stop that asks for nothing else, and the shell's answer to every command. */
+function shellAnswers($: Engine, on: On, answer: Record<string, unknown>) {
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => ({ value: [] }))
+  on('tool.call', () => answer as never)
+  return async () => (await $.classic.Stop({ stop_hook_active: false })).block
+}
+
+test('a command put in the background part way still has its run scripts reviewed', async ($, on) => {
+  disk(on, { [MAP]: 1 })
+  // Ctrl+B or a timeout: the result comes back while the command still runs, so its files can't be compared.
+  const stop = shellAnswers($, on, { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b1' } })
+  await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES })
+  expect((await stop())?.includes('memory-map.py')).toBe(true)
+})
+
+test('a command that failed may have written before it failed, so its writes are reviewed', async ($, on) => {
+  disk(on, {})
+  const stop = shellAnswers($, on, { result: { stdout: '', stderr: 'tests failed', interrupted: false }, isError: true })
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/a/b/' src/app.py && pytest" })
+  expect((await stop())?.includes('src/app.py')).toBe(true)
+})
+
+test('a scratch file a command copies or moves is kept: it may be going into the project', async ($, on) => {
+  disk(on, {})
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: `cp ${TEMP}/claude/x/scratchpad/app.py /c/proj/` })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  await stop(true)
+  await $.tool.call({ tool: 'PowerShell', command: `Copy-Item ${TEMP}/claude/x/scratchpad/tool.ps1 C:/proj/` })
+  expect((await stop())?.includes('tool.ps1')).toBe(true)
+})
+
+test('what is left out goes after a guard notice on the status line, never over it', async ($, on) => {
+  const status = disk(on, { [MAP]: 1 })
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: `${RUN_AFTER_NOTES}; ssh box 'git push'` })
+  expect(await stop()).toBe(undefined)
+  const last = status.at(-1) ?? ''
+  expect(last.includes('sent over SSH') && last.includes('was NOT checked here')).toBe(true)
+  expect(last.includes('Not reviewed: only run .scripts/memory-map.py')).toBe(true)
+})
+
+test('a script only run is left out at every shell call site, the git-checked ones too', async ($, on) => {
+  world(on)
+  on('fs.stat', () => ({ value: { kind: 'file' as const, size: 10, mtimeMs: 1, isLink: false } })) // world() answers fs.read
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => ({ value: [] }))
+  const stop = async () => (await $.classic.Stop({ stop_hook_active: false })).block
+  // A push to GitHub goes through the guard first, then its writes are remembered.
+  await $.tool.call({ tool: 'Bash', command: `${RUN_AFTER_NOTES} && git push origin main` })
+  expect(await stop()).toBe(undefined)
+  await $.tool.call({ tool: 'PowerShell', command: `cd C:/Users/pat/vault; 'x' | Set-Content n.md; python .scripts/memory-map.py` })
+  expect(await stop()).toBe(undefined)
+})
+
+test('a failed lookup never leaves a file out', async ($, on) => {
+  on('env.get', () => { throw new Error('no env') }) // a throw, not a rejection
+  on('fs.stat', () => { throw new Error('EACCES') })
+  const { edit, stop } = cycle($, on)
+  await edit(`${TEMP}/claude/x/a.py`) // TEMP can't be read: not known to be scratch
+  await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES })
+  const prompt = await stop()
+  expect(prompt?.includes('a.py')).toBe(true)
+  expect(prompt?.includes('memory-map.py')).toBe(true)
+})
+
+test('knows scratch folders, and which scripts a command only runs and where', async () => {
+  const temp = [TEMP]
+  expect(inScratch(`${TEMP.replace(/\//g, '\\')}\\claude\\a\\s.py`, temp, true, true)).toBe(true)
+  expect(inScratch('/c/users/PAT/appdata/local/temp/CLAUDE/a.py', temp, true, true)).toBe(true) // Git Bash, any case on Windows
+  expect(inScratch('/tmp/claude-1000/a.py', [], false, true)).toBe(true)
+  expect(inScratch('/TMP/claude-1000/a.py', [], false, true)).toBe(false) // Linux names keep their case
+  expect(inScratch('/tmp/claude-1/a.py', [], true, false)).toBe(false) // PowerShell: /tmp is C:\tmp
+  expect(inScratch(`${TEMP}/a.py`, temp, true, true)).toBe(false) // temp, but not Claude's
+  expect(inScratch(`${TEMP}/claude`, temp, true, true)).toBe(false) // the folder itself
+  expect(inScratch('/tmp/claude/../../home/pat/app.py', [], false, true)).toBe(false) // `..` climbs out
+  expect(inScratch('C:/claude/a.py', ['C:/', '/', 'C:'], true, false)).toBe(false) // a root is no temp folder
+  expect(inScratch('C:/proj/claude/a.py', ['proj', 'tmp'], true, false)).toBe(false) // nor a relative one
+  expect(inScratch('C:/Users/pat/AppData/Local/TempX/claude/a.py', temp, true, true)).toBe(false)
+
+  expect([...runOnlyScripts(RUN_AFTER_NOTES, WIN)]).toEqual([['.scripts/memory-map.py', MAP]])
+  expect([...runOnlyScripts('cd ~/proj && python3 -I gen.py 2>&1 | tail -3', LINUX)]).toEqual([['gen.py', '/home/pat/proj/gen.py']])
+  expect([...runOnlyScripts('node "C:/tools/b.mjs" out.html', WIN)]).toEqual([['C:/tools/b.mjs', 'C:/tools/b.mjs']])
+  // A backslash anywhere can escape a quote the here-document split can't follow: no candidates, so reviewed.
+  expect([...runOnlyScripts('node "C:\\tools\\b.mjs" out.html', WIN)]).toEqual([])
+  // PowerShell's `~` is the profile folder, not HOME.
+  expect([...runOnlyScripts('cd ~/p; python gen.py', { windows: true, home: 'D:/h', userProfile: 'C:/Users/pat' }, true)])
+    .toEqual([['gen.py', 'C:/Users/pat/p/gen.py']])
+  expect([...runOnlyScripts('cd ~/p; python gen.py', { windows: true, home: 'D:/h', userProfile: 'C:/Users/pat' })])
+    .toEqual([['gen.py', 'D:/h/p/gen.py']])
+  expect([...runOnlyScripts('python /d/work/gen.py', LINUX)]).toEqual([['/d/work/gen.py', '/d/work/gen.py']]) // a real Linux folder
+  expect([...runOnlyScripts('python /d/work/gen.py', WIN)]).toEqual([['/d/work/gen.py', 'D:/work/gen.py']])
+  for (const command of [
+    'python gen.py', // no starting folder
+    'cd sub && python gen.py', // a relative folder
+    'cd "$DIR" && python gen.py', // a variable
+    'cd ~ && python gen.py', // `~` is HOME, which this machine lacks
+    'Push-Location C:/p; python gen.py', // not a plain cd
+    'cd C:/p; Pop-Location; python gen.py',
+    'cd C:/p && echo "x" > gen.py && python gen.py', // written by a redirect
+    'cd C:/p && python gen.py && cp gen.py b.py', // named again
+    'cd C:/p && python $D/gen.py', // a variable
+    'cd C:/p && python `x`', // a backtick
+    'cd C:/p && { python gen.py; }', // a group
+    'cd C:/p && python -c "import gen"', // inline code
+    "cd C:/p && cat <<'EOF'\npython gen.py\nEOF", // a body is not a command
+    'cd C:/p && source env.sh && python gen.py', // `source` runs a file in this shell: it may move it
+    'cd C:/p && . env.sh && python gen.py',
+    'cd C:/p && python gen.py & cp n.py gen.py', // a background job
+    'cd C:/p && nohup sh -c "cp n.py gen.py" && python gen.py', // a detached one, and named inside a word
+    'cd C:/p && Start-Process cp; python gen.py',
+  ]) {
+    expect([...runOnlyScripts(command, { windows: true, userProfile: 'C:/Users/pat' })]).toEqual([])
+  }
+})
+
 test('knows which code files a shell command writes', async () => {
+  // PowerShell's and cmd's own copies, moves and writes count, as commands; the same words in a note don't.
+  for (const c of ['copy a.py b.py', 'cpi a.py b.py', 'mi a.py b.py', 'ren a.py b.py', 'rni a.py b.py', 'Rename-Item a.py b.py',
+    "x; sc b.py 'v'", 'ForEach-Object {copy a.py b.py}', 'iwr https://x -OutFile b.py', "New-Item b.py -Value 'x'"]) {
+    expect(shellWrites(c).includes('b.py')).toBe(true)
+  }
+  expect(shellWrites("cat > n.md <<'EOF'\nMove scan.ts later, then copy it\nEOF")).toEqual([])
   expect(shellWrites("sed -i 's/a/b/' src/app.py")).toEqual(['src/app.py'])
   expect(shellWrites("cat > hooks/scan.ts <<'EOF'\nconst a = 1\nEOF")).toEqual(['hooks/scan.ts'])
   expect(shellWrites('echo "x = 1" >> "my app/settings.py"')).toEqual(['my app/settings.py'])

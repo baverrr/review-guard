@@ -7,7 +7,11 @@ import {
   ghWrites,
   gitAction,
   type GitAction,
+  inScratch,
   languageOf,
+  type Paths,
+  runOnlyScripts,
+  COPIES,
   localPart,
   networkAllowed,
   report,
@@ -26,7 +30,8 @@ import {
 import { candidates, gitleaksFindings, type Scanner, SCANNERS, scannerSteps, VERSION_ARGS } from './scanners'
 
 // review-guard:
-// 1. Remembers the code files Claude changes in a turn. When the turn ends, sends Claude back
+// 1. Remembers the code files Claude changes in a turn (not its own scratch files, nor a script a shell
+//    command only ran, which the status line names). When the turn ends, sends Claude back
 //    to review them with the pr-review-toolkit agents plus a security review for each language.
 //    The review also names the outside scanners installed here that suit the files (bandit, semgrep,
 //    zizmor, trivy), with commands to run.
@@ -94,13 +99,62 @@ async function updateCycle<T>($: EngineInterface, change: (c: Cycle) => T): Prom
   return result
 }
 
-/** Code files were just changed: they wait for a review, and an interrupted task has picked up again. */
-async function remember($: EngineInterface, files: [string, string][]): Promise<void> {
-  if (files.length === 0) return
+// An environment variable read so that it can't fail: undefined when unset or unreadable (a throw
+// included). Every caller treats undefined as "not known", which keeps a file in the review. Each call
+// names its variable as a literal, as the engine asks.
+const safely = (read: () => Promise<string | undefined>) => Promise.resolve().then(read).catch(() => undefined)
+
+/** How paths are spelled here. Windows is told by USERPROFILE, which Windows always sets. */
+async function pathsHere($: EngineInterface): Promise<Paths> {
+  const userProfile = await safely(() => $.env.get('USERPROFILE'))
+  return { windows: userProfile !== undefined, home: await safely(() => $.env.get('HOME')), userProfile }
+}
+
+/** The machine's temp folders (TEMP, TMP, TMPDIR). One that can't be read is left out. */
+async function tempDirs($: EngineInterface): Promise<string[]> {
+  const dirs = [await safely(() => $.env.get('TEMP')), await safely(() => $.env.get('TMP')), await safely(() => $.env.get('TMPDIR'))]
+  return dirs.filter((d): d is string => d !== undefined && d.trim() !== '')
+}
+
+/** Says on the status line which files were left out of the review and why, so no skip is silent. */
+function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], said?: string): void {
+  const parts = [
+    ...(scratch.length ? [`scratch ${scratch.map(p => p.replace(/^.*[\\/]/, '')).join(', ')}`] : []),
+    ...(onlyRun.length ? [`only run ${onlyRun.join(', ')}`] : []),
+  ]
+  if (parts.length === 0) return
+  try {
+    // After a line the guard just put there (a security notice), so that line is never hidden.
+    $.ui.status(said ? `${said}. Not reviewed: ${parts.join('; ')}` : `review-guard: not reviewed (${parts.join('; ')})`)
+  } catch { /* the status line is best effort */ }
+}
+
+/**
+ * Code files were just changed: they wait for a review, and an interrupted task has picked up again.
+ * Files in Claude's scratch folders (`inScratch`) are throwaway: they are left out, and an edit only to
+ * them does not count as work picking up again. `posixTmp`: whether /tmp means the Unix temp folder
+ * (not for the PowerShell tool). `keepScratch`: keep them too (a copy or move may have taken them into
+ * the project). Returns the scratch files left out.
+ */
+async function remember($: EngineInterface, changed: [string, string][], posixTmp: boolean, keepScratch = false): Promise<string[]> {
+  if (changed.length === 0) return []
+  if (keepScratch) {
+    await updateCycle($, c => {
+      for (const [path, lang] of changed) c.changed[path] = lang
+      c.held = false
+    })
+    return []
+  }
+  const temp = await tempDirs($)
+  const { windows } = await pathsHere($)
+  const scratch = changed.filter(([path]) => inScratch(path, temp, windows, posixTmp)).map(([path]) => path)
+  const files = changed.filter(([path]) => !scratch.includes(path))
+  if (files.length === 0) return scratch
   await updateCycle($, c => {
     for (const [path, lang] of files) c.changed[path] = lang
     c.held = false
   })
+  return scratch
 }
 
 /** What the end of a turn asks for: a review, a word that one is held, or nothing. */
@@ -347,14 +401,86 @@ async function findingsFor($: EngineInterface, action: GitAction, config: Config
   return out
 }
 
+/** A run script's file as it was just before the command: its spelling in the command, place, time and size. */
+type Snapshot = { script: string; place: string; mtimeMs: number; size: number; text?: string }
+
+/** A plain file's time and size, or undefined for a link, a folder, or one that can't be found or read. */
+async function fileState($: EngineInterface, place: string): Promise<{ mtimeMs: number; size: number } | undefined> {
+  const stat = await Promise.resolve().then(() => $.fs.stat(place)).catch(() => undefined)
+  return stat?.kind === 'file' && !stat.isLink ? { mtimeMs: stat.mtimeMs, size: stat.size } : undefined
+}
+
+// A script up to this size is also compared by its text, so a copy that keeps both time and size
+// (`cp -p`, `rsync -a`, `touch -r` after a write) still shows. Larger ones are compared by time and size.
+const COMPARE_TEXT_UP_TO = 512 * 1024
+
+/** A run script's text, when it is small enough to keep; undefined otherwise or when it can't be read. */
+async function scriptText($: EngineInterface, place: string, size: number): Promise<string | undefined> {
+  if (size > COMPARE_TEXT_UP_TO) return undefined
+  return Promise.resolve().then(() => $.fs.read(place)).then(t => (typeof t === 'string' ? t : undefined)).catch(() => undefined)
+}
+
+/**
+ * Before a shell command runs: the files of the scripts it only runs (`runOnlyScripts`), as they are now.
+ * None for a command run in the background, which has not finished when the hook looks again. Never
+ * throws: a failure means no snapshots, so nothing is left out of the review.
+ */
+async function snapshotRunScripts($: EngineInterface, command: string, background: boolean, powershell: boolean): Promise<Snapshot[]> {
+  if (background) return []
+  try {
+    const out: Snapshot[] = []
+    for (const [script, place] of runOnlyScripts(command, await pathsHere($), powershell)) {
+      const state = await fileState($, place)
+      if (state) out.push({ script, place, ...state, text: await scriptText($, place, state.size) })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * After the command: the scripts from `before` whose file is as it was (same time and size, the same text
+ * when it is small, still a plain file). The command only ran those. Comparing a file with itself needs no
+ * clock, so a network share's clock can't fool it, and a copy, move, link, download or `touch` that
+ * changed the file shows. (A copy of exactly the same text over it would not, and needs no review.)
+ */
+async function untouched($: EngineInterface, before: readonly Snapshot[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  for (const b of before) {
+    const now = await fileState($, b.place)
+    if (!now || now.mtimeMs !== b.mtimeMs || now.size !== b.size) continue
+    if (b.size <= COMPARE_TEXT_UP_TO && (b.text === undefined || (await scriptText($, b.place, now.size)) !== b.text)) continue
+    out.add(b.script)
+  }
+  return out
+}
+
+// A shell result that came back while its command may still run: put in the background by the user,
+// by a timeout, by a turn abort or to deliver a message. Its files can't be compared yet.
+const STILL_RUNNING = ['backgroundTaskId', 'backgroundedByUser', 'backgroundedByTurnAbort', 'backgroundedToDeliverMessage', 'timedOutAfterMs', 'interrupted'] as const
+const mayStillRun = (result: { result?: unknown }) => {
+  const r = result.result
+  return typeof r === 'object' && r !== null && STILL_RUNNING.some(k => Boolean((r as Record<string, unknown>)[k]))
+}
+
 /**
  * Code is also changed from a shell (sed -i, a redirect, a script that writes files). Once a shell
- * command has run, the code files it wrote are remembered for the review. Never throws: it only remembers.
+ * command has run, the code files it wrote are remembered for the review, less the scripts it only ran
+ * (`before` holds them as they were) and Claude's scratch files. A command that failed may still have
+ * written, so it counts; one that was refused never ran. What is left out is named on the status line,
+ * after `said` when the guard already put a line there. Never throws: it only remembers.
  */
-async function rememberShellWrites<R extends { deny?: unknown; isError?: unknown }>($: EngineInterface, result: R, command: string): Promise<R> {
+async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string): Promise<R> {
   try {
-    if (result.deny === undefined && result.isError !== true) {
-      await remember($, shellWrites(command).map(path => [path, languageOf(path) ?? 'other code']))
+    if (result.deny === undefined) {
+      const written = shellWrites(command)
+      const compare = written.length > 0 && before.length > 0 && !mayStillRun(result)
+      const onlyRun = compare ? await untouched($, before).catch(() => new Set<string>()) : new Set<string>()
+      const kept = written.filter(path => !onlyRun.has(path))
+      // A scratch file named by a copy or move may be the source of a write into the project: keep it.
+      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), !powershell, COPIES.test(command))
+      sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said)
     }
   } catch (err) {
     // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.
@@ -404,7 +530,8 @@ export const register: Register = on => {
     if (result.deny === undefined && result.isError !== true) {
       const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
       const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
-      if (lang) await remember($, [[path, lang]])
+      // The edit tools take a native path, so /tmp is the Unix temp folder only off Windows.
+      if (lang) sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
     }
     return result
   }).catch(($, e, next) => next(e)) // only remembers: a failure must never stop an edit
@@ -466,15 +593,20 @@ export const register: Register = on => {
 
   // Both shells: on Windows the PowerShell tool runs git as often as Bash does.
   on('tool.call', { tool: ['Bash', 'PowerShell'] }, async ($, e, next) => {
+    // The scripts this command only runs, as they are before it runs, to compare afterwards.
+    const powershell = e.tool === 'PowerShell'
+    const before = await snapshotRunScripts($, e.command, e.run_in_background === true, powershell)
     // What ssh runs on another machine is left alone (the user's choice): it cannot be checked from here.
     const local = localPart(e.command)
     const action = gitAction(e.command)
     const gh = ghWrites(local)
     if (!action && !gh) {
+      let said: string | undefined
       if (local !== e.command && /\bgit\b[^;&|\n]*\b(?:commit|push)\b/.test(e.command)) {
-        $.ui.status('review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here')
+        said = 'review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here'
+        $.ui.status(said)
       }
-      return rememberShellWrites($, await next(e), e.command)
+      return rememberShellWrites($, await next(e), e.command, before, powershell, said)
     }
     let remotes: string[] = []
     let toGitHub = false
@@ -485,7 +617,7 @@ export const register: Register = on => {
       // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
       toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
     }
-    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command)
+    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell)
     const { config, note } = await loadConfig($)
     const notes = note ? [note] : []
     const found: Finding[] = []
@@ -495,10 +627,11 @@ export const register: Register = on => {
     const what = action && toGitHub ? (action.commits && action.pushes ? 'commit and push' : action.kind) : 'gh command'
     // What could only be partly checked goes with the refusal too: the status line would be overwritten.
     if (left.length > 0) return { deny: report(left, what) + (notes.length > 0 ? `\nAlso: ${notes.join('; ')}.` : '') }
-    $.ui.status(notes.length > 0
+    const said = notes.length > 0
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
-      : `review-guard: ${what} checked, nothing personal or secret found`)
-    return rememberShellWrites($, await next(e), e.command)
+      : `review-guard: ${what} checked, nothing personal or secret found`
+    $.ui.status(said)
+    return rememberShellWrites($, await next(e), e.command, before, powershell, said)
   }).catch(($, e, next) =>
     next.called ? next(e) : {
       deny: `review-guard could not check this command, so it stopped it (${next.error.message ?? next.error.kind}). If the command names ` +

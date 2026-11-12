@@ -504,6 +504,11 @@ const SHELL_WRITE = new RegExp([
   String.raw`--write\b`, String.raw`--fix\b`, String.raw`\b(?:black|autopep8|rustfmt)\s`, String.raw`\bgofmt\s+-\w*w`, String.raw`\bdotnet\s+format\b`,
 ].join('|'), 'i')
 
+// PowerShell's and cmd's own copies, moves and writes (`copy`, `cpi`, `mi`, `ren`, `sc`, `iwr`, ...), as a
+// command. Short words like these are everyday words too ("Move scan.ts later"), so this is only tested
+// on a command's text outside its here-document bodies, and only where a command starts.
+const SHELL_WRITE_PS = /(?:^|[;&|({\n]\s*)(?:copy|cpi|move|mi|ren|rni|robocopy|xcopy|sc|ac|ni|iwr)\s|\b(?:Rename-Item|New-Item|Expand-Archive|Invoke-WebRequest)\b/i
+
 /**
  * A here-document body and, from its opener's line, the command that reads it (`python -I -`, `cat > n.md`).
  * `quoted` is `<<'EOF'`: bash then takes the body as it is, with no `$`, backtick or backslash expansion.
@@ -659,7 +664,7 @@ const REDIRECT = /\d?>>?\s*([^\s<>]+)/g
 function onlyRun(command: string): { outside: string; runs: Map<string, number> } | undefined {
   const { outside, bodies, complete } = heredocs(command)
   // `--pre`: `rg --pre bash` runs a program on every file it reads, so rg is not read-only then.
-  if (!complete || outside.includes('$') || /--pre\b/.test(outside) || SHELL_WRITE.test(outside)) return undefined
+  if (!complete || outside.includes('$') || /--pre\b/.test(outside) || SHELL_WRITE.test(outside) || SHELL_WRITE_PS.test(outside)) return undefined
   const written = new Set<string>() // what the bodies write: running one of these runs new code
   for (const body of bodies) {
     if (body.piped) return undefined // `cat <<EOF | bash`: the body goes on to something else
@@ -776,7 +781,9 @@ function blankDataBodies(full: string, local: string): string {
  * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
  * safer mistake than a change nobody looked at. Three things are left out: what ssh runs on another
  * machine (`localPart`), the text of data here-documents nothing here runs (`blankDataBodies`), and a
- * script run after here-documents that only write notes (`onlyRun`).
+ * script run after here-documents that only write notes (`onlyRun`). The caller leaves out two more: the
+ * scripts a command only ran, shown by their file being the same before and after (`runOnlyScripts`), and
+ * Claude's scratch files (`inScratch`).
  */
 export function shellWrites(fullCommand: string): string[] {
   // What ssh runs on another machine writes no file here, and a data heredoc's text runs nowhere here.
@@ -789,7 +796,7 @@ export function shellWrites(fullCommand: string): string[] {
     const target = unquote(m[1] ?? '')
     if (languageOf(target)) out.add(target)
   }
-  if (SHELL_WRITE.test(command)) {
+  if (SHELL_WRITE.test(command) || SHELL_WRITE_PS.test(heredocs(command).outside)) {
     const trusted = onlyRun(command)
     // Shell words, quotes kept together: "$DST/hooks/a.ts" is one word, not "$DST" and "/hooks/a.ts".
     const mentions = new Map<string, number>()
@@ -802,6 +809,158 @@ export function shellWrites(fullCommand: string): string[] {
   }
   return [...out]
 }
+
+/** How paths are spelled on this machine: Windows (drive letters, Git Bash `/c/`, any case) or not. */
+export type Paths = { windows: boolean; home?: string; userProfile?: string }
+
+// A path as one comparable string: forward slashes, no trailing slash, and on Windows Git Bash's `/c/` as
+// `C:/` and lower case (Linux file names are case-sensitive, so they keep theirs).
+function comparable(p: string, windows: boolean): string {
+  const s = p.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  return windows ? nativePath(s).toLowerCase() : s
+}
+
+/**
+ * Whether a path is in one of Claude's own scratch folders: a `claude` or `claude-<number>` folder right inside
+ * a temp folder (`tempDirs`, the machine's TEMP, TMP and TMPDIR, plus /tmp and /var/tmp when `posixTmp`:
+ * the PowerShell tool reads /tmp as C:\tmp). That is where the session's scratchpad and task output live,
+ * and code there is throwaway, so it is never sent for review. Anything else in a temp folder, such as a
+ * repo cloned to /tmp, still is. A path with a `..`, and a temp folder that is not absolute or is a drive
+ * root or `/`, never count.
+ */
+export function inScratch(path: string, tempDirs: readonly string[], windows: boolean, posixTmp: boolean): boolean {
+  const p = comparable(path, windows)
+  if (p.split('/').includes('..')) return false
+  const roots = [...tempDirs, ...(posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, windows))
+  const claude = windows ? /^claude(?:-\d+)?\/./i : /^claude(?:-\d+)?\/./
+  return roots.some(r => /^(?:[a-z]:)?\/[^/]/i.test(r) && p.startsWith(`${r}/`) && claude.test(p.slice(r.length + 1)))
+}
+
+// Words that move the shell to another folder, in Bash and PowerShell.
+const MOVES = /(?:^|[^\w$.-])(?:cd|chdir|pushd|popd|Set-Location|sl|Push-Location|Pop-Location)(?![\w-])/gi
+
+/**
+ * The command's parts split at `;`, `&&`, `||`, `|`, `&` and new lines outside quotes, each as its words
+ * (quotes removed, the program first). Undefined when the command has a subshell, a group, a command
+ * substitution, a backtick or a background job (`&`) outside quotes: then where and when its parts run
+ * is not plain from the text.
+ */
+function commandParts(text: string): string[][] | undefined {
+  const parts: string[][] = []
+  let words: string[] = []
+  let word = ''
+  let quote = ''
+  let quoted = false // the word holds a quoted part, so '' is still a word
+  const endWord = () => {
+    if (word || quoted) words.push(word)
+    word = ''
+    quoted = false
+  }
+  const endPart = () => {
+    endWord()
+    if (words.length) parts.push(words)
+    words = []
+  }
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] ?? ''
+    if (quote) {
+      if (ch === quote) quote = ''
+      else word += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      quoted = true
+    } else if ('(){}`'.includes(ch)) {
+      return undefined
+    } else if (';&|\n'.includes(ch)) {
+      if (ch === '&' && /[<>]$/.test(word)) word += ch // `2>&1`, `>&2`: a redirect, not a split
+      else if (ch === '&' && text[i + 1] !== '&' && text[i - 1] !== '&') return undefined // a background job
+      else endPart()
+    } else if (/\s/.test(ch)) {
+      endWord()
+    } else {
+      word += ch
+    }
+  }
+  if (quote) return undefined
+  endPart()
+  return parts
+}
+
+// Programs that start another program and return before it ends: what they start can write later.
+const DETACHES = /(?:^|[^\w-])(?:nohup|setsid|disown|Start-Process|Start-Job|saps|start)(?![\w-])/i
+
+/**
+ * The scripts a command only runs, each with the file on disk it must be (`python -I gen.py` runs
+ * `<folder>/gen.py`). A script counts only when the command, here-document bodies included, names it
+ * nowhere but as what an interpreter runs (`sed -i x gen.py; python gen.py` names it twice, so it is out).
+ * A relative name is placed only when the command starts by moving to a known folder (`cd /abs && ...`)
+ * and nothing else in it moves the shell (another cd, pushd or popd, `source`, an escaped builtin like
+ * `c\d`): where the shell stands before the command is not known here. `powershell`: the command is for
+ * the PowerShell tool, where `~` and $HOME are the user's profile folder. None when the command starts
+ * something in the background, or its here-documents can't be told apart.
+ *
+ * What it gives is only a candidate: the caller compares the file before and after the command, and only a
+ * file the command left as it was is left out of the review.
+ */
+export function runOnlyScripts(command: string, paths: Paths, powershell = false): Map<string, string> {
+  const out = new Map<string, string>()
+  const docs = heredocs(command)
+  if (!docs.complete) return out
+  const outside = docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' ')
+  const parts = commandParts(outside)
+  if (!parts || DETACHES.test(outside)) return out
+  // Home spellings: in Bash `~` and $HOME are HOME; in PowerShell they and $env:USERPROFILE are the
+  // profile folder. A missing one leaves the name unknown, never filled in from the other.
+  const homeHere = powershell ? paths.userProfile : paths.home
+  const expand = (p: string): string | undefined => {
+    let e = p
+    if (/^(?:~|\$HOME|\$\{HOME\})(?=$|[\\/])/.test(e)) e = homeHere ? e.replace(/^(?:~|\$HOME|\$\{HOME\})/, homeHere) : ''
+    else if (/^(?:\$USERPROFILE|\$\{USERPROFILE\}|\$env:USERPROFILE)(?=$|[\\/])/i.test(e)) {
+      e = paths.userProfile ? e.replace(/^[^\\/]+/, paths.userProfile) : ''
+    }
+    if (!e || /[$`%*?~]/.test(e)) return undefined
+    const f = e.replace(/\\/g, '/')
+    return paths.windows ? nativePath(f) : f
+  }
+  const absolute = (p: string) => (paths.windows ? /^[A-Za-z]:\// : /^\//).test(p)
+  // The programs, after `sudo`, `env` and VAR=value.
+  const programs = parts.map(argv => {
+    const words = [...argv]
+    while (words.length && (BEFORE_PROGRAM.has(words[0] ?? '') || /^[A-Za-z_]\w*=/.test(words[0] ?? ''))) words.shift()
+    return words
+  })
+  // The folder the command starts in: only `cd <folder>` as its very first part, and nothing else that
+  // moves the shell. `source` and `.` run a file in this shell; in Bash `c\d` is cd.
+  let base: string | undefined
+  const moves = [...outside.matchAll(MOVES)].length
+  const hidden = programs.some(w => /^(?:source|\.)$/.test(w[0] ?? '') || (!powershell && (w[0] ?? '').includes('\\')))
+  const first = parts[0] ?? []
+  if (moves === 1 && !hidden && /^(?:cd|Set-Location|sl|chdir)$/i.test(first[0] ?? '') && first.length === 2) {
+    const dir = expand(first[1] ?? '')
+    if (dir && absolute(dir)) base = dir.replace(/\/+$/, '')
+  }
+  const runs = new Map<string, number>()
+  for (const words of programs) {
+    if (!INTERPRETER.test(commandName(words[0] ?? ''))) continue
+    const target = runTarget(words.filter(w => !/^\d*[<>]/.test(w)))
+    if (target && target !== '-') runs.set(target, (runs.get(target) ?? 0) + 1)
+  }
+  for (const [script, n] of runs) {
+    // Named anywhere else, in the command or a here-document body, as a word or inside one: it may be written.
+    if (command.split(script).length - 1 !== n) continue
+    const s = expand(script)
+    if (s === undefined) continue
+    const place = absolute(s) ? s : base === undefined ? undefined : `${base}/${s.replace(/^(?:\.\/)+/, '')}`
+    if (place !== undefined) out.set(script, place)
+  }
+  return out
+}
+
+/**
+ * Whether a command copies or moves files (`cp`, `mv`, `rsync`, `Copy-Item`, `copy`, ...), as a command,
+ * not a word in text. A scratch file it names may be the source of a write into the project.
+ */
+export const COPIES = /(?:^|[;&|({\n]\s*|\b(?:sudo|xargs)\s+)(?:cp|mv|rsync|install|ditto|scp|Copy-Item|Move-Item|Rename-Item|copy|cpi|move|mi|ren|rni|robocopy|xcopy)(?=\s)/i
 
 const SECURITY: Record<Language, string> = {
   Python: 'SQL built from strings, shell=True or os.system with input, eval/exec, pickle or yaml.load, path traversal, requests to URLs from input (SSRF), weak crypto. Run `bandit -q` on the changed files if bandit is installed.',
