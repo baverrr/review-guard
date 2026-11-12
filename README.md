@@ -118,6 +118,10 @@ So is a script a command only runs, when its file is unchanged after the command
 and for small scripts the same text). The status line names each file left out. To turn the mod off for
 a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your settings.
 
+**"It checked a commit or push I didn't make."** A command that writes a file holding a git command (a test,
+a note) and also runs a script is checked, since the guard can't tell whether the script runs it. A test
+that only calls a helper like `git(repo, 'commit')` is not.
+
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
 
 **"review-guard is not under Connectors", or its tools say "out of date".** The tools need Node.js 22 or

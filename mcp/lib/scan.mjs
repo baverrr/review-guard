@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 26c369ece9ac867902ed01f0864473987b7734928019423338ccc2069b2afd8f built-sha256: 90a2ac621f33b330d3d9081fb2669219f4e8ffe057a53603f19f3160ba61285b
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: ceae61e2680140f7a163c62ba9420958f7511e2c4ab516fb11b45b1e525bf0b8 built-sha256: 1b3d8f2879b3e4b5fcad386019552badea12efff3d1efc607089190ace0a4031
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -401,6 +401,42 @@ export function localPart(command        )         {
   return chars.join('')
 }
 
+/**
+ * The text of every heredoc opened on a line that holds a `git ... commit`: the message of
+ * `git commit -F - <<'EOF'`, `-m "$(cat <<'EOF'`, `cat <<'EOF' | git commit -F -`, and also of any other
+ * heredoc on that line (`git commit -m x && cat > notes.md <<'EOF'`). Reading the line's quotes and
+ * operators the way bash does is where earlier versions lost messages (`2>&1`, `--author='R&D'`), so
+ * every body there counts: more text scanned, never less. A terminator is a word (letters, digits, `_`,
+ * `-`, `.`), bare, after `\` or in quotes, `<<-` too. A body ends only on a line that is exactly its
+ * terminator (a `\r` at the line's end dropped, leading tabs dropped for `<<-` alone), so a line like
+ * `EOF and more` is still message. With no such line, the rest of the command counts. A here-string on
+ * that line (`<<<'text'`) is message too. Undefined when there is no heredoc or here-string there.
+ */
+function commitHeredoc(cmd        )                     {
+  const lines = cmd.split('\n')
+  const bodies           = []
+  for (let i = 0; i < lines.length; i++) {
+    if (!/\bgit\b.*\bcommit\b/i.test(lines[i] ?? '')) continue // `GIT commit` too, as in gitAction
+    // Each opener's body follows the one before it, as in bash.
+    let j = i + 1
+    for (const m of (lines[i] ?? '').matchAll(/(?<!<)<<(?!<)(-?)\s*\\?(["']?)([\w.-]+)\2/g)) {
+      const body           = []
+      for (; j < lines.length; j++) {
+        const line = (lines[j] ?? '').replace(/\r$/, '')
+        if ((m[1] ? line.replace(/^\t+/, '') : line) === m[3]) break
+        body.push(line)
+      }
+      j++ // past the terminator line
+      bodies.push(body.join('\n'))
+    }
+    // A here-string is message too: `git commit -F - <<<'text'`.
+    for (const m of (lines[i] ?? '').matchAll(/<<<\s*("(?:[^"\\]|\\.)*"|'[^']*'|\S+)/g)) bodies.push(unquote(m[1] ?? ''))
+    if (j > i + 1) i = j - 1 // the bodies are message, not lines to look at again
+  }
+  const text = bodies.filter(Boolean).join('\n')
+  return text || undefined // only empty bodies: nothing to add
+}
+
 /** A commit or push this shell command is about to make on this machine, and where. */
 export function gitAction(command        )                        {
   // What ssh runs elsewhere is blanked, and so is the text of a script written here only to be sent to
@@ -411,9 +447,18 @@ export function gitAction(command        )                        {
   // could move: with one in the command, written bodies are not blanked.
   const local = blankDataBodies(joined, localPart(joined))
   const cmd = /\\\r?\n/.test(command) ? local : blankWrittenScripts(local)
-  const push = /\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)/.exec(cmd)
-  const ghPush = /\bgh\s+repo\s+create\b[^;&|\n]*--push\b/.exec(cmd)
-  const commit = /\bgit\b[^;&|\n]*\bcommit\b/.exec(cmd)
+  // A `;`, `&` or `|` inside quotes ends no command (`git -c user.name='A & B' commit`). In `ops` those are
+  // made `\x01` (not a word character, so `\bgit` still matches after one), keeping every index, before the
+  // git words are looked for. Quotes pair only within a line, and an escaped quote (`it\'s`) is skipped, so
+  // an apostrophe in a note or comment can't pair with a quote lines later. A `2>&1` stays: it only ends
+  // the search early on a line that has the git words before it.
+  const ops = cmd.replace(/\\.|"(?:[^"\\\n]|\\.)*"|'[^'\n]*'/g, q => (q.startsWith('\\') ? q : q.replace(/[;&|]/g, '\x01')))
+  // `Git` and `GIT` run git too on Windows, whose file names ignore case.
+  const push = /\b[Gg][Ii][Tt]\b[^;&|\n]*?\bpush\b([^;&|\n]*)/.exec(ops)
+  const ghPush = /\bgh\s+repo\s+create\b[^;&|\n]*--push\b/.exec(ops)
+  const commit = /\b[Gg][Ii][Tt]\b[^;&|\n]*\bcommit\b/.exec(ops)
+  // What the push names, read from the command itself at the place `ops` found (quoted words intact).
+  const pushArgs = push ? cmd.slice(push.index + push[0].length - (push[1] ?? '').length, push.index + push[0].length) : ''
   const isPush = push !== null || ghPush !== null
   const isCommit = commit !== null
   if (!isPush && !isCommit) return undefined
@@ -428,16 +473,20 @@ export function gitAction(command        )                        {
   if (dashC) dir = unquote(dashC[1] ?? '')
   const source = new RegExp(String.raw`--source[=\s]+` + path).exec(cmd)
   if (source) dir = unquote(source[1] ?? '')
-  const messages = [...cmd.matchAll(/(?:-m|--message)[=\s]+("(?:[^"\\]|\\.)*"|'[^']*'|\S+)/g)].map(m => unquote(m[1] ?? ''))
-  // A heredoc message: one opened on the commit's own line (`git commit -F - <<'EOF'`, or `-m "$(cat <<'EOF'`),
-  // any terminator spelling, `<<-` too. Its text replaces the `$(cat <<...` the -m value caught.
-  const heredoc = /^[^\n]*\bcommit\b[^\n]*<<-?\s*(["']?)([\w-]+)\1[^\n]*\n([\s\S]*?)\n\t*\2(?=\s|\)|$)/m.exec(cmd)
-  if (heredoc) messages.splice(0, messages.length, ...messages.filter(m => !/^\$\(\s*cat\s+<</.test(m)), heredoc[3] ?? '')
-  // `git commit -F file`: a heredoc in this command may have written that file, so every body counts.
-  if (/\bcommit\b[^\n]*\s(?:-F\s*|--file[=\s]+)(?!-(?:\s|$))\S/.test(cmd)) messages.push(...heredocs(cmd).bodies.map(b => b.text))
+  // `-m x`, `--message x`, `-m` at the end of combined short flags (`-am x`, `-qm x`), and a value right
+  // after it, quoted or bare (`-m"x"`, `-mx`, `-amx`). Matched anywhere in the command, so
+  // `python -m pytest` adds `pytest` and `find -name a` adds `e`: extra text only.
+  const messages = [...cmd.matchAll(/(?:(?<![\w-])-[A-Za-z]*m|--message)(?:[=\s]+|(?=\S))("(?:[^"\\]|\\.)*"|'[^']*'|\S+)/g)].map(m => unquote(m[1] ?? ''))
+  // Heredoc messages (`-F - <<'EOF'`, `-m "$(cat <<'EOF'`) are added, in place of the `$(cat <<...` an -m
+  // value caught, which ends at the body's first `"`.
+  const heredoc = commitHeredoc(cmd)
+  if (heredoc !== undefined) messages.splice(0, messages.length, ...messages.filter(m => !/^\$\(\s*cat\s+<</.test(m)), heredoc)
+  // `git commit -F file` (`-aF file` too): a heredoc in this command may have written that file, so every
+  // body counts. `-F -` reads its own heredoc, handled above.
+  if (/\bcommit\b[^\n]*\s(?:-[A-Za-z]*F\s*|--file[=\s]+)(?!-(?:\s|$))\S/.test(cmd)) messages.push(...heredocs(cmd).bodies.map(b => b.text))
   // What the push names: `git push [options] <remote> <ref>...`. Words that are not plain ref names
   // (a redirect, a variable) are left out, and the current branch is checked instead.
-  const words = (push?.[1] ?? '').trim().split(/\s+/).filter(Boolean).map(unquote)
+  const words = pushArgs.trim().split(/\s+/).filter(Boolean).map(unquote)
   const deletes = words.some(w => w === '--delete' || w === '-d')
   const refs = deletes ? [] : words.filter(w => !w.startsWith('-')).slice(1)
     .map(w => w.replace(/^\+/, '').split(':')[0] ?? '')
@@ -550,7 +599,9 @@ function heredocs(command        )                                              
     const masked = line
       .replace(/<<(-?)\s*(["'])([A-Za-z_][\w-]*)\2/g, '<<$1\x01$3') // keep a quoted terminator's name, marked
       .replace(/"[^"]*"|'[^']*'/g, '""')
-      .replace(/(^|[\s;&|()])#.*$/, '$1') // bash starts a comment after a space or ; & | ( ) too
+      // bash starts a comment at a `#` that begins a word: at the line's start, or after a space, a tab or
+      // ; & | ( ) < >. Not after \r, \v, \f or a no-break space.
+      .replace(/(^|[ \t;&|()<>])#.*$/, '$1')
     // A backslash can escape a quote (`-"\" <<EOF"`), which the masking above can't follow.
     if (/["'`\\]/.test(masked.replace(/""/g, '')) || line.includes('\\') || /[<>]\(/.test(masked)) complete = false
     const opener = i // a second heredoc on this line starts after the first one's body, but opens here
@@ -660,7 +711,7 @@ function loadedModules(text        )           {
 // The same file spelled two ways (`./gen.txt`, `gen.txt`, `GEN.TXT` on Windows) is one file.
 const sameFile = (name        ) => name.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').toLowerCase()
 
-const REDIRECT = /\d?>>?\s*([^\s<>]+)/g
+const REDIRECT = /\d?>[>|]?\s*([^\s<>]+)/g // `>|` too, so its `|` is not read as a pipe
 
 /**
  * Code files that a command only runs, never writes, so they need no review, and the command's own text
@@ -746,14 +797,18 @@ const RUNS_NOTHING = new Set(['cat', 'mkdir', 'sleep', 'date', 'export', 'for', 
  * RUNS_NOTHING (`bash`, `python`, `xargs`, `eval`, `.`, `read` loops and anything unknown run something,
  * so nothing is blanked), and none may hold `$(...)`, a backtick, `--pre` (`rg --pre bash` runs a
  * program), `exec` (`exec >file` sends a screen heredoc into a file), or anything that could make `cat`
- * another program (a PATH assignment, a function or an alias). Nothing is blanked when the heredoc split is a guess, and a body that is piped on or shares
- * its opener line with another heredoc is kept.
+ * another program (a PATH assignment, a function or an alias). The redirects `>|`, `&>` and `>&file` are
+ * refused too (their target is read from the opener line by a pattern that sees only `>` and `>>`), and so
+ * is any space-like character but a space, a tab or a newline (see `ODD_SPACE`). Nothing is blanked when
+ * the heredoc split is a guess, and a body that is piped on or shares its opener line with another heredoc
+ * is kept.
  */
 function blankDataBodies(full        , local        )         {
   const command = local
   const { outside, bodies, complete } = heredocs(command)
-  // `exec >file` sends a later screen heredoc into that file.
-  if (!complete || /\$\(|`|--pre\b|\bPATH=|\(\s*\)|\b(?:function|alias|exec)\b/.test(outside.replace(/'[^'\n]*'/g, "''"))) return command
+  // `exec >file` sends a later screen heredoc into that file. `>|`, `&>` and `>&file` write one to a file
+  // (`cat <<'EOF' >|~/bin/ls`), and the `|` of `>|` would also split the command where bash doesn't.
+  if (!complete || /\$\(|`|--pre\b|\bPATH=|\(\s*\)|\b(?:function|alias|exec)\b|>\||&>|>&\s*[^\d\s-]/.test(outside.replace(/'[^'\n]*'/g, "''")) || oddSpace(outside)) return command
   const masked = outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""').replace(/\d*>&\d+/g, '')
   for (const cmd of masked.split(/&&|\|\||[;&|\n]/)) {
     const name = commandName(programWords(cmd.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(REDIRECT, ''))[0] ?? '')
@@ -772,7 +827,7 @@ function blankDataBodies(full        , local        )         {
     if (!b.quoted || b.piped || perLine.get(b.line) !== 1) continue
     if (!/^(?:\S*[\\/])?cat(?:\.exe)?(?:\s+-\S*)*$/i.test(b.reader.replace(REDIRECT, '').trim())) continue
     // Every redirect target on the opener's line, as spelled there (the masked reader hides quoted names).
-    const targets = [...(lines[b.line] ?? '').matchAll(/(?<![0-9&<])\d?>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)].map(m => unquote(m[1] ?? ''))
+    const targets = [...(lines[b.line] ?? '').matchAll(/(?<![0-9&<])\d?>[>|]?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)].map(m => unquote(m[1] ?? ''))
     if (!targets.every(t => t === '/dev/null' || sentToSsh(t))) continue // a file left here may run later
     for (let k = b.from; k < b.to; k++) lines[k] = ''
   }
@@ -790,11 +845,46 @@ const NOT_A_SHELL = /^(?:mkdir|rm|diff|sha256sum|md5sum)$/
 // launcher (it follows a `#!/usr/bin/env bash` line) and bun (it runs `.sh` files, and `bun x` may be a
 // package.json script named x).
 const SCRIPT_OF = new Map                ([['python', /\.pyw?$/i], ['node', /\.[cm]?js$/i]])
-// A body that may start programs itself (`subprocess.run(['git', 'push'])`, `execSync('bash x')`) is kept: the
-// guard can't follow what a script runs, but it can still see such a body's text. Best effort, so it is
-// wide: any import of os, subprocess or pty, any child_process, any dynamic import, any call named like
-// system, popen, exec or spawn.
-const STARTS_PROGRAMS = /\b(?:subprocess|pty|child_process|__import__|importlib|getattr|globals|eval|Popen|execa|shelljs|zx|Deno|Bun|(?:import|from)\s+os\b|os\s*\.|require\s*\(|import\s*\(|(?:system|popen|exec\w*|spawn\w*|startfile|fork)\s*\()/
+// A body that may start programs itself (`subprocess.run(['git', 'push'])`, `execSync('bash x')`) or use git
+// through a library (`import git`, `pygit2`, `isomorphic-git`) is kept: the guard can't follow what a
+// script runs, but it can still see such a body's text. Best effort, so it is wide and ignores case. Call
+// names (spawn, exec, popen, system, fork, binding and the like) match inside longer names too
+// (`create_subprocess_shell`, `os.posix_spawn`, `execSync`); a body kept by mistake (`filesystem`) only
+// costs a check. Module and runtime names (pty, asyncio, ctypes, child_process, Deno, ...) match at a
+// word's start (`ptyprocess`, and `evaluate` by mistake), and the short ones (nt, sh, zx) as whole words
+// only. Node's static `import ... from` (a helper module may run anything) and Python's `import`/`from` of
+// os, git or sh count too. The regex is the full list. Every part runs in time linear in the body: `^` is
+// followed by `[ \t]*`, never `\s*`, which would cross blank lines again from each one.
+const STARTS_PROGRAMS = new RegExp([
+  String.raw`subprocess|spawn|popen|system|exec|fork|startfile|pipepager|getBuiltinModule|binding|dlopen`,
+  String.raw`\bcode\s*\.\s*interact`,
+  String.raw`\b(?:pty|asyncio|multiprocessing|pydoc|ctypes|cffi|webbrowser|runpy|posix|_winapi|child_process|__import__|importlib|getattr|globals|builtins|__dict__|eval|shelljs|Deno|Bun|pexpect|plumbum|invoke|fabric|pygit2|dulwich|isomorphic-git|simple-git|nodegit)`,
+  String.raw`\b(?:nt|sh|zx)\b`,
+  String.raw`\b(?:import|from)\s+(?:os|git|sh)\b`,
+  String.raw`^[ \t]*import\b[^\n]*\bfrom\b`,
+  String.raw`\bos\s*\.|\brequire\s*\(|\bimport\s*\(|\bprocess\s*\[`,
+].join('|'), 'im')
+// A git push or commit command line, or `gh repo create --push`, inside the body's text (`'git push origin
+// main'`, `"git -C 'my repo' commit -am y"`, `git.exe push`): when the command runs a script at all, a body
+// that holds one is kept, as no list of the calls that start programs is complete. It needs a space after
+// `git`, so a test helper's call (`git(repo, 'commit')`) or an argument list (`['git', 'push']`) is not one.
+// Prose that says "git push" counts too, while a script runs: kept by mistake, it only costs a check.
+// Read line by line, from the first `git ` on it, so a line of many `git ` words is read once, not once each.
+function gitCommandText(text        )          {
+  return text.split('\n').some(line => {
+    const at = line.search(/\bgit(?:\.exe)?[ \t]/i)
+    if (at >= 0 && /\b(?:push|commit)\b/i.test(line.slice(at))) return true
+    const gh = line.search(/\bgh[ \t]+repo[ \t]+create\b/i)
+    return gh >= 0 && line.includes('--push', gh)
+  })
+}
+// Space-like characters other than a space, a tab and a newline (`\r` mid-line, `\v`, `\f`, a no-break
+// space), and other control characters. JavaScript's `\s` takes most of them as spaces and bash does
+// not, so the patterns here would split words where bash doesn't (`true\r# ; bash x` runs `bash x`).
+// A `\r` that ends a line is fine: `heredocs()` drops it before `outside` is built. Inside quotes bash reads
+// them as plain characters too, so only unquoted ones count (`ls 'a<no-break space>b'` is fine).
+const ODD_SPACE = /[^\S \t\n]|[\x00-\x08\x0e-\x1f\x7f]/
+const oddSpace = (outside        ) => ODD_SPACE.test(outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""'))
 // The only files a body may be written to and still be blanked: scripts of the languages above and plain
 // text, outside `.git`. Anything else (a file with no extension on PATH, `.bashrc`, a git hook, `.git/config`,
 // `package.json`, `tox.ini`, a Makefile) may be run later by a shell or git, unseen. Git runs a hook only by
@@ -804,7 +894,7 @@ const PLAIN_TARGET = /^(?!.*(?:^|[\\/])\.git[\\/])(?:.*[\\/])?[\w-][\w.-]*\.(?:p
 // Variables that change which program runs, or make a shell or interpreter run more code.
 // Also the usual exported ones: setting one changes the environment of every program started after it
 // (`APPDATA=` moves where Python loads `usercustomize`, `COMSPEC=` is the shell `shell=True` starts).
-const RUNS_WITH = /^(?:PATH|PATHEXT|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|PS4|IFS|CDPATH|LD_\w+|DYLD_\w+|NODE_\w+|PYTHON\w*|BUN_\w+|GIT_\w+|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|COMSPEC|SHELL|TEMP|TMP|TMPDIR|SYSTEMROOT|WINDIR|XDG_\w+)$/i
+const RUNS_WITH = /^(?:PATH|PATHEXT|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|PS4|IFS|CDPATH|LD_\w+|DYLD_\w+|NODE_\w+|PYTHON\w*|BUN_\w+|GIT_\w+|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|COMSPEC|SHELL|TEMP|TMP|TMPDIR|PWD|OLDPWD|SYSTEMROOT|WINDIR|XDG_\w+)$/i
 
 /**
  * The words of one command, from the program on: shell words that come before a program (`sudo`, `env`,
@@ -846,10 +936,13 @@ function programWords(cmd        , set           = [])           {
  * - A variable is read only as `$TMP`, `$TEMP`, `$TMPDIR`, `$HOME`, `$USERPROFILE`, `$LOCALAPPDATA` or `$PWD`
  *   (the machine's, as none of them may be set here): another could turn `python $S.py` into `python -c ...`.
  * - Every redirect in the command, on any line, must go to `/dev/null` or a PLAIN_TARGET file, and `&>`,
- *   `>&file` and `<>` are refused: `cat x.txt > ~/bin/python` copies a body where a later command runs it.
+ *   `>&file`, `<>` and `>|` are refused: `cat x.txt > ~/bin/python` copies a body where a later command runs it.
+ * - Nothing is blanked either when the command has a space-like or control character bash reads
+ *   differently (ODD_SPACE) outside the bodies. A `\r` that ends a line is fine.
  * - A body is kept when it is unquoted (bash expands `$(...)` in it), read by anything but `cat` alone,
  *   piped on (`cat <<'EOF' | bash`), shares its opener line with another heredoc, or may start programs
- *   itself (STARTS_PROGRAMS).
+ *   itself (STARTS_PROGRAMS), or holds a git commit or push command line while the command runs a script
+ *   (`gitCommandText`).
  * - `#` comments are read as bash reads them, and `timeout DURATION` and prefix words as `programWords` does.
  * - The caller does not use this when the command holds a `\`-newline (see `gitAction`).
  *
@@ -857,9 +950,10 @@ function programWords(cmd        , set           = [])           {
  */
 function blankWrittenScripts(command        )         {
   const { outside, bodies, complete } = heredocs(command)
-  if (!complete || /\$\(|`|[<>]\(|\(\s*\)|\b(?:function|alias)\b|&>|>&\s*[^\d\s-]|<>/.test(outside)) return command
+  // `>|` writes past noclobber, and its `|` would split the command where bash doesn't. ODD_SPACE: see there.
+  if (!complete || /\$\(|`|[<>]\(|\(\s*\)|\b(?:function|alias)\b|&>|>&\s*[^\d\s-]|<>|>\|/.test(outside) || oddSpace(outside)) return command
   const lines = command.split('\n')
-  const TARGET = /(?<![0-9&<])\d?>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g
+  const TARGET = /(?<![0-9&<])\d?>[>|]?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g // `>|` is refused above; read here too as a backup
   const base = (path        ) => commandName(path.replace(/\\/g, '/'))
   // Every redirect target in the command, on any line: each must be a file nothing runs later.
   const targets = [...outside.matchAll(TARGET)].map(m => unquote(m[1] ?? ''))
@@ -867,10 +961,11 @@ function blankWrittenScripts(command        )         {
   const written = new Set(targets.map(base))
   // Quotes are taken off, keeping what is inside as one word: `"bash"` and `b""ash` are bash.
   const plain = outside.replace(/"([^"\n]*)"|'([^'\n]*)'/g, (_, a, b) => String(a ?? b ?? '').replace(/[\s;&|<>()#]/g, '_'))
-    .replace(/(^|[\s;&|()])#.*$/gm, '$1') // a comment, as bash reads one (a # in quotes is gone already)
+    .replace(/(^|[ \t;&|()<>])#.*$/gm, '$1') // a comment, as bash reads one (a # in quotes is gone already)
   // A variable other than the machine's own folders, or one of those set here, may hold anything.
   const MACHINE = /\$\{?(?:TMP|TEMP|TMPDIR|HOME|USERPROFILE|LOCALAPPDATA|PWD)\b\}?/g
   if (plain.replace(MACHINE, '').includes('$')) return command
+  let runsScript = false
   for (const cmd of plain.split(/&&|\|\||[;&|\n]/)) {
     const raw = cmd.replace(/<<-?\s*[\w-]+/g, '').replace(REDIRECT, '').trim().split(/\s+/).filter(Boolean)
     if (raw.some(w => w === 'exec' || w.startsWith('--pre') || /[{}]/.test(w))) return command
@@ -888,11 +983,13 @@ function blankWrittenScripts(command        )         {
     if (READ_ONLY.test(name) || NOT_A_SHELL.test(name)) continue
     const target = script ? runTarget(words) : undefined
     if (!script || !target || !script.test(target)) return command
+    runsScript = true
   }
   const perLine = new Map                ()
   for (const b of bodies) perLine.set(b.line, (perLine.get(b.line) ?? 0) + 1)
   for (const b of bodies) {
     if (!b.quoted || b.piped || perLine.get(b.line) !== 1 || STARTS_PROGRAMS.test(b.text)) continue
+    if (runsScript && gitCommandText(b.text)) continue
     if (!/^cat(?:\s+-\S*)*$/i.test(b.reader.replace(REDIRECT, '').trim())) continue
     for (let k = b.from; k < b.to; k++) lines[k] = ''
   }
@@ -915,7 +1012,9 @@ export function shellWrites(fullCommand        )           {
   // A wildcard, a variable or a sed pattern is not a file name: `src/*.ts`, `$DIR/a.py`, `hooks\/a.ts`.
   const notAName = (raw        ) => /[*?^$]|\\\//.test(raw)
   const out = new Set        ()
-  for (const m of command.matchAll(/(?<![0-9&>])>>?\s*(?!&)("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)) {
+  // `>`, `>>` and `>|`, with an fd number (`1>`, `2>|`) or `&` (`&>`, `&>>`) before it, and `<>` (opened
+  // to read and write, `exec 3<>a.py`). Not `2>&1`.
+  for (const m of command.matchAll(/(?<![<>&])(?:(?:\d+|&)?(?<![<>])>[>|]?|\d*<>)\s*(?!&)("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)) {
     if (notAName(m[1] ?? '')) continue
     const target = unquote(m[1] ?? '')
     if (languageOf(target)) out.add(target)
@@ -926,8 +1025,23 @@ export function shellWrites(fullCommand        )           {
     const mentions = new Map                ()
     for (const raw of (trusted?.outside ?? command).match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
       if (notAName(raw)) continue
-      const word = raw.replace(/["']/g, '')
-      if (word.length > 2 && !word.startsWith('-') && languageOf(word)) mentions.set(word, (mentions.get(word) ?? 0) + 1)
+      const whole = raw.replace(/["']/g, '')
+      // A quoted string with a line break, or a shell operator with a space on either side, or a `#` followed
+      // by a space, may be a piece of shell (a test case in a script): the names inside it count one by one.
+      // A piece that is not a Windows path is split at `\n` and `\r` escapes too (`C:\tools\new.py` and
+      // `src\new.py` hold no escapes). The whole string counts as well (`"R & D/app.py"` is a real name),
+      // except one with a line break, or a shell-like one with a `\n` or `\r` escape outside a Windows path:
+      // no file name holds those. Anything else stays whole, as before (`scripts\release.py`).
+      // A Windows path: one from a drive or `.\`, or a relative one with no spaces (`src\new.py`, not `true\r# ;`).
+      const windowsPath = (s        ) => /^(?:[A-Za-z]:|\.{1,2})?\\/.test(s) || (!/\s/.test(s) && /^[\w.-]+\\[\w.-]/.test(s))
+      const shellLike = /[\r\n]|\s[;|&<>]|[;|&<>]\s|#\s/.test(whole)
+      const words = shellLike
+        ? whole.split(/[\s;|&<>()#,=[\]{}`]+/).flatMap(piece => (windowsPath(piece) ? [piece] : piece.split(/\\[nr]/)))
+        : []
+      if (!/[\r\n]/.test(whole) && (!shellLike || windowsPath(whole) || !/\\[nr]/.test(whole))) words.push(whole)
+      for (const word of words) {
+        if (word.length > 2 && !word.startsWith('-') && languageOf(word)) mentions.set(word, (mentions.get(word) ?? 0) + 1)
+      }
     }
     for (const [word, count] of mentions) if ((trusted?.runs.get(word) ?? 0) < count) out.add(word)
   }

@@ -161,8 +161,9 @@ describe('git commands', () => {
       `${fix}nohup python /tmp/t/fix.py`, `${fix}env python /tmp/t/fix.py`, `${fix}time python /tmp/t/fix.py`,
       `${fix}.venv/Scripts/python.exe /tmp/t/fix.py`, // a venv's python, spelled as a path
       `S=/tmp/t\nS+=/u\n${fix}python /tmp/t/fix.py`, // variables set alone
-      `${fix}cat > /tmp/t/b.md <<'B'\ngit push origin main\nB\npython /tmp/t/fix.py`, // two bodies, each on its own line
-      `cat > /dev/null <<'EOF'\ngit push origin main\nEOF\npython /tmp/t/fix.py`,
+      `${fix}cat > /tmp/t/b.md <<'B'\nnotes\nB\npython /tmp/t/fix.py`, // two bodies, each on its own line
+      `cat > /dev/null <<'EOF'\nnotes\nEOF\npython /tmp/t/fix.py`,
+      `cat > /tmp/t/b.md <<'B'\ngit push origin main\nB\ncat /tmp/t/b.md`, // git text, but no script runs, so it is blanked
       `cat > src/hooks/use.js <<'EOF'\ngit(repo, 'push')\nEOF\nnode src/hooks/use.js`, // git runs hooks by exact name only
       "cat > /tmp/t/fix.py <<-'PYEOF'\n\tgit(repo, 'commit')\n\tPYEOF\npython /tmp/t/fix.py",
       "cat > /tmp/t/fix.py <<'PYEOF'\r\ngit(repo, 'commit')\r\nPYEOF\r\npython /tmp/t/fix.py\r\n",
@@ -187,6 +188,12 @@ describe('git commands', () => {
       'PATH=/tmp/t python a.py', 'PATH+=:/tmp/t; python a.py', 'path=/tmp/t', 'export PATH=/tmp/t', 'readonly BASH_ENV=/tmp/t/x.py',
       'BASH_ENV=/tmp/t/x.py', 'X=1 python a.py', 'GIT_DIR=/c/p', 'APPDATA=/tmp/t', 'HOME=/tmp/t', 'NODE_OPTIONS=--require=/tmp/t/a.js',
       'PYTHONPATH=/tmp/t', 'LD_PRELOAD=/tmp/t/x.so', 'IFS=/', 'ENV=/tmp/t/x.py', 'PROMPT_COMMAND=x', 'PATHEXT=.PY', 'COMSPEC=/tmp/t/x.exe',
+      // Setting any RUNS_WITH variable is refused. That is also why `$TMP`, `$PWD` and the other machine
+      // folders can be trusted when read.
+      'PWD=/x', 'OLDPWD=/x', 'TMP=/x', 'TEMP=/x', 'TMPDIR=/x', 'USERPROFILE=/x', 'LOCALAPPDATA=/x', 'PROGRAMDATA=/x', 'SHELLOPTS=x', 'BASHOPTS=x',
+      'PS4=x', 'CDPATH=/x', 'DYLD_INSERT_LIBRARIES=/x', 'BUN_X=1', 'SHELL=/x', 'SYSTEMROOT=/x', 'WINDIR=/x', 'XDG_CONFIG_HOME=/x',
+      // A carriage return, vertical tab, form feed or no-break space (U+00A0) before `#` starts no comment in bash.
+      'true\r# ; bash /tmp/t/x.py', 'true\v# ; bash /tmp/t/x.py', 'true\f# ; bash /tmp/t/x.py', 'true # ; bash /tmp/t/x.py',
     ]) counts(shell + run)
     // A written file run by its path, even with a harmless name.
     counts("cat > /tmp/t/python <<'EOF'\ngit commit -am x\nEOF\n/tmp/t/python a.py")
@@ -229,7 +236,49 @@ describe('git commands', () => {
       // A body that may start programs, in other spellings.
       "cat > /tmp/t/r.py <<'EOF'\nfrom os import system as s\ns('git push origin main')\nEOF\npython /tmp/t/r.py",
       "cat > /tmp/t/r.py <<'EOF'\n__import__('os').system('git push origin main')\nEOF\npython /tmp/t/r.py",
+      // `>|` writes like `>`, and `<>` opens a file for writing.
+      `${txt}cat /tmp/t/x.txt >| ~/bin/python a.py\npython a.py`,
+      `${txt}cd ~/bin && cat /tmp/t/x.txt >|ls; ls`,
+      `${txt}cat /tmp/t/x.txt 1<>~/bin/python\npython a.py`,
+      "cat <<'EOF' >|~/bin/ls\n#!/bin/sh\ngit commit -m x\nEOF\nls",
+      "cat <<'EOF' &>~/bin/ls\n#!/bin/sh\ngit commit -m x\nEOF\nls", // a screen heredoc sent to a file with &>
+      // A body with a git push or commit command line in its text, run by its script, is kept even when no
+      // call STARTS_PROGRAMS lists runs it.
+      "cat > /tmp/t/r.py <<'EOF'\nimport helpers\nhelpers.run('git push origin main')\nEOF\npython /tmp/t/r.py",
+      "cat > /tmp/t/r.py <<'EOF'\nhelp('git -C /c/p commit -am x')\nEOF\npython /tmp/t/r.py",
+      ...["git.exe push origin main", 'git -C "/c/my p" push', 'git -c "a=b c" commit -m x', 'git --work-tree /c/p push',
+        'Git push', 'gh repo create x --source . --push'].map(t => `cat > /tmp/t/r.py <<'EOF'\nhelpers.run('${t}')\nEOF\npython /tmp/t/r.py`),
+      // Notes that say "git push", written while a script runs: kept by mistake, only a check.
+      "cat > notes.md <<'EOF'\nRun git push origin main to sync.\nEOF\npython -I .scripts/memory-map.py",
     ]) counts(c)
+    // Names STARTS_PROGRAMS lists, some spelled inside longer names (`posix_spawn`, `create_subprocess_shell`,
+    // `ptyprocess`), keep a body run by its script. Each body also holds a test helper's `git(repo, 'commit')`,
+    // which alone would be blanked.
+    const helper = "\ngit(repo, 'commit')"
+    for (const code of [
+      "import os\nos.system('x')", "import pty\npty.spawn(['sh'])", "import importlib\nimportlib.import_module('o' + 's')",
+      "getattr(m, 'run')('x')", "eval('1')", "Popen(['x'])", "posix_spawn('x')", "execv('x', [])",
+      "import asyncio\nasyncio.run(asyncio.create_subprocess_shell('x'))", "import pydoc\npydoc.pipepager('', 'x')",
+      "import multiprocessing", "import ctypes", "import webbrowser", "import runpy", "import code\ncode.interact()",
+      "import posix\nposix.system('x')", "import nt", "from os import system as s",
+      "import cffi", "import _winapi", "startfile('x')", "fork()", "globals()['x']", "__import__('o' + 's')",
+      "import ptyprocess", "import builtins\nbuiltins.__dict__['x']", "import pexpect", "from plumbum.cmd import ls",
+      "import git\ngit.Repo('.').index.commit('wip')", "import pygit2", "import dulwich", "import sh\nsh.ls()",
+    ]) counts(`cat > /tmp/t/r.py <<'EOF'\n${code}${helper}\nEOF\npython /tmp/t/r.py`)
+    for (const code of [
+      "process.getBuiltinModule('child_' + 'process')", "process.binding('spawn_sync')", "process['dlopen']({}, 'x')",
+      "import('child_process')", "require('fs')", "const zx = 1", "execa('x')", "Bun.spawn(['x'])", "Deno.run({})",
+      "process.linkedBinding('x')", "require('shelljs')", "import git from 'isomorphic-git'", "import { run } from './helpers.mjs'",
+      "import simpleGit from 'simple-git'",
+    ]) counts(`cat > /tmp/t/r.mjs <<'EOF'\n${code}${helper}\nEOF\nnode /tmp/t/r.mjs`)
+    hidden(`cat > /tmp/t/r.py <<'EOF'\nimport json${helper}\nEOF\npython /tmp/t/r.py`) // the control: the helper alone is blanked
+    hidden(`cat > /tmp/t/r.py <<'EOF'\nimport json${helper}\nEOF\npython /tmp/t/r.py --title café`) // a non-ASCII letter is fine
+    hidden("cat > n.md <<'EOF'\ngit push origin main\nEOF\nls 'a b'") // a no-break space inside quotes is a plain character
+    // Long bodies are read in linear time: blank lines, and a line of many `git ` words.
+    const started = Date.now()
+    gitAction(`cat > /tmp/t/r.py <<'EOF'\n${'\n'.repeat(60000)}x\nEOF\npython /tmp/t/r.py`)
+    gitAction(`cat > /tmp/t/r.py <<'EOF'\n${'git '.repeat(30000)}\nEOF\npython /tmp/t/r.py`)
+    expect(Date.now() - started).toBeLessThan(3000)
     // A real commit outside the bodies is still seen, and only a heredoc on its own line is its message.
     expect(gitAction("cat > n.py <<'EOF'\nprint(1)\nEOF\npython n.py && git commit -m done")?.message).toBe('done')
     for (const opener of ["<<'EOF'", "<<-'EOF'", '<<"EOF"', '<<EOF']) {
@@ -240,6 +289,53 @@ describe('git commands', () => {
     expect(gitAction("git commit -m \"$(cat <<'END-MSG'\nSubject\nEND-MSG\n)\"")?.message).toBe('Subject')
     // `-F file`: a heredoc that wrote the file is read as the message too.
     expect(gitAction("cat > /tmp/msg.txt <<'EOF'\nSubject here\nEOF\ngit commit -F /tmp/msg.txt")?.message).toContain('Subject here')
+    // Combined short flags carry the message too, so does `--file=`, and `--amend` is not `-am`.
+    expect(gitAction("cat > /tmp/msg.txt <<'EOF'\nSubject here\nEOF\ngit commit -aF /tmp/msg.txt")?.message).toContain('Subject here')
+    expect(gitAction("cat > /tmp/msg.txt <<'EOF'\nSubject here\nEOF\ngit commit --file=/tmp/msg.txt")?.message).toContain('Subject here')
+    expect(gitAction('git commit -am "fix: thing"')?.message).toBe('fix: thing')
+    expect(gitAction('git commit -qm "fix: thing"')?.message).toBe('fix: thing')
+    expect(gitAction('git commit --amend --no-edit')?.message).toBe('')
+    // A body ends only on a line that is exactly its terminator, tabs dropped for `<<-` alone, so every
+    // line before that is message and scanned, or, with no such line, the rest of the command.
+    expect(gitAction("git commit -F - <<'EOF'\nSubject\nEOF and more\nSECOND\nEOF")?.message).toBe('Subject\nEOF and more\nSECOND')
+    expect(gitAction("git commit -F - <<'EOF'\nSubject\n\tEOF\nSECOND\nEOF")?.message).toBe('Subject\n\tEOF\nSECOND')
+    expect(gitAction("git commit -F - <<-'EOF'\n\tSubject\n\tEOF\nnot message")?.message).toBe('\tSubject')
+    expect(gitAction("git commit -F - <<'EOF'\nSubject\nno end line")?.message).toBe('Subject\nno end line')
+    // Every heredoc on the commit's line counts, whatever stands between: a redirect, a quoted `&` or `;`,
+    // a pipe into the commit, or another command after it (more text scanned, never less).
+    for (const c of [
+      "git commit -F - 2>&1 <<'EOF'\nSECRET\nEOF",
+      "git commit --file=- >/dev/null 2>&1 <<'EOF'\nSECRET\nEOF",
+      "git commit --author='R&D <a@b.c>' -F - <<'EOF'\nSECRET\nEOF",
+      "git commit --trailer 'a;b' -F - <<'EOF'\nSECRET\nEOF",
+      "cat <<'EOF' | git commit -F -\nSECRET\nEOF",
+      "git commit -F - <<'END.MSG'\nSECRET\nEND.MSG",
+      "git commit -F - <<\\EOF\nSECRET\nEOF",
+      ": commit <<'Z'\nZ\ngit commit -F - <<'EOF'\nSECRET\nEOF", // not git's heredoc first
+      "cat > commit.md <<'A'\nnotes\nA\ngit add commit.md && git commit -m \"$(cat <<'EOF'\nSECRET\nEOF\n)\"",
+      'git commit -m "a & b" -m "$(cat <<\'EOF\'\nsay "hi" SECRET\nEOF\n)"',
+      'git commit -m"SECRET"', "git commit -am'SECRET'",
+    ]) expect([c, gitAction(c)?.message.includes('SECRET')]).toEqual([c, true])
+    expect(gitAction("git commit -m done && cat > notes.md <<'EOF'\nsome notes\nEOF")?.message).toBe('done\nsome notes')
+    // More message spellings: a heredoc on a later line, CRLF, `GIT`, a here-string, a bare attached value.
+    for (const c of [
+      "cd /c/p\ngit commit -F - <<'EOF'\nSECRET\nEOF", "git commit -F - <<'EOF'\r\nSECRET\r\nEOF\r\n",
+      "GIT commit -F - <<'EOF'\nSECRET\nEOF", "git commit -F - <<<'SECRET'", 'git commit -mSECRET', 'git commit -amSECRET',
+    ]) expect([c, gitAction(c)?.message.includes('SECRET')]).toEqual([c, true])
+    expect(gitAction("git commit -F - <<'EOF'\r\nSubject\r\nEOF\r\n")?.message).toBe('Subject')
+    expect(gitAction('git commit -m a && echo foo-m b')?.message).toBe('a') // `-m` only where a word starts
+    // A quoted `&`, `;` or `|` between git and its command ends nothing.
+    expect(gitAction("git -c user.name='A & B' commit -m x")?.commits).toBe(true)
+    expect(gitAction("git -c 'alias.x=!a|b' push origin main")?.refs).toEqual(['main'])
+    // An apostrophe in a note, a body or a comment pairs with no quote on a later line: the git lines after
+    // it are found, and a push names what it names.
+    const apostrophe = (c: string) => gitAction(c)
+    expect(apostrophe("cat > n.md <<'EOF'\nit's\nEOF\ngit push origin feature && git branch -d old 'x'")?.refs).toEqual(['feature'])
+    expect(apostrophe("cat <<'EOF' > n.txt\nwon't\nEOF\ngit -C /c/p push origin main\necho 'x'")?.dir).toBe('/c/p')
+    expect(apostrophe("git commit -F - <<'EOF'\nDon't break\nEOF\ngit push origin main\necho 'done'")?.pushes).toBe(true)
+    expect(apostrophe("cat >> Changes/log.md <<'EOF'\n- Fixed the user's thing\nEOF\ngit -C /c/v commit -am 'log' && git -C /c/v push origin main")?.commits).toBe(true)
+    expect(apostrophe("git push origin main # don't\necho 'x'")?.refs).toEqual(['main'])
+    expect(apostrophe("echo it\\'s; git push origin main; echo 'done'")?.refs).toEqual(['main'])
   })
 
   test('knows a gh command that writes from one that reads', async () => {
@@ -925,6 +1021,31 @@ test('knows which code files a shell command writes', async () => {
   expect(shellWrites('cp "$DST"/hooks/register.ts "$DEV/hooks/register.ts"')).toEqual([])
   expect(shellWrites('cat > "$S/t.ts" <<\'EOF\'\nx\nEOF')).toEqual([])
   expect(shellWrites("ssh box \"sed -i 's/a/b/' app.py\"")).toEqual([]) // written on another machine
+  // `>|` writes like `>`, and so do numbered and `&` redirects; `2>&1` writes no file.
+  for (const r of ['>|', '1>', '&>', '&>>', '2>|', '>>']) expect([r, shellWrites(`echo x ${r} src/app.py`)]).toEqual([r, ['src/app.py']])
+  expect(shellWrites('python g.py 2>&1')).toEqual([])
+  // A quoted test case with a line break or a `\n`/`\r` escape is not a file name; the names in it are.
+  // One with only a spaced operator may be a real name, so it counts whole and in pieces.
+  const probe = "cat > \"$S/p.mjs\" <<'EOF'\nconst c = ['true\\r# ; bash /tmp/t/x.py', 'cat x >| ~/bin/python\\npython a.py', \"x &&git.py\", 'one\ntwo.py']\nwriteFileSync(f, c)\nEOF\nnode \"$S/p.mjs\""
+  expect(shellWrites(probe).sort()).toEqual(['/tmp/t/x.py', 'a.py', 'git.py', 'two.py', 'x &&git.py'])
+  // A space alone, `&` or `#` with no space, and a Windows path's `\t` or `\n` keep the name whole.
+  expect(shellWrites('cp "my file.py" "R&D/#1.py" "C:\\tools\\new.py" x')).toEqual(['my file.py', 'R&D/#1.py', 'C:\\tools\\new.py'])
+  // A real name with a spaced operator or `# ` is kept whole, a Windows one too.
+  for (const name of ['R & D/app.py', 'notes # 2.py', 'x ; y.py', 'a > b.py', 'C:\\R & D\\new.py']) {
+    expect([name, shellWrites(`cp a.txt "${name}"`).includes(name)]).toEqual([name, true])
+  }
+  // Windows paths whose `\n` or `\r` is a folder's first letter, and `<>` writes, count as before.
+  for (const [c, name] of [
+    ['Copy-Item a.py src\\new.py', 'src\\new.py'], ['Copy-Item a.py .\\src\\new.py', '.\\src\\new.py'],
+    ['Move-Item tmp.ts hooks\\register.ts', 'hooks\\register.ts'], ['cp a.py scripts\\release.py', 'scripts\\release.py'],
+    ['Copy-Item "a.py" "lib\\nodes.py"', 'lib\\nodes.py'], ['Set-Content -Path scripts\\release.py -Value x', 'scripts\\release.py'],
+    ['echo x 1<>src/a.py', 'src/a.py'], ['exec 3<>src/a.py', 'src/a.py'], ['cat <>src/a.py', 'src/a.py'],
+  ]) expect([c, shellWrites(c).includes(name)]).toEqual([c, true])
+  // Each trigger alone splits a snippet: a `\n` escape (the whole is then no name), and `# `.
+  expect(shellWrites("cp a.txt b.txt; echo 'x ; /tmp/y\\na.py'")).toEqual(['a.py'])
+  expect(shellWrites("cp a.txt b.txt; echo 'x # a.py'").sort()).toEqual(['a.py', 'x # a.py'])
+  // The names in a snippet are split at the outer word pattern's own delimiters too.
+  expect(shellWrites('cp a.txt b.txt; python -c "open(\'x.py\',\'w\')\nprint(1)"')).toContain('x.py')
   // A script run after here-documents that only write notes is not written (the one exception).
   const notes = "python -I - <<'EOF'\nimport pathlib\npathlib.Path('notes.md').write_text('x')\nEOF\n"
   expect(shellWrites(notes + 'python -I .scripts/memory-map.py 2>&1 | tail -2')).toEqual([])
