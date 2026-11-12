@@ -83,9 +83,12 @@ export function scanLine(line: string, where: string, personal: readonly string[
   return out
 }
 
-/** Findings in a unified diff: only added lines, with their file and new line number. */
-export function scanDiff(diff: string, personal: readonly string[]): Finding[] {
-  const out: Finding[] = []
+/**
+ * Walks a unified diff: `onFile` each time a file is named (its `diff --git` line and again its `+++` line,
+ * so usually twice; a binary file once), `onAdded` for each added
+ * line with the file and new line number it lands on. Removed and context lines are not reported.
+ */
+function walkDiff(diff: string, onFile: (file: string) => void, onAdded: (line: string, where: string) => void): void {
   let file = '(unknown file)'
   let lineNo = 0
   for (const raw of diff.split('\n')) {
@@ -94,14 +97,14 @@ export function scanDiff(diff: string, personal: readonly string[]): Finding[] {
     if (header) {
       const name = header[1] ?? ''
       file = name === '/dev/null' || name === '' ? file : name
-      if (sensitiveFile(file)) out.push({ kind: 'a sensitive file (keys, .env or credentials)', where: file })
+      onFile(file)
       continue
     }
     // A binary file has no "+++" line, so a key store (.p12, .kdbx) is named only here.
     const start = /^diff --git a\/.* b\/(.*)$/.exec(line)
     if (start) {
       file = start[1] ?? file
-      if (sensitiveFile(file)) out.push({ kind: 'a sensitive file (keys, .env or credentials)', where: file })
+      onFile(file)
       continue
     }
     if (line.startsWith('--- ')) continue
@@ -111,12 +114,32 @@ export function scanDiff(diff: string, personal: readonly string[]): Finding[] {
       continue
     }
     if (line.startsWith('+')) {
-      out.push(...scanLine(line.slice(1), `${file}:${lineNo}`, personal))
+      onAdded(line.slice(1), `${file}:${lineNo}`)
       lineNo++
     } else if (!line.startsWith('-') && !line.startsWith('\\')) {
       lineNo++
     }
   }
+}
+
+/** Findings in a unified diff: only added lines, with their file and new line number. */
+export function scanDiff(diff: string, personal: readonly string[]): Finding[] {
+  const out: Finding[] = []
+  walkDiff(
+    diff,
+    file => { if (sensitiveFile(file)) out.push({ kind: 'a sensitive file (keys, .env or credentials)', where: file }) },
+    (line, where) => out.push(...scanLine(line, where, personal)),
+  )
+  return out
+}
+
+/** One line of text an outside scanner reads, and where it came from ("app.py:3", "the commit message"). */
+export type SentLine = { text: string; where: string }
+
+/** The added lines of a diff, each with the file and line it lands on, for an outside scanner. */
+export function addedLines(diff: string): SentLine[] {
+  const out: SentLine[] = []
+  walkDiff(diff, () => {}, (text, where) => out.push({ text, where }))
   return out
 }
 
@@ -142,6 +165,17 @@ export function scanValue(value: unknown, where: string, personal: readonly stri
     ...(key === 'path' && typeof v === 'string' && sensitiveFile(v) ? [{ kind: 'a sensitive file (keys, .env or credentials)', where: v }] : []),
     ...scanValue(v, `${where} "${key}"`, personal),
   ])
+}
+
+/** A tool call's text values as lines for an outside scanner, each named as `scanValue` names it. */
+export function valueLines(value: unknown, where: string): SentLine[] {
+  if (typeof value === 'string') {
+    const lines = value.split('\n')
+    return lines.map((text, i) => ({ text, where: lines.length > 1 ? `${where}, line ${i + 1}` : where }))
+  }
+  if (Array.isArray(value)) return value.flatMap((v, i) => valueLines(v, `${where}[${i}]`))
+  if (typeof value !== 'object' || value === null) return []
+  return Object.entries(value).flatMap(([key, v]) => valueLines(v, `${where} "${key}"`))
 }
 
 /** Keeps one finding per kind and place. Drops network findings where allowed, and any
@@ -336,8 +370,10 @@ export function localPart(command: string): string {
         continue
       }
       const stop = commandEnd(end)
-      if (stop.open) {
-        i = end // a quote that never closes: blank nothing
+      // A quote that never closes: blank nothing. And ssh's ProxyCommand and LocalCommand run their
+      // command on this machine (`ssh -o ProxyCommand='sh x.sh' host`), so that ssh line stays visible.
+      if (stop.open || /\b(?:ProxyCommand|LocalCommand|PermitLocalCommand)\b/i.test(command.slice(end, stop.at))) {
+        i = end
         continue
       }
       const here = heredocWord(end, stop.at)
@@ -365,7 +401,10 @@ export function localPart(command: string): string {
 
 /** A commit or push this shell command is about to make on this machine, and where. */
 export function gitAction(command: string): GitAction | undefined {
-  const cmd = localPart(command.replace(/\\\n/g, ' '))
+  // What ssh runs elsewhere is blanked, and so is the text of a script written here only to be sent to
+  // ssh (`cat > x.sh <<'EOF'` ... `ssh host 'bash -s' < x.sh`): its git commands run on the other machine.
+  const joined = command.replace(/\\\n/g, ' ')
+  const cmd = blankDataBodies(joined, localPart(joined))
   const push = /\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)/.exec(cmd)
   const ghPush = /\bgh\s+repo\s+create\b[^;&|\n]*--push\b/.exec(cmd)
   const commit = /\bgit\b[^;&|\n]*\bcommit\b/.exec(cmd)
@@ -417,8 +456,15 @@ export function ghWrites(command: string): boolean {
 
 // --- which reviews a change needs -----------------------------------------------------------
 
-const LANGUAGES: [RegExp, string][] = [
+/** Every language label, declared once: the tables below and scanners.ts are checked against it. */
+export const LANGUAGE_NAMES = ['Docker', 'dependencies', 'Python', 'TypeScript', 'JavaScript', 'HTML templates', 'C#', 'C/C++',
+  'Shell', 'PowerShell', 'SQL', 'Go', 'Rust', 'Java/Kotlin', 'other code', 'GitHub Actions', 'config', 'CSS'] as const
+export type Language = typeof LANGUAGE_NAMES[number]
+
+const LANGUAGES: [RegExp, Language][] = [
   [/(^|\/)(Dockerfile[^/]*|[^/]*compose[^/]*\.ya?ml)$/i, 'Docker'],
+  // What a project pulls in: a change here can bring in a package with known holes.
+  [/(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.(txt|in|lock)|pyproject\.toml|uv\.lock|poetry\.lock|Pipfile(\.lock)?|[^/]+\.csproj|packages\.lock\.json|Directory\.Packages\.props|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$/i, 'dependencies'],
   [/\.py$/i, 'Python'],
   [/\.(ts|tsx|mts|cts)$/i, 'TypeScript'],
   [/\.(js|jsx|mjs|cjs)$/i, 'JavaScript'],
@@ -438,7 +484,7 @@ const LANGUAGES: [RegExp, string][] = [
 ]
 
 /** The language of a code file, or undefined for notes, data and everything else. */
-export function languageOf(path: string): string | undefined {
+export function languageOf(path: string): Language | undefined {
   const p = path.replace(/\\/g, '/')
   if (/(^|\/)(\.git|node_modules|\.venv|dist|build|__pycache__)\//.test(p)) return undefined
   return LANGUAGES.find(([re]) => re.test(p))?.[1]
@@ -755,7 +801,7 @@ export function shellWrites(fullCommand: string): string[] {
   return [...out]
 }
 
-const SECURITY: Record<string, string> = {
+const SECURITY: Record<Language, string> = {
   Python: 'SQL built from strings, shell=True or os.system with input, eval/exec, pickle or yaml.load, path traversal, requests to URLs from input (SSRF), weak crypto. Run `bandit -q` on the changed files if bandit is installed.',
   TypeScript: 'XSS (innerHTML, dangerouslySetInnerHTML), eval or new Function, child_process with input, prototype pollution, unchecked JSON. Run `npm audit` if a lockfile changed.',
   JavaScript: 'XSS (innerHTML, dangerouslySetInnerHTML), eval or new Function, child_process with input, prototype pollution, unchecked JSON. Run `npm audit` if a lockfile changed.',
@@ -771,17 +817,22 @@ const SECURITY: Record<string, string> = {
   Docker: 'load the docker-skills:docker-build-strategies skill. Check: non-root user, base images pinned by digest, no secrets in layers or build args, ports bound to 127.0.0.1, cap_drop ALL, read_only, no-new-privileges.',
   'GitHub Actions': 'pull_request_target with checkout of the PR, actions not pinned to a commit, secrets echoed to logs, write permissions wider than needed.',
   config: 'secrets in config files, debug modes left on, permissions or CORS wider than needed.',
+  dependencies: 'packages with known holes (the trivy step below), versions not pinned, new packages nobody asked for, install scripts.',
   'other code': 'injection (SQL, shell, template), unsafe deserialization, path traversal, secrets in code.',
   CSS: 'nothing security-specific beyond the general review.',
 }
 
-/** The text that sends the model into a review of the files it changed this turn. */
-export function reviewPrompt(changed: ReadonlyMap<string, string>): string {
+/**
+ * The text that sends the model into a review of the files it changed this turn. `scannerSteps` are the
+ * lines from `scannerSteps` in scanners.ts: ready-to-run Bash commands, then possibly one line naming
+ * the scanners that are not installed.
+ */
+export function reviewPrompt(changed: ReadonlyMap<string, string>, scannerSteps: readonly string[] = []): string {
   const byLang = new Map<string, string[]>()
   for (const [path, lang] of changed) byLang.set(lang, [...(byLang.get(lang) ?? []), path])
   const files = [...byLang].map(([lang, paths]) =>
     `- ${lang}: ${paths.slice(0, 8).join(', ')}${paths.length > 8 ? ` and ${paths.length - 8} more` : ''}`)
-  const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang] ?? SECURITY['other code']}`)
+  const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang as Language] ?? SECURITY['other code']}`)
   return [
     `review-guard: code changed in ${changed.size} file(s) this turn. Before you finish, review it:`,
     ...files,
@@ -796,6 +847,9 @@ export function reviewPrompt(changed: ReadonlyMap<string, string>): string {
     ...security,
     '   If no listed plugin or skill covers one of these languages well, use SearchPlugins to look for a',
     '   security plugin for it and offer the best match with SuggestPluginInstall.',
+    ...(scannerSteps.length > 0
+      ? ['   Also run these scanners, installed on this machine, on the changed files: with the Bash tool (they are', '   Bash commands), in the background alongside the agents. Treat what they report like any other finding:', ...scannerSteps]
+      : []),
     '3. Check each finding against the code before acting on it. Fix the confirmed ones, rerun the tests,',
     '   and tell the user what was found and fixed. Commit or push nothing as part of this review unless',
     '   the user asked for that.',

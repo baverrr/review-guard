@@ -12,6 +12,9 @@ import {
   networkAllowed,
   report,
   resolveDir,
+  addedLines,
+  type SentLine,
+  valueLines,
   reviewPrompt,
   scanDiff,
   scanFile,
@@ -20,12 +23,16 @@ import {
   settle,
   shellWrites,
 } from './scan'
+import { candidates, gitleaksFindings, type Scanner, SCANNERS, scannerSteps, VERSION_ARGS } from './scanners'
 
 // review-guard:
 // 1. Remembers the code files Claude changes in a turn. When the turn ends, sends Claude back
 //    to review them with the pr-review-toolkit agents plus a security review for each language.
+//    The review also names the outside scanners installed here that suit the files (bandit, semgrep,
+//    zizmor, trivy), with commands to run.
 // 2. Stops a git commit or push (and GitHub MCP writes) that would send secrets, keys, MAC or
-//    IP addresses, or the person's own details to a repository with a GitHub remote.
+//    IP addresses, or the person's own details to a repository with a GitHub remote. When gitleaks
+//    is installed, what a commit or push sends also goes through it.
 //
 // The person's own details live in ~/.claude/review-guard.json, never in this code:
 //   { "personal": ["name", "email", ...], "allowNetworkInfo": ["owner/repo"], "allowValues": [] }
@@ -106,6 +113,76 @@ async function homeDir($: EngineInterface): Promise<string | undefined> {
   return home?.replace(/\\/g, '/')
 }
 
+// The outside scanners installed here, found once per load of the module: a scanner to its program.
+/** A scanner's program (`exe`), or why one that is there would not run (`broken`); neither: not installed. */
+type Located = { exe?: string; broken?: string }
+
+// Scanners found so far. Only a working one is kept: a missing or broken one is looked for again next
+// time, so one installed (or unblocked) later is used without reloading the mod.
+const located = new Map<Scanner, Promise<Located>>()
+
+/**
+ * Where a scanner is. A file that is there but does not run (blocked, half downloaded, too slow on its
+ * first start) is `broken`, never "not installed"; only nothing at any place, and nothing on PATH, is.
+ */
+function locate($: EngineInterface, tool: Scanner): Promise<Located> {
+  let found = located.get(tool)
+  if (!found) {
+    found = (async (): Promise<Located> => {
+      const home = await homeDir($).catch(() => undefined)
+      const windows = /^[A-Za-z]:\//.test(home ?? '')
+      for (const exe of candidates(tool, home, windows)) {
+        const isPath = exe.includes('/')
+        if (isPath && !(await $.fs.exists(exe).catch(() => false))) continue
+        try {
+          const r = await $.process.run([exe, ...VERSION_ARGS[tool]], { timeoutMs: 30_000 })
+          if (r.exitCode === 0) return { exe }
+          return { broken: `${exe} exited ${r.exitCode}: ${r.stderr.trim().slice(0, 150) || 'no message'}` }
+        } catch (err) {
+          // A file that is there but would not start is broken; a bare name that would not start is not on PATH.
+          if (isPath) return { broken: `${exe} would not start: ${err instanceof Error ? err.message : String(err)}` }
+        }
+      }
+      return {}
+    })()
+    located.set(tool, found)
+    void found.then(l => { if (!l.exe) located.delete(tool) }, () => located.delete(tool))
+  }
+  return found
+}
+
+/** The review scanners that run here, a scanner to its program. Never throws. */
+async function findScanners($: EngineInterface): Promise<Map<Scanner, string>> {
+  const tools = SCANNERS.filter(t => t !== 'gitleaks')
+  const found = await Promise.all(tools.map(t => locate($, t).catch((): Located => ({}))))
+  return new Map(tools.flatMap((t, i) => (found[i]?.exe ? [[t, found[i].exe] as const] : [])))
+}
+
+/**
+ * gitleaks on what a commit or push sends: commit messages, added lines and new files' text. Not
+ * installed: nothing, and a note. There but broken, failing, or with no full report: throws, so the
+ * command stops. Its own ways to wave a finding through are shut, so allowValues stays the only one:
+ * `--ignore-gitleaks-allow` for `gitleaks:allow` comments, the mod's own folder as the working folder
+ * and ignore path (no `.gitleaks.toml` or `.gitleaksignore` there), and the config variables emptied.
+ */
+async function gitleaksScan($: EngineInterface, sent: readonly SentLine[], notes: string[]): Promise<Finding[]> {
+  const { exe, broken } = await locate($, 'gitleaks')
+  if (broken) throw new Error(`gitleaks is installed but would not run (${broken})`)
+  if (!exe) {
+    notes.push('gitleaks is not installed, so only the built-in checks ran')
+    return []
+  }
+  if (sent.length === 0) return []
+  const root = $.plugin.root
+  const r = await $.process.run(
+    [exe, 'stdin', '--no-banner', '--exit-code', '0', '--report-format', 'json', '--report-path', '-', '--log-level', 'error',
+      '--ignore-gitleaks-allow', '--gitleaks-ignore-path', root],
+    { stdin: sent.map(s => s.text).join('\n'), cwd: root, env: { GITLEAKS_CONFIG: '', GITLEAKS_CONFIG_TOML: '' }, timeoutMs: 120_000 },
+  )
+  if (r.exitCode !== 0 || r.isStdoutTruncated) throw new Error(`gitleaks failed: ${(r.stderr || 'its report was cut short').slice(0, 200)}`)
+  return gitleaksFindings(r.stdout, sent.map(s => s.where))
+}
+
 async function configPath($: EngineInterface): Promise<string | undefined> {
   const home = await homeDir($)
   return home ? `${home}/${CONFIG_NAME}` : undefined
@@ -174,12 +251,21 @@ const TOO_MUCH = (what: string): Finding => ({ kind: `more ${what} than can be c
 async function findingsFor($: EngineInterface, action: GitAction, config: Config, notes: string[]): Promise<Finding[]> {
   const { dir } = action
   const out: Finding[] = []
+  // What goes out, for gitleaks: one entry per line it reads, with where that line came from. Each text is
+  // one line (every source is split on newlines first), so gitleaks' line i + 1 is `sent[i]`.
+  const sent: SentLine[] = []
+  const send = (diff: string) => sent.push(...addedLines(diff))
   // Who the commits will say made them.
   for (const v of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
     const r = await git($, dir, ['var', v])
     if (r.exitCode === 0) out.push(...scanLine(r.stdout, `the commit's ${v === 'GIT_AUTHOR_IDENT' ? 'author' : 'committer'}`, config.personal))
   }
-  if (action.message) action.message.split('\n').forEach(l => out.push(...scanLine(l, 'the commit message', config.personal)))
+  if (action.message) {
+    action.message.split('\n').forEach(l => {
+      out.push(...scanLine(l, 'the commit message', config.personal))
+      sent.push({ text: l, where: 'the commit message' })
+    })
+  }
 
   // A command can do both (`git commit ... && git push`): then the staged changes and the commits
   // already waiting are each checked.
@@ -188,11 +274,13 @@ async function findingsFor($: EngineInterface, action: GitAction, config: Config
     const staged = await gitOk($, dir, [...diffArgs, '--cached'], 'git diff --cached')
     if (staged.isStdoutTruncated) out.push(TOO_MUCH('staged changes'))
     out.push(...scanDiff(staged.stdout, config.personal))
+    send(staged.stdout)
     if (action.addsFiles) {
       // The same command stages more first: scan the working tree's changes and new files too.
       const tracked = await gitOk($, dir, diffArgs, 'git diff')
       if (tracked.isStdoutTruncated) out.push(TOO_MUCH('changes'))
       out.push(...scanDiff(tracked.stdout, config.personal))
+      send(tracked.stdout)
       // New files are listed from the top of the repository, not the command's folder: `git add -A`
       // stages all of them, and the names git prints are then relative to where they are read from.
       const top = (await gitOk($, dir, ['rev-parse', '--show-toplevel'], 'git rev-parse')).stdout.trim()
@@ -202,7 +290,9 @@ async function findingsFor($: EngineInterface, action: GitAction, config: Config
       let nameOnly = 0
       for (const rel of files.slice(0, MAX_NEW_FILES)) {
         try {
-          out.push(...scanFile(rel, await $.fs.read(`${top}/${rel}`), config.personal))
+          const text = await $.fs.read(`${top}/${rel}`)
+          out.push(...scanFile(rel, text, config.personal))
+          text.split('\n').forEach((l, i) => sent.push({ text: l, where: `${rel}:${i + 1}` }))
         } catch {
           // Over 4 MiB or unreadable: still check its name, and say so.
           out.push(...scanFile(rel, '', config.personal))
@@ -247,10 +337,13 @@ async function findingsFor($: EngineInterface, action: GitAction, config: Config
         inMessage = false
       } else if (inMessage) {
         out.push(...scanLine(line, `commit ${commit}'s message`, config.personal))
+        sent.push({ text: line, where: `commit ${commit}'s message` })
       }
     }
     out.push(...scanDiff(log.stdout, config.personal))
+    send(log.stdout)
   }
+  out.push(...(await gitleaksScan($, sent, notes)))
   return out
 }
 
@@ -336,6 +429,8 @@ export const register: Register = on => {
     const settled = await next(e)
     if (settled.block) return settled
     await ensureLoaded($)
+    // The scanners installed here, for the review's commands (found once; none is fine).
+    const found = await findScanners($).catch(() => new Map<Scanner, string>())
     // If the agents cannot be listed, the review ends here rather than holding every later review back.
     const busy = cycle.reviewing && (await $.agent.list().catch(() => [])).some(a => BUSY.has(a.status))
     const ask = await updateCycle($, (c): StopAsk => {
@@ -352,7 +447,8 @@ export const register: Register = on => {
       const files = Object.keys(c.changed).length
       if (c.held && files > 0) return { kind: 'held', files }
       if (e.stop_hook_active || files === 0) return undefined
-      const prompt = reviewPrompt(new Map(Object.entries(c.changed)))
+      const changed = new Map(Object.entries(c.changed))
+      const prompt = reviewPrompt(changed, scannerSteps(changed, found))
       c.underReview = c.changed
       c.changed = {}
       c.reviewing = true
@@ -397,7 +493,8 @@ export const register: Register = on => {
     if (action && toGitHub) found.push(...(await findingsFor($, action, config, notes)))
     const left = settle(found, networkAllowed(remotes, config.allowNetworkInfo), config.allowValues)
     const what = action && toGitHub ? (action.commits && action.pushes ? 'commit and push' : action.kind) : 'gh command'
-    if (left.length > 0) return { deny: report(left, what) }
+    // What could only be partly checked goes with the refusal too: the status line would be overwritten.
+    if (left.length > 0) return { deny: report(left, what) + (notes.length > 0 ? `\nAlso: ${notes.join('; ')}.` : '') }
     $.ui.status(notes.length > 0
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
       : `review-guard: ${what} checked, nothing personal or secret found`)
@@ -414,9 +511,14 @@ export const register: Register = on => {
   // straight to GitHub: check all of it. The ones that only read are left alone.
   on('tool.call', { tool: /^mcp__.*github.*__(?!get_|list_|search_|issue_read$|pull_request_read$)\w+$/ }, async ($, e, next) => {
     const { config, note } = await loadConfig($)
-    if (note) $.ui.status(`review-guard: ${note}`)
-    const found = settle(scanValue(e, `the ${String(e.tool).split('__').pop()} call`, config.personal), false, config.allowValues)
-    return found.length > 0 ? { deny: report(found, 'GitHub write') } : next(e)
+    const notes = note ? [note] : []
+    const where = `the ${String(e.tool).split('__').pop()} call`
+    // What the write sends goes through gitleaks too, value by value, like a commit's added lines.
+    const raw = [...scanValue(e, where, config.personal), ...(await gitleaksScan($, valueLines(e, where), notes))]
+    const found = settle(raw, false, config.allowValues)
+    if (found.length > 0) return { deny: report(found, 'GitHub write') + (notes.length > 0 ? `\nAlso: ${notes.join('; ')}.` : '') }
+    if (notes.length > 0) $.ui.status(`review-guard: GitHub write checked, but ${notes.join('; ')}`)
+    return next(e)
   }).catch(($, e, next) =>
     next.called ? next(e) : { deny: `review-guard could not check this GitHub write, so it stopped it (${next.error.message ?? next.error.kind}).` },
   )

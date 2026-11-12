@@ -29,7 +29,13 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
   pr-review-toolkit plugin is not installed.
 - **Stops leaks to GitHub.** A `git commit`, `git push`, `gh pr create` or GitHub tool call that would send a
   key, a token, a private key, an IP or MAC address, or one of your personal terms is stopped, and Claude is
-  told what and where, never the value itself.
+  told what and where, never the value itself. With [gitleaks](https://github.com/gitleaks/gitleaks)
+  installed, commits, pushes and GitHub writes also go through its hundreds of key patterns.
+- **Uses the scanners you have.** The review lists ready-to-run commands for the ones installed that suit the
+  changed files: [bandit](https://github.com/PyCQA/bandit) for Python, [Semgrep](https://semgrep.dev) for
+  most languages, [zizmor](https://github.com/zizmorcore/zizmor) for GitHub Actions and
+  [Trivy](https://github.com/aquasecurity/trivy) for dependency files and Dockerfiles. Missing ones are named,
+  never silently skipped.
 - **Knows when to wait.** If you stop Claude part way, it waits until work picks up again before asking for
   a review.
 
@@ -38,6 +44,8 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 - [Claude Code](https://claude.com/claude-code) on Windows, macOS or Linux
 - `git` (and `gh` if you use it)
 - For a private copy of this repository: access to it on GitHub, and git signed in to GitHub on your computer
+- Optional: the scanners above. They are found on PATH, in `~/.local/bin`, or in `~/Tools/scanners/bin` and
+  `~/Tools/scanners/venv` (on Windows, `%USERPROFILE%\Tools\scanners\...`, so nothing has to go on PATH)
 
 ## Install
 

@@ -1,8 +1,9 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  ghWrites, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, report, resolveDir, reviewPrompt, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, ghWrites, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, report, resolveDir, reviewPrompt, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan'
+import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners'
 
 // Every value here is made up: fake key shapes, made-up addresses, placeholder names.
 const PERSONAL = ['pat example', 'pat@example.org', 'patuser']
@@ -187,6 +188,18 @@ describe('git commands', () => {
     expect(gitAction("timeout 90 ssh box 'cd ~/repo && git push origin refs/tags/v1'")).toBe(undefined)
     expect(gitAction("MSYS_NO_PATHCONV=1 timeout -s KILL 2m /c/Windows/System32/OpenSSH/ssh.exe box 'git push'")).toBe(undefined)
     expect(gitAction('timeout 90 git push origin main')?.refs).toEqual(['main'])
+    // A script written here only to be sent to ssh runs its git commands there, not here.
+    const sshScript = "S=/tmp/s\ncat > \"$S/run.sh\" <<'EOF'\nC=$(mktemp -d); git -C \"$C\" init -q\ngit -C \"$C\" commit -qm c\ngit push origin main\nEOF\n"
+    expect(gitAction(sshScript + "ssh box 'bash -s' < \"$S/run.sh\"")).toBe(undefined)
+    expect(gitAction(sshScript + "MSYS_NO_PATHCONV=1 timeout 600 ssh.exe box 'bash -s' < \"$S/run.sh\"")).toBe(undefined)
+    // Kept on disk and run here, written somewhere ssh doesn't read, or a real push after the ssh line: still local.
+    expect(gitAction(sshScript + 'bash "$S/run.sh"')?.pushes).toBe(true)
+    expect(gitAction(sshScript.replace('cat > "$S/run.sh"', 'cat > /tmp/notes.md') + "ssh box 'bash -s' < \"$S/run.sh\"")?.pushes).toBe(true)
+    expect(gitAction(sshScript + "ssh box 'bash -s' < \"$S/run.sh\"\ngit push origin main")?.refs).toEqual(['main'])
+    // ssh's ProxyCommand and LocalCommand run here, so such an ssh line hides nothing.
+    expect(gitAction("ssh -o ProxyCommand='git push origin main' box true")?.pushes).toBe(true)
+    expect(gitAction(sshScript.replace('/tmp/s', '/tmp/s') + "ssh -o ProxyCommand='sh /tmp/s/run.sh' box 'bash -s' < \"$S/run.sh\"")?.pushes).toBe(true)
+    expect(gitAction("ssh -o LocalCommand='git commit -am x' -o PermitLocalCommand=yes box true")?.commits).toBe(true)
     expect(gitAction("timeout 90 ssh box 'uptime' && git push")?.kind).toBe('push')
     // Heredoc lookalikes and odd heredocs never hide the local push that follows.
     expect(gitAction('ssh box cat <<< "note"\ngit push origin main')?.kind).toBe('push')
@@ -751,18 +764,34 @@ const added = (file: string, line: string) => `diff --git a/${file} b/${file}\n-
  * `git` maps a piece of a git command line to what git answers; the first piece found wins, and
  * anything else succeeds with no output. `config` is the config file's text, or undefined for none.
  */
-function world(on: On, git: Record<string, Run> = {}, config: string | undefined = CONFIG) {
+function world(on: On, git: Record<string, Run> = {}, config: string | undefined = CONFIG, files: Record<string, string> = {}) {
   // `git` and `config` can be changed between calls: hooks are registered once, before the first call.
-  const seen = { ran: false, status: [] as string[], calls: [] as string[], git, config: config as string | undefined }
+  // Programs in the scanners folder exist; `stdin` and `cwd` record what gitleaks was given.
+  const seen = {
+    ran: false, status: [] as string[], calls: [] as string[], git, config: config as string | undefined,
+    stdin: [] as string[], cwd: [] as (string | undefined)[], missing: [] as string[], // scanners not installed at all
+  }
   mock.env(on, { USERPROFILE: 'C:/Users/pat' })
   on('process.run', (_$, e) => {
     const line = e.argv.join(' ')
     seen.calls.push(line)
+    if (seen.missing.includes(e.argv[0] ?? '')) throw new Error(`spawn ${e.argv[0]} ENOENT`) // not on PATH either
+    if (e.init?.stdin !== undefined) {
+      seen.stdin.push(e.init.stdin)
+      seen.cwd.push(e.init.cwd)
+    }
     const key = Object.keys(seen.git).find(k => line.includes(k))
-    const base = { exitCode: 0, stdout: line.includes('remote -v') ? REMOTE : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+    // gitleaks writes "[]" when it finds nothing.
+    const base = { exitCode: 0, stdout: line.includes('remote -v') ? REMOTE : line.includes(' stdin ') ? '[]' : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
     return { value: { ...base, ...(key ? seen.git[key] : {}) } }
   })
-  on('fs.read', () => {
+  on('fs.exists', (_$, e) => {
+    const p = e.path.replace(/\\/g, '/') // the engine may hand over a Windows path
+    return { value: p.includes('/Tools/scanners/bin/') && !seen.missing.some(m => p.endsWith(`/${m}.exe`)) }
+  })
+  on('fs.read', (_$, e) => {
+    const file = Object.keys(files).find(f => e.path.replace(/\\/g, '/').endsWith(`/${f}`))
+    if (file) return { value: files[file] ?? '' }
     if (seen.config === undefined) throw new Error('no such file')
     return { value: seen.config }
   })
@@ -776,6 +805,171 @@ function world(on: On, git: Record<string, Run> = {}, config: string | undefined
   })
   return seen
 }
+
+describe('outside scanners', () => {
+  // A made-up value in the shape gitleaks reports; built from pieces like the others in this file.
+  const LEAK = ['k9Qz', 'Xw2L', 'pR7v', 'Tn4Y', 'bH8s'].join('')
+  const report = (line: number) => JSON.stringify([{ RuleID: 'generic-api-key', StartLine: line, Secret: LEAK, Match: `key=${LEAK}` }])
+
+  test('a commit gitleaks finds a secret in is stopped, naming the rule and place but never the secret', async ($, on) => {
+    // gitleaks reads the commit message first (line 1), then the added lines: line 3 is cfg.py:1.
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') + added('cfg.py', 'y = 2') }, ' stdin ': { stdout: report(3) } })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('a secret gitleaks found (generic-api-key) at cfg.py:1')).toBe(true)
+    expect(r.deny?.includes(LEAK)).toBe(false)
+    expect(seen.ran).toBe(false)
+    // It ran the program found in the scanners folder, in stdin mode.
+    expect(seen.calls.some(l => l.startsWith('C:/Users/pat/Tools/scanners/bin/gitleaks.exe stdin '))).toBe(true)
+  })
+
+  test('a gitleaks finding the user allowed passes, like any other', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') }, ' stdin ': { stdout: report(1) } },
+      JSON.stringify({ personal: PERSONAL, allowNetworkInfo: [], allowValues: [LEAK] }))
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny).toBe(undefined)
+    expect(seen.ran).toBe(true)
+  })
+
+  test('without gitleaks the built-in checks still run, and the status says gitleaks was skipped', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') } })
+    seen.missing.push('gitleaks')
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny).toBe(undefined)
+    expect(seen.ran).toBe(true)
+    expect(seen.status.at(-1)?.includes('gitleaks is not installed')).toBe(true)
+    expect(seen.calls.some(l => l.includes(' stdin '))).toBe(false)
+  })
+
+  test('gitleaks that is installed but fails stops the commit, as any check that could not run', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') }, ' stdin ': { exitCode: 2, stderr: 'boom' } })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('could not check')).toBe(true)
+    expect(r.deny?.includes('gitleaks failed: boom')).toBe(true)
+    expect(seen.ran).toBe(false)
+  })
+
+  test('gitleaks reads exactly what goes out, in a folder of its own, with its own ways to wave findings through shut', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') + added('cfg.py', 'y = 2') } })
+    await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(seen.stdin).toEqual(['x\nx = 1\ny = 2']) // the message, then the added lines in order
+    const run = seen.calls.find(l => l.includes(' stdin ')) ?? ''
+    for (const flag of ['--exit-code 0', '--report-path -', '--report-format json', '--ignore-gitleaks-allow', '--gitleaks-ignore-path']) {
+      expect(run.includes(flag)).toBe(true)
+    }
+    expect(seen.cwd[0] !== undefined && seen.cwd[0] !== '').toBe(true) // never the session's folder
+  })
+
+  test('a push sends its commits and their messages through gitleaks', async ($, on) => {
+    const log = `COMMIT abc1234\nAUTHOR bot <bot@example.com>\nCOMMITTER bot <bot@example.com>\nadd config\n${added('cfg.py', 'y = 2')}`
+    const seen = world(on, { ' log ': { stdout: log }, ' stdin ': { stdout: report(2) } })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+    expect(seen.stdin[0]?.includes('y = 2')).toBe(true)
+    expect(r.deny?.includes('at cfg.py:1')).toBe(true)
+    seen.git[' stdin '] = { stdout: report(1) }
+    expect((await $.tool.call({ tool: 'Bash', command: 'git push origin main' })).deny?.includes("at commit abc1234's message")).toBe(true)
+  })
+
+  test('git add -A sends the working tree and new files through gitleaks too', async ($, on) => {
+    const seen = world(on, {
+      '--cached': { stdout: '' }, ' diff --no-color': { stdout: added('edit.py', 'z = 3') }, // first match wins: staged first
+      'ls-files --others': { stdout: 'new.py\n' }, ' stdin ': { stdout: report(4) },
+    }, CONFIG, { 'new.py': 'a = 1\nb = 2' })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m x' })
+    expect(seen.stdin[0]).toBe('x\nz = 3\na = 1\nb = 2')
+    expect(r.deny?.includes('at new.py:2')).toBe(true)
+  })
+
+  test('a push with nothing new runs no gitleaks', async ($, on) => {
+    const seen = world(on)
+    expect((await $.tool.call({ tool: 'Bash', command: 'git push origin main' })).deny).toBe(undefined)
+    expect(seen.calls.some(l => l.includes(' stdin '))).toBe(false)
+  })
+
+  test('gitleaks that is there but will not run, gives no report, or is cut short stops the commit', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') }, 'gitleaks.exe version': { exitCode: 3, stderr: 'dll missing' } })
+    let r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('gitleaks is installed but would not run')).toBe(true)
+    delete seen.git['gitleaks.exe version']
+    seen.git[' stdin '] = { stdout: '' }
+    r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('gitleaks gave no report')).toBe(true)
+    seen.git[' stdin '] = { stdout: '[', isStdoutTruncated: true }
+    r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('its report was cut short')).toBe(true)
+    expect(seen.ran).toBe(false)
+  })
+
+  test('a refusal says gitleaks was skipped, since the status line would be overwritten', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', `key = "${FAKE_GH}"`) } })
+    seen.missing.push('gitleaks')
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes('GitHub token')).toBe(true)
+    expect(r.deny?.includes('Also: gitleaks is not installed')).toBe(true)
+  })
+
+  test('GitHub MCP writes go through gitleaks too', async ($, on) => {
+    const seen = world(on, { ' stdin ': { stdout: report(2) } })
+    const r = await $.tool.call({ tool: 'mcp__plugin_github_github__create_or_update_file', path: 'cfg.py', content: 'x = 1\ny = 2', message: 'add' } as never)
+    expect(r.deny?.includes('a secret gitleaks found')).toBe(true)
+    expect(seen.stdin.length).toBe(1)
+  })
+
+  test('each machine has its own places to look, then PATH', async () => {
+    expect(candidates('gitleaks', 'C:/Users/pat', true)).toEqual(
+      ['C:/Users/pat/Tools/scanners/bin/gitleaks.exe', 'C:/Users/pat/Tools/scanners/venv/Scripts/gitleaks.exe', 'gitleaks'])
+    expect(candidates('bandit', '/home/pat', false)[0]).toBe('/home/pat/.local/bin/bandit')
+    expect(candidates('trivy', undefined, false)).toEqual(['trivy'])
+  })
+
+  test('each changed file goes to the scanners that understand it', async () => {
+    const changed = new Map([['a.py', 'Python'], ['b.ts', 'TypeScript'], ['.github/workflows/ci.yml', 'GitHub Actions'],
+      ['requirements.txt', 'dependencies'], ['Dockerfile', 'Docker'], ['site.css', 'CSS'], ['app.toml', 'config']])
+    const got = Object.fromEntries(scannersFor(changed))
+    expect(got).toEqual({
+      bandit: ['a.py'], semgrep: ['a.py', 'b.ts', 'Dockerfile'], zizmor: ['.github/workflows/ci.yml'], trivy: ['requirements.txt', 'Dockerfile'],
+    })
+    expect(scannersFor(new Map([['x.css', 'CSS']])).size).toBe(0)
+    // Every code language gets semgrep (Python bandit as well); trivy gets one run per file, as it takes one path.
+    for (const lang of ['JavaScript', 'HTML templates', 'C#', 'C/C++', 'Shell', 'Go', 'Rust', 'Java/Kotlin', 'other code']) {
+      expect(scannersFor(new Map([['f', lang]])).get('semgrep')).toEqual(['f'])
+    }
+    expect(scannerCommand('trivy', 'trivy', ['package.json', 'package-lock.json'])).toBe(
+      "'trivy' fs --scanners vuln,misconfig,secret --quiet 'package.json'; 'trivy' fs --scanners vuln,misconfig,secret --quiet 'package-lock.json'")
+  })
+
+  test('the review gets a command per installed scanner and names the ones that are missing', async () => {
+    const changed = new Map([['my app/a.py', 'Python'], ['.github/workflows/ci.yml', 'GitHub Actions']])
+    const steps = scannerSteps(changed, new Map([['bandit', 'C:/Tools/bandit.exe']]))
+    expect(steps.some(s => s.includes("'C:/Tools/bandit.exe' -q 'my app/a.py'"))).toBe(true) // quoted, spaces kept
+    expect(steps.at(-1)?.includes('Not installed here (or would not run), so skipped')).toBe(true)
+    expect(steps.at(-1)?.includes('semgrep, zizmor')).toBe(true)
+    expect(scannerCommand('zizmor', 'zizmor', ['w.yml'])).toBe("'zizmor' --offline 'w.yml'")
+    // Bash expands nothing in single quotes; a quote inside is closed, escaped and reopened.
+    expect(scannerCommand('bandit', 'bandit', ["it's $HOME/a.py"])).toBe("'bandit' -q 'it'\\''s $HOME/a.py'")
+    expect(scannerCommand('semgrep', 'semgrep', ['a.py']).includes('--metrics=off')).toBe(true)
+    const prompt = reviewPrompt(changed, steps)
+    expect(prompt.includes('Also run these scanners')).toBe(true)
+    expect(reviewPrompt(changed).includes('Also run these scanners')).toBe(false)
+  })
+
+  test("gitleaks' report becomes findings at the right place; an empty or broken report is handled", async () => {
+    const places = ['the commit message', 'app.py:3']
+    expect(gitleaksFindings(report(2), places)).toEqual([{ kind: 'a secret gitleaks found (generic-api-key)', where: 'app.py:3', value: LEAK }])
+    expect(gitleaksFindings(report(9), places)[0]?.where).toBe('the changes')
+    expect(() => gitleaksFindings('', places)).toThrow() // gitleaks always writes "[]": nothing at all means it failed
+    expect(gitleaksFindings('[]', places)).toEqual([])
+    expect(() => gitleaksFindings('{"a":1}', places)).toThrow()
+  })
+
+  test('the added lines of a diff keep their file and line, and dependency files are reviewable', async () => {
+    const diff = 'diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,3 @@\n keep\n-old\n+new\n+more\n'
+    expect(addedLines(diff)).toEqual([{ text: 'new', where: 'a.py:2' }, { text: 'more', where: 'a.py:3' }])
+    for (const f of ['requirements.txt', 'requirements-dev.in', 'pyproject.toml', 'uv.lock', 'frontend/package-lock.json', 'App/App.csproj', 'Cargo.lock',
+      'package.json', 'go.mod', 'go.sum', 'Gemfile.lock']) {
+      expect(languageOf(f)).toBe('dependencies')
+    }
+    for (const f of ['mypackage.json', 'notrequirements.txt']) expect(languageOf(f)).not.toBe('dependencies')
+    expect(languageOf('settings.toml')).toBe('config')
+  })
+})
 
 describe('the git guard', () => {
   test('stops a commit with a key in it and lets a clean one through', async ($, on) => {
