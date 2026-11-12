@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 4079286bcb7dcd322c32c30983ec1d3151b2edaa36cdd97eaa734580873b67c8 built-sha256: 5eacecb4199c6f992af38bcbf815ccf31e018d02523d60029970ab631c9a27f6
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 26c369ece9ac867902ed01f0864473987b7734928019423338ccc2069b2afd8f built-sha256: 90a2ac621f33b330d3d9081fb2669219f4e8ffe057a53603f19f3160ba61285b
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -405,8 +405,12 @@ export function localPart(command        )         {
 export function gitAction(command        )                        {
   // What ssh runs elsewhere is blanked, and so is the text of a script written here only to be sent to
   // ssh (`cat > x.sh <<'EOF'` ... `ssh host 'bash -s' < x.sh`): its git commands run on the other machine.
+  // So is a quoted `cat` heredoc's text when nothing else in the command runs shell code (`blankWrittenScripts`).
   const joined = command.replace(/\\\n/g, ' ')
-  const cmd = blankDataBodies(joined, localPart(joined))
+  // Bash keeps a `\`-newline as it is inside a quoted heredoc body, but `joined` joins it, so a body's end
+  // could move: with one in the command, written bodies are not blanked.
+  const local = blankDataBodies(joined, localPart(joined))
+  const cmd = /\\\r?\n/.test(command) ? local : blankWrittenScripts(local)
   const push = /\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)/.exec(cmd)
   const ghPush = /\bgh\s+repo\s+create\b[^;&|\n]*--push\b/.exec(cmd)
   const commit = /\bgit\b[^;&|\n]*\bcommit\b/.exec(cmd)
@@ -425,8 +429,12 @@ export function gitAction(command        )                        {
   const source = new RegExp(String.raw`--source[=\s]+` + path).exec(cmd)
   if (source) dir = unquote(source[1] ?? '')
   const messages = [...cmd.matchAll(/(?:-m|--message)[=\s]+("(?:[^"\\]|\\.)*"|'[^']*'|\S+)/g)].map(m => unquote(m[1] ?? ''))
-  const heredoc = /<<-?\s*'?(\w+)'?\n([\s\S]*?)\n\1\b/.exec(cmd)
-  if (heredoc && /\bcommit\b/.test(cmd)) messages.push(heredoc[2] ?? '')
+  // A heredoc message: one opened on the commit's own line (`git commit -F - <<'EOF'`, or `-m "$(cat <<'EOF'`),
+  // any terminator spelling, `<<-` too. Its text replaces the `$(cat <<...` the -m value caught.
+  const heredoc = /^[^\n]*\bcommit\b[^\n]*<<-?\s*(["']?)([\w-]+)\1[^\n]*\n([\s\S]*?)\n\t*\2(?=\s|\)|$)/m.exec(cmd)
+  if (heredoc) messages.splice(0, messages.length, ...messages.filter(m => !/^\$\(\s*cat\s+<</.test(m)), heredoc[3] ?? '')
+  // `git commit -F file`: a heredoc in this command may have written that file, so every body counts.
+  if (/\bcommit\b[^\n]*\s(?:-F\s*|--file[=\s]+)(?!-(?:\s|$))\S/.test(cmd)) messages.push(...heredocs(cmd).bodies.map(b => b.text))
   // What the push names: `git push [options] <remote> <ref>...`. Words that are not plain ref names
   // (a redirect, a variable) are left out, and the current branch is checked instead.
   const words = (push?.[1] ?? '').trim().split(/\s+/).filter(Boolean).map(unquote)
@@ -542,7 +550,7 @@ function heredocs(command        )                                              
     const masked = line
       .replace(/<<(-?)\s*(["'])([A-Za-z_][\w-]*)\2/g, '<<$1\x01$3') // keep a quoted terminator's name, marked
       .replace(/"[^"]*"|'[^']*'/g, '""')
-      .replace(/(^|\s)#.*$/, '$1')
+      .replace(/(^|[\s;&|()])#.*$/, '$1') // bash starts a comment after a space or ; & | ( ) too
     // A backslash can escape a quote (`-"\" <<EOF"`), which the masking above can't follow.
     if (/["'`\\]/.test(masked.replace(/""/g, '')) || line.includes('\\') || /[<>]\(/.test(masked)) complete = false
     const opener = i // a second heredoc on this line starts after the first one's body, but opens here
@@ -731,29 +739,24 @@ const RUNS_NOTHING = new Set(['cat', 'mkdir', 'sleep', 'date', 'export', 'for', 
  * nothing in it) that goes either onto the screen (`cat <<'EOF'`) or into a file this same command then
  * sends to ssh (`cat > "$S/x.sh" <<'EOF'` ... `ssh host 'bash -s' < "$S/x.sh"`), which runs it on
  * another machine. A body written to any other file stays: a later command may run it (`bash x`, `make`,
- * a git hook), and a write of code this command can't see is still a write of code.
+ * a git hook), and a write of code this command can't see is still a write of code. (That keeps code
+ * writes visible to `shellWrites`; `gitAction` then also blanks bodies with `blankWrittenScripts`.)
  *
  * Kept narrow, as an allowlist: every command outside the bodies must be a read-only tool or one in
  * RUNS_NOTHING (`bash`, `python`, `xargs`, `eval`, `.`, `read` loops and anything unknown run something,
  * so nothing is blanked), and none may hold `$(...)`, a backtick, `--pre` (`rg --pre bash` runs a
- * program), or anything that could make `cat` another program (a PATH assignment, a function or an
- * alias). Nothing is blanked when the heredoc split is a guess, and a body that is piped on or shares
+ * program), `exec` (`exec >file` sends a screen heredoc into a file), or anything that could make `cat`
+ * another program (a PATH assignment, a function or an alias). Nothing is blanked when the heredoc split is a guess, and a body that is piped on or shares
  * its opener line with another heredoc is kept.
  */
 function blankDataBodies(full        , local        )         {
   const command = local
   const { outside, bodies, complete } = heredocs(command)
-  if (!complete || /\$\(|`|--pre\b|\bPATH=|\(\s*\)|\b(?:function|alias)\b/.test(outside.replace(/'[^'\n]*'/g, "''"))) return command
+  // `exec >file` sends a later screen heredoc into that file.
+  if (!complete || /\$\(|`|--pre\b|\bPATH=|\(\s*\)|\b(?:function|alias|exec)\b/.test(outside.replace(/'[^'\n]*'/g, "''"))) return command
   const masked = outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""').replace(/\d*>&\d+/g, '')
   for (const cmd of masked.split(/&&|\|\||[;&|\n]/)) {
-    const words = cmd.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(REDIRECT, '').trim().split(/\s+/)
-    while (words.length && (BEFORE_PROGRAM.has(words[0] ?? '') || /^[A-Za-z_]\w*=/.test(words[0] ?? ''))) words.shift()
-    if (commandName(words[0] ?? '') === 'timeout') { // `timeout [options] DURATION program`, as in localPart
-      words.shift()
-      while (words[0]?.startsWith('-')) if (/^(?:-[ks]|--kill-after|--signal)$/.test(words.shift() ?? '')) words.shift()
-      words.shift() // the duration
-    }
-    const name = commandName(words[0] ?? '')
+    const name = commandName(programWords(cmd.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(REDIRECT, ''))[0] ?? '')
     if (name && !READ_ONLY.test(name) && !RUNS_NOTHING.has(name)) return command
   }
   const lines = command.split('\n')
@@ -771,6 +774,126 @@ function blankDataBodies(full        , local        )         {
     // Every redirect target on the opener's line, as spelled there (the masked reader hides quoted names).
     const targets = [...(lines[b.line] ?? '').matchAll(/(?<![0-9&<])\d?>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)].map(m => unquote(m[1] ?? ''))
     if (!targets.every(t => t === '/dev/null' || sentToSsh(t))) continue // a file left here may run later
+    for (let k = b.from; k < b.to; k++) lines[k] = ''
+  }
+  return lines.join('\n')
+}
+
+// Besides READ_ONLY, the commands that run no shell code: `mkdir`, `rm`, `diff` and checksums. Left out:
+// `cp` and `mv` (they can put a script in a git hook or on PATH) and `chmod` (`chmod +x x.py` lets a later
+// `./x.py` with no `#!` line run as a shell script).
+const NOT_A_SHELL = /^(?:mkdir|rm|diff|sha256sum|md5sum)$/
+// Interpreters of other languages, with the script files each runs. `git(repo, 'commit')` or a "git commit"
+// string in such a script is not a commit. Only a script file of its own language counts, run with the
+// flags `runTarget` allows: no inline code (`python -c`, `node -e`), module (`-m`), preload (`node -r`) or
+// package script (`node --run`). Python and Node ignore a `#!` line. Left out on purpose: the `py`
+// launcher (it follows a `#!/usr/bin/env bash` line) and bun (it runs `.sh` files, and `bun x` may be a
+// package.json script named x).
+const SCRIPT_OF = new Map                ([['python', /\.pyw?$/i], ['node', /\.[cm]?js$/i]])
+// A body that may start programs itself (`subprocess.run(['git', 'push'])`, `execSync('bash x')`) is kept: the
+// guard can't follow what a script runs, but it can still see such a body's text. Best effort, so it is
+// wide: any import of os, subprocess or pty, any child_process, any dynamic import, any call named like
+// system, popen, exec or spawn.
+const STARTS_PROGRAMS = /\b(?:subprocess|pty|child_process|__import__|importlib|getattr|globals|eval|Popen|execa|shelljs|zx|Deno|Bun|(?:import|from)\s+os\b|os\s*\.|require\s*\(|import\s*\(|(?:system|popen|exec\w*|spawn\w*|startfile|fork)\s*\()/
+// The only files a body may be written to and still be blanked: scripts of the languages above and plain
+// text, outside `.git`. Anything else (a file with no extension on PATH, `.bashrc`, a git hook, `.git/config`,
+// `package.json`, `tox.ini`, a Makefile) may be run later by a shell or git, unseen. Git runs a hook only by
+// its exact name, which has no extension, so a `.js` file in a `hooks` folder is fine.
+const PLAIN_TARGET = /^(?!.*(?:^|[\\/])\.git[\\/])(?:.*[\\/])?[\w-][\w.-]*\.(?:pyw?|[cm]?[jt]s|[jt]sx|md|txt|log|csv)$/i
+
+// Variables that change which program runs, or make a shell or interpreter run more code.
+// Also the usual exported ones: setting one changes the environment of every program started after it
+// (`APPDATA=` moves where Python loads `usercustomize`, `COMSPEC=` is the shell `shell=True` starts).
+const RUNS_WITH = /^(?:PATH|PATHEXT|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|PS4|IFS|CDPATH|LD_\w+|DYLD_\w+|NODE_\w+|PYTHON\w*|BUN_\w+|GIT_\w+|HOME|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|COMSPEC|SHELL|TEMP|TMP|TMPDIR|SYSTEMROOT|WINDIR|XDG_\w+)$/i
+
+/**
+ * The words of one command, from the program on: shell words that come before a program (`sudo`, `env`,
+ * `nohup`, `if`, ...), variables set for it (`LC_ALL=C`, also after `env`), and `timeout [options]
+ * DURATION` are skipped, as in `localPart`. The names of the variables set are put in `set`.
+ */
+function programWords(cmd        , set           = [])           {
+  const words = cmd.trim().split(/\s+/).filter(Boolean)
+  for (;;) {
+    for (;;) {
+      if (BEFORE_PROGRAM.has(words[0] ?? '')) words.shift()
+      else if (/^[A-Za-z_]\w*\+?=/.test(words[0] ?? '')) set.push((words.shift() ?? '').replace(/\+?=.*$/, ''))
+      else break
+    }
+    if (commandName(words[0] ?? '') !== 'timeout') return words
+    words.shift()
+    while (words[0]?.startsWith('-')) if (/^(?:-[ks]|--kill-after|--signal)$/.test(words.shift() ?? '')) words.shift()
+    words.shift() // the duration
+  }
+}
+
+/**
+ * For `gitAction`: the command with the bodies of quoted here-documents read by `cat` alone blanked when
+ * nothing else in the command runs shell code. Such a body is a file's text (or goes to the screen), and a
+ * `git commit` in it commits nothing until a shell runs it (a Python test that calls `git(repo, 'commit')`
+ * is not a commit). Kept narrow, as an allowlist:
+ *
+ * - Every other command must be READ_ONLY or in NOT_A_SHELL, or an interpreter in SCRIPT_OF running a
+ *   script file of its language. Anything else may run the file, by name or redirect (`bash x.sh`,
+ *   `. x.sh`, `sh < x.sh`) or not (`make`, `npm test`, a hook run by `git commit`), so nothing is blanked
+ *   then. A program spelled as a path is any file there (`./cat`), so only python or node may be (a venv's
+ *   `.venv/Scripts/python.exe`), and not when a heredoc here writes a file of that name (`/tmp/t/python`).
+ * - Nothing is blanked when the split is a guess, or the command has `$(...)` or a backtick (even in double
+ *   quotes), `exec` (`exec >file` sends a screen heredoc into a file), `rg --pre` in any spelling (runs a
+ *   program on each file), brace expansion, `printf -v` (sets a variable by name), a variable set for a
+ *   program (`X=1 python a.py`), or one in RUNS_WITH set at all (`PATH=`, `BASH_ENV=`). A line that only
+ *   sets another variable (`S=/tmp/s`) is fine. Process substitution, a function and an alias are refused
+ *   here too, as a backup: the name check already refuses them.
+ * - A variable is read only as `$TMP`, `$TEMP`, `$TMPDIR`, `$HOME`, `$USERPROFILE`, `$LOCALAPPDATA` or `$PWD`
+ *   (the machine's, as none of them may be set here): another could turn `python $S.py` into `python -c ...`.
+ * - Every redirect in the command, on any line, must go to `/dev/null` or a PLAIN_TARGET file, and `&>`,
+ *   `>&file` and `<>` are refused: `cat x.txt > ~/bin/python` copies a body where a later command runs it.
+ * - A body is kept when it is unquoted (bash expands `$(...)` in it), read by anything but `cat` alone,
+ *   piped on (`cat <<'EOF' | bash`), shares its opener line with another heredoc, or may start programs
+ *   itself (STARTS_PROGRAMS).
+ * - `#` comments are read as bash reads them, and `timeout DURATION` and prefix words as `programWords` does.
+ * - The caller does not use this when the command holds a `\`-newline (see `gitAction`).
+ *
+ * `shellWrites` does not use this: a heredoc written to `x.py` is a write of code even if nothing runs it.
+ */
+function blankWrittenScripts(command        )         {
+  const { outside, bodies, complete } = heredocs(command)
+  if (!complete || /\$\(|`|[<>]\(|\(\s*\)|\b(?:function|alias)\b|&>|>&\s*[^\d\s-]|<>/.test(outside)) return command
+  const lines = command.split('\n')
+  const TARGET = /(?<![0-9&<])\d?>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g
+  const base = (path        ) => commandName(path.replace(/\\/g, '/'))
+  // Every redirect target in the command, on any line: each must be a file nothing runs later.
+  const targets = [...outside.matchAll(TARGET)].map(m => unquote(m[1] ?? ''))
+  if (!targets.every(t => t === '/dev/null' || PLAIN_TARGET.test(t))) return command
+  const written = new Set(targets.map(base))
+  // Quotes are taken off, keeping what is inside as one word: `"bash"` and `b""ash` are bash.
+  const plain = outside.replace(/"([^"\n]*)"|'([^'\n]*)'/g, (_, a, b) => String(a ?? b ?? '').replace(/[\s;&|<>()#]/g, '_'))
+    .replace(/(^|[\s;&|()])#.*$/gm, '$1') // a comment, as bash reads one (a # in quotes is gone already)
+  // A variable other than the machine's own folders, or one of those set here, may hold anything.
+  const MACHINE = /\$\{?(?:TMP|TEMP|TMPDIR|HOME|USERPROFILE|LOCALAPPDATA|PWD)\b\}?/g
+  if (plain.replace(MACHINE, '').includes('$')) return command
+  for (const cmd of plain.split(/&&|\|\||[;&|\n]/)) {
+    const raw = cmd.replace(/<<-?\s*[\w-]+/g, '').replace(REDIRECT, '').trim().split(/\s+/).filter(Boolean)
+    if (raw.some(w => w === 'exec' || w.startsWith('--pre') || /[{}]/.test(w))) return command
+    // `S=/tmp/s` alone sets a variable. One that changes what runs, or one set for a program, is refused.
+    const set           = []
+    const words = programWords(raw.join(' '), set)
+    if (set.length && (words.length || set.some(n => RUNS_WITH.test(n)))) return command
+    if (!words.length) continue
+    if (commandName(words[0] ?? '') === 'printf' && words.some(w => w.startsWith('-v'))) return command
+    const program = words[0] ?? ''
+    const name = commandName(program).replace(/^python[\d.]*$/, 'python')
+    const script = SCRIPT_OF.get(name)
+    // A path is any file there (`./cat`): only an interpreter's own (a venv's python) is taken as that program.
+    if (/[\\/]/.test(program) && (!script || written.has(base(program)))) return command
+    if (READ_ONLY.test(name) || NOT_A_SHELL.test(name)) continue
+    const target = script ? runTarget(words) : undefined
+    if (!script || !target || !script.test(target)) return command
+  }
+  const perLine = new Map                ()
+  for (const b of bodies) perLine.set(b.line, (perLine.get(b.line) ?? 0) + 1)
+  for (const b of bodies) {
+    if (!b.quoted || b.piped || perLine.get(b.line) !== 1 || STARTS_PROGRAMS.test(b.text)) continue
+    if (!/^cat(?:\s+-\S*)*$/i.test(b.reader.replace(REDIRECT, '').trim())) continue
     for (let k = b.from; k < b.to; k++) lines[k] = ''
   }
   return lines.join('\n')

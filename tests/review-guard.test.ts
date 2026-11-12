@@ -143,6 +143,105 @@ describe('git commands', () => {
     expect([all?.allBranches, all?.tags, all?.addsFiles]).toEqual([true, true, false])
   })
 
+  test('git commands in a heredoc written here count unless nothing else in the command runs shell code', async () => {
+    // Each case is checked with its input in the result, so a failure names it.
+    const seen = (c: string) => [c, gitAction(c) !== undefined]
+    const hidden = (c: string) => expect(seen(c)).toEqual([c, false])
+    const counts = (c: string) => expect(seen(c)).toEqual([c, true])
+    // A Python test written with a heredoc and run with python: its git(...) calls are not a commit, in
+    // any of the ways the command may be written.
+    const body = "<<'PYEOF'\ngit(repo, 'add', 'a.txt')\ngit(repo, 'commit', '-q', '-m', 'first')\nPYEOF\n"
+    const fix = `cat > /tmp/t/fix.py ${body}`
+    for (const c of [
+      `cd /c/proj && ${fix}python -I /tmp/t/fix.py .`,
+      `cat > "/tmp/my dir/fix.py" ${body}python "/tmp/my dir/fix.py"`,
+      `${fix}# run it\ntimeout 60 python3 /tmp/t/fix.py; true;# done`,
+      `cat > /tmp/t/fix.mjs ${body}node /tmp/t/fix.mjs && rm /tmp/t/fix.mjs`,
+      `mkdir -p /tmp/t && ${fix}diff /tmp/t/fix.py b; sha256sum /tmp/t/fix.py; md5sum /tmp/t/fix.py; python /tmp/t/fix.py`,
+      `${fix}nohup python /tmp/t/fix.py`, `${fix}env python /tmp/t/fix.py`, `${fix}time python /tmp/t/fix.py`,
+      `${fix}.venv/Scripts/python.exe /tmp/t/fix.py`, // a venv's python, spelled as a path
+      `S=/tmp/t\nS+=/u\n${fix}python /tmp/t/fix.py`, // variables set alone
+      `${fix}cat > /tmp/t/b.md <<'B'\ngit push origin main\nB\npython /tmp/t/fix.py`, // two bodies, each on its own line
+      `cat > /dev/null <<'EOF'\ngit push origin main\nEOF\npython /tmp/t/fix.py`,
+      `cat > src/hooks/use.js <<'EOF'\ngit(repo, 'push')\nEOF\nnode src/hooks/use.js`, // git runs hooks by exact name only
+      "cat > /tmp/t/fix.py <<-'PYEOF'\n\tgit(repo, 'commit')\n\tPYEOF\npython /tmp/t/fix.py",
+      "cat > /tmp/t/fix.py <<'PYEOF'\r\ngit(repo, 'commit')\r\nPYEOF\r\npython /tmp/t/fix.py\r\n",
+      `${fix}python /tmp/t/exec.py --mode=exec`, // "exec" only as a word on its own is refused
+      "cat <<'EOF'\nthen run git commit -m x\nEOF", // to the screen (blankDataBodies already)
+      `cat > "$TMP/fix.py" ${body}python -I "$TMP/fix.py" .`, // the machine's own folders may be named
+    ]) hidden(c)
+    // Anything else may run the body as shell code, by name, redirect or not at all (make, a package
+    // script, a preload, inline code): its commit counts. The body goes to a .py file, otherwise blanked.
+    const shell = "cat > /tmp/t/x.py <<'EOF'\ncd /c/proj && git commit -am x && git push origin main\nEOF\n"
+    const txt = "cat > /tmp/t/x.txt <<'EOF'\n#!/bin/sh\ngit commit -am x && git push origin main\nEOF\n"
+    for (const run of [
+      'bash /tmp/t/x.py', '. /tmp/t/x.py', 'sh < /tmp/t/x.py', 'cat /tmp/t/x.py | sh', '"bash" /tmp/t/x.py', 'b""ash /tmp/t/x.py',
+      'nohup bash /tmp/t/x.py', 'env -i bash /tmp/t/x.py', 'sudo -u me bash /tmp/t/x.py', 'timeout 9 bash /tmp/t/x.py',
+      'make', 'npm test', 'git status', 'rg --pre bash . /tmp/t/x.py', 'rg --pre=bash x /tmp/t/x.py',
+      'python -c "import os"', 'python -c"import os" /tmp/t/a.py', 'python -Werror /tmp/t/a.py', 'python -m tox', 'python3.12 -m pip install .',
+      'node -e 1', 'node -r /tmp/t/x.py a.js', 'node --run c', 'node /tmp/t/x.py',
+      'bun run c', 'bun /tmp/t/x.sh', 'bun a.ts', 'py a.py', 'python a.sh', 'constructor a.py', 'python < /tmp/t/x.py',
+      'python /tmp/t/fix.py "$(bash /tmp/t/x.py)"', 'python /tmp/t/fix.py "`bash /tmp/t/x.py`"', 'eval "$(cat /tmp/t/x.py)"',
+      'cp /tmp/t/x.py .git/hooks/pre-commit', 'mv /tmp/t/x.py ~/bin/ls', 'chmod +x /tmp/t/x.py',
+      './cat a.py', 'exec >~/bin/ls; ls', 'if true; then python /tmp/t/fix.py; fi', 'f() { bash "$1"; }; f /tmp/t/x.py',
+      'PATH=/tmp/t python a.py', 'PATH+=:/tmp/t; python a.py', 'path=/tmp/t', 'export PATH=/tmp/t', 'readonly BASH_ENV=/tmp/t/x.py',
+      'BASH_ENV=/tmp/t/x.py', 'X=1 python a.py', 'GIT_DIR=/c/p', 'APPDATA=/tmp/t', 'HOME=/tmp/t', 'NODE_OPTIONS=--require=/tmp/t/a.js',
+      'PYTHONPATH=/tmp/t', 'LD_PRELOAD=/tmp/t/x.so', 'IFS=/', 'ENV=/tmp/t/x.py', 'PROMPT_COMMAND=x', 'PATHEXT=.PY', 'COMSPEC=/tmp/t/x.exe',
+    ]) counts(shell + run)
+    // A written file run by its path, even with a harmless name.
+    counts("cat > /tmp/t/python <<'EOF'\ngit commit -am x\nEOF\n/tmp/t/python a.py")
+    // Kept wherever a later shell or git may run it, even if nothing here does.
+    for (const target of ['/tmp/t/x.sh', '~/bin/ls', '~/.bashrc', '.git/hooks/post-merge', '.git/hooks/pre-commit.py', '.git/config', 'package.json', 'tox.ini', 'Makefile']) {
+      counts(`cat > ${target} <<'EOF'\ngit push origin main\nEOF\npython a.py`)
+    }
+    // Kept when it is unquoted (bash runs `$(...)` in it as it writes the file, and one with no `$` too),
+    // read by anything but cat, piped on, shares its opener line, starts programs itself, or the split is a
+    // guess; and the `py` launcher always counts (it follows a `#!/usr/bin/env bash` line, after a tab too).
+    for (const c of [
+      "cat > x.py <<EOF\nx=$(git commit -m x)\nEOF",
+      "cat > /tmp/t/a.txt <<EOF\ngit push origin main\nEOF\npython /tmp/t/fix.py",
+      "python /tmp/t/run.py <<'EOF'\ngit push origin main\nEOF",
+      "cat <<'EOF' | bash\ngit commit -m x\nEOF",
+      "cat <<'EOF' | python /tmp/t/run.py\ngit push origin main\nEOF",
+      "cat <<'EOF' | grep x\ngit push origin main\nEOF",
+      "cat > /tmp/t/a.txt <<'A'; cat > /tmp/t/b.md <<'B'\ngit push origin main\nA\nnotes\nB\npython /tmp/t/fix.py",
+      "cat > /tmp/t/rel.py <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'push', 'origin', 'main'], check=True)\nEOF\npython /tmp/t/rel.py",
+      "cat > /tmp/t/rel.js <<'EOF'\nrequire('child_process').execSync('git push origin main')\nEOF\nnode /tmp/t/rel.js",
+      "cat > /tmp/t/x.py <<-'EOF'\n\t#!/usr/bin/env bash\n\tgit commit -m x\n\tEOF\npy /tmp/t/x.py",
+      "cat > /tmp/t/x.py <<'EOF'\r\ngit push origin main\r\nEOF\r\nbash /tmp/t/x.py\r\n",
+      "cat > x.py <<'EOF'\ngit commit -m x", // no end line
+      "true;#/cat <<'EOF'\ngit commit -m x\nEOF", // `;#` starts a comment: no heredoc, the line runs
+      "mkdir -p ~/bin\nexec >~/bin/ls\ncat <<'EOF'\n#!/bin/sh\ngit commit -m x\nEOF\nls", // a screen heredoc sent to a file
+      // A `\`-newline stays in a quoted body, so the body ends at the first EOF and the git line runs.
+      "cat > /tmp/t/x.py <<'EOF'\nfoo \\\nEOF\ngit commit -am x && git push origin main\nEOF\npython /tmp/t/x.py",
+      "cat <<'EOF' &>~/bin/python\n#!/bin/sh\ngit commit -am x\nEOF\npython a.py", // &> is a redirect too
+      "cat <<'EOF' >&~/bin/python\ngit commit -am x\nEOF\npython a.py",
+      // A body copied, on another line, to where a later command runs it.
+      `${txt}cat /tmp/t/x.txt > ~/bin/python\npython a.py`,
+      `${txt}head -n 99 /tmp/t/x.txt >> ~/bin/ls\nls`,
+      `${txt}cat /tmp/t/x.txt > /tmp/t/python\n/tmp/t/python a.py`,
+      // rg --pre in other spellings, and a variable that becomes a flag.
+      `${txt}rg --p""re bash . /tmp/t/x.txt`, `${txt}rg --"pre" bash . /tmp/t/x.txt`, `${txt}rg --pr{e,e} bash . /tmp/t/x.txt`,
+      `S="-c__import__('os').system('sh</tmp/t/x.txt')#"\n${txt}python $S.py`,
+      `S="-c__import__('os').system('sh</tmp/t/x.txt')#"\n${txt}python "$S/a.py"`,
+      `X=--p\n${txt}rg \${X}re=bash . /tmp/t/x.txt`,
+      `${txt}printf -v BASH_ENV %s /tmp/t/x.txt\npython a.py`,
+      // A body that may start programs, in other spellings.
+      "cat > /tmp/t/r.py <<'EOF'\nfrom os import system as s\ns('git push origin main')\nEOF\npython /tmp/t/r.py",
+      "cat > /tmp/t/r.py <<'EOF'\n__import__('os').system('git push origin main')\nEOF\npython /tmp/t/r.py",
+    ]) counts(c)
+    // A real commit outside the bodies is still seen, and only a heredoc on its own line is its message.
+    expect(gitAction("cat > n.py <<'EOF'\nprint(1)\nEOF\npython n.py && git commit -m done")?.message).toBe('done')
+    for (const opener of ["<<'EOF'", "<<-'EOF'", '<<"EOF"', '<<EOF']) {
+      const end = opener.includes('-') ? '\tEOF' : 'EOF'
+      const c = `git commit -m "$(cat ${opener}\n${opener.includes('-') ? '\t' : ''}Subject\n${end}\n)"`
+      expect([c, gitAction(c)?.message]).toEqual([c, opener.includes('-') ? '\tSubject' : 'Subject'])
+    }
+    expect(gitAction("git commit -m \"$(cat <<'END-MSG'\nSubject\nEND-MSG\n)\"")?.message).toBe('Subject')
+    // `-F file`: a heredoc that wrote the file is read as the message too.
+    expect(gitAction("cat > /tmp/msg.txt <<'EOF'\nSubject here\nEOF\ngit commit -F /tmp/msg.txt")?.message).toContain('Subject here')
+  })
+
   test('knows a gh command that writes from one that reads', async () => {
     for (const c of ['gh pr create --title x', 'gh issue comment 3 --body hi', 'gh release create v1', 'gh api repos/o/r/issues -f title=x', 'gh api -X POST /gists']) {
       expect(ghWrites(c)).toBe(true)
@@ -197,9 +296,11 @@ describe('git commands', () => {
     const sshScript = "S=/tmp/s\ncat > \"$S/run.sh\" <<'EOF'\nC=$(mktemp -d); git -C \"$C\" init -q\ngit -C \"$C\" commit -qm c\ngit push origin main\nEOF\n"
     expect(gitAction(sshScript + "ssh box 'bash -s' < \"$S/run.sh\"")).toBe(undefined)
     expect(gitAction(sshScript + "MSYS_NO_PATHCONV=1 timeout 600 ssh.exe box 'bash -s' < \"$S/run.sh\"")).toBe(undefined)
-    // Kept on disk and run here, written somewhere ssh doesn't read, or a real push after the ssh line: still local.
+    // Kept on disk and run here, or a real push after the ssh line: still local. Written to a .md file
+    // with nothing else here running shell code: only text (`blankWrittenScripts`). A later command that
+    // runs such a file is not seen by this check either way.
     expect(gitAction(sshScript + 'bash "$S/run.sh"')?.pushes).toBe(true)
-    expect(gitAction(sshScript.replace('cat > "$S/run.sh"', 'cat > /tmp/notes.md') + "ssh box 'bash -s' < \"$S/run.sh\"")?.pushes).toBe(true)
+    expect(gitAction(sshScript.replace('cat > "$S/run.sh"', 'cat > /tmp/notes.md') + "ssh box 'bash -s' < \"$S/run.sh\"")).toBe(undefined)
     expect(gitAction(sshScript + "ssh box 'bash -s' < \"$S/run.sh\"\ngit push origin main")?.refs).toEqual(['main'])
     // ssh's ProxyCommand and LocalCommand run here, so such an ssh line hides nothing.
     expect(gitAction("ssh -o ProxyCommand='git push origin main' box true")?.pushes).toBe(true)
@@ -1396,6 +1497,12 @@ describe('the git guard', () => {
     seen.existsFails.push('/gitleaks.exe')
     const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
     expect(r.deny?.includes("gitleaks is installed but would not run")).toBe(true)
+  })
+
+  test('a Python test written with a heredoc and run is not a commit: no check, no stop', async ($, on) => {
+    const seen = world(on)
+    const r = await $.tool.call({ tool: 'Bash', command: "cd /c/proj && cat > /tmp/t/fix.py <<'PYEOF'\ngit(repo, 'commit', '-q', '-m', 'first')\nPYEOF\npython -I /tmp/t/fix.py ." })
+    expect([r.deny, seen.ran, seen.calls.filter(c => c.startsWith('git ')).length]).toEqual([undefined, true, 0])
   })
 
   test('a clean commit runs', async ($, on) => {

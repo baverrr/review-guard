@@ -1,7 +1,7 @@
 {
   "name": "review-guard",
-  "version": "0.2.0",
-  "description": "After code changes, sends Claude to review them (pr-review-toolkit plus a per-language security review), and stops git commits and pushes that would send secrets, keys, MAC or IP addresses, or your personal details to GitHub.",
+  "version": "0.3.0",
+  "description": "After code changes, sends Claude to review them with review agents, a per-language security review and the scanners you have, and to act on every finding, low ones included. Stops git commits, pushes and GitHub writes that would send keys, tokens, MAC or IP addresses, or your personal details (with gitleaks when installed). Under Connectors, its tools check a push or any text on request and list what waits for review.",
   "author": {
     "name": "baverrr"
   },
