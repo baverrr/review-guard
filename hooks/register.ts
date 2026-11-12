@@ -1,12 +1,11 @@
 import type { EngineInterface, Register } from 'claude-code'
-import { REVIEW_AGENTS } from './agents'
+import { REVIEW_AGENTS } from './agents.ts'
 import type { Cycle } from '../types'
 import {
   isNewRequest,
   type Finding,
   ghWrites,
   gitAction,
-  type GitAction,
   inScratch,
   languageOf,
   type Paths,
@@ -16,18 +15,15 @@ import {
   networkAllowed,
   report,
   resolveDir,
-  addedLines,
-  type SentLine,
   valueLines,
   reviewPrompt,
-  scanDiff,
-  scanFile,
-  scanLine,
   scanValue,
   settle,
   shellWrites,
-} from './scan'
-import { candidates, gitleaksFindings, type Scanner, SCANNERS, scannerSteps, VERSION_ARGS } from './scanners'
+} from './scan.ts'
+import { type Scanner, scannerSteps } from './scanners.ts'
+import { type Config, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
+import { type LeftOut, type StatusFile, statusDir, statusFileName } from './status.ts'
 
 // review-guard:
 // 1. Remembers the code files Claude changes in a turn (not its own scratch files, nor a script a shell
@@ -37,14 +33,14 @@ import { candidates, gitleaksFindings, type Scanner, SCANNERS, scannerSteps, VER
 //    zizmor, trivy), with commands to run.
 // 2. Stops a git commit or push (and GitHub MCP writes) that would send secrets, keys, MAC or
 //    IP addresses, or the person's own details to a repository with a GitHub remote. When gitleaks
-//    is installed, what a commit or push sends also goes through it.
+//    is installed, what a commit or push sends also goes through it. The check itself is in
+//    outgoing.ts, shared with the MCP server (mcp/server.mjs).
+// 3. Writes each session's review state to ~/.claude/review-guard/status/ (status.ts) for the MCP
+//    server's review_status tool.
 //
-// The person's own details live in ~/.claude/review-guard.json, never in this code:
+// The person's own details live in ~/.claude/review-guard.json (read by loadConfig in outgoing.ts),
+// never in this code:
 //   { "personal": ["name", "email", ...], "allowNetworkInfo": ["owner/repo"], "allowValues": [] }
-
-type Config = { personal: string[]; allowNetworkInfo: string[]; allowValues: string[] }
-
-const CONFIG_NAME = '.claude/review-guard.json'
 
 // The review cycle. The module keeps it in memory, where changes cannot clash (the module runs one
 // thing at a time), and copies each change to the session's state, which outlives a reload: the
@@ -96,13 +92,74 @@ async function updateCycle<T>($: EngineInterface, change: (c: Cycle) => T): Prom
   await ensureLoaded($)
   const result = change(cycle)
   await save($)
+  await writeStatus($)
   return result
 }
 
-// An environment variable read so that it can't fail: undefined when unset or unreadable (a throw
-// included). Every caller treats undefined as "not known", which keeps a file in the review. Each call
-// names its variable as a literal, as the engine asks.
-const safely = (read: () => Promise<string | undefined>) => Promise.resolve().then(read).catch(() => undefined)
+// The files left out of the review this session, newest last, for the status file. In memory only: a
+// reload of the mod empties the list, so the file says since when it holds them (`leftOutSince`).
+const leftOut: LeftOut[] = []
+const LEFT_OUT_KEPT = 30
+const leftOutSince = new Date().toISOString()
+let statusWrites: Promise<void> = Promise.resolve() // the status writes, one after another
+let statusFailed: string | undefined // why the last write failed, said once and kept in the next file
+
+/**
+ * Writes this session's review state to ~/.claude/review-guard/status/ (status.ts), where the MCP
+ * server's `review_status` reads it: the server is another process and can't see the engine's state.
+ * Kept on this machine only. One file per session, never deleted (the engine can't delete files;
+ * review_status shows only recent ones). Writes run one after another, each with the state as it is
+ * then. A failed write never stops anything, but it is said once in the log, and the next
+ * file that is written says the one before it failed.
+ */
+function writeStatus($: EngineInterface, ended = false): Promise<void> {
+  statusWrites = statusWrites.then(async () => {
+    try {
+      await ensureLoaded($)
+      const home = await homeDir($)
+      if (!home) throw new Error('the home folder is not known (neither USERPROFILE nor HOME is set)')
+      const session = await $.session.id()
+      const path = `${statusDir(home)}/${statusFileName(session)}`
+      // A session with nothing to report gets no file: review_status lists the sessions that have
+      // something. Once a file is there (from this load or an earlier one), it is kept current.
+      const nothing = !cycle.reviewing && !cycle.held && Object.keys(cycle.changed).length === 0 && leftOut.length === 0
+      if (nothing && !(await $.fs.exists(path))) {
+        statusFailed = undefined
+        return
+      }
+      const folder = await safely(() => $.session.cwd())
+      const status: StatusFile = {
+        v: 1,
+        session,
+        ...(folder ? { folder } : {}),
+        updated: new Date().toISOString(),
+        phase: ended ? 'ended' : cycle.reviewing ? 'reviewing' : cycle.held ? 'held' : 'idle',
+        queued: Object.keys(cycle.changed),
+        underReview: cycle.reviewing ? Object.keys(cycle.underReview) : [],
+        leftOut: [...leftOut],
+        leftOutSince,
+        ...(statusFailed ? { writeFailed: statusFailed } : {}),
+      }
+      await $.fs.write(path, `${JSON.stringify(status, null, 2)}\n`)
+      statusFailed = undefined
+    } catch (err) {
+      const first = statusFailed === undefined
+      statusFailed = err instanceof Error ? err.message.slice(0, 200) : String(err)
+      if (first) {
+        // In the log, not on the status line: that line may hold a guard notice that must stay seen.
+        try {
+          $.ui.log(`review-guard: could not update its status file, so review_status may be behind (${statusFailed})`)
+        } catch { /* the log is best effort */ }
+      }
+    }
+  })
+  return statusWrites
+}
+
+// A value read so that it can't fail: undefined when unset or unreadable (a throw included). Every caller
+// treats undefined as "not known", which keeps a file in the review. An environment read names its
+// variable as a literal, as the engine asks.
+const safely = <T>(read: () => Promise<T | undefined>): Promise<T | undefined> => Promise.resolve().then(read).catch(() => undefined)
 
 /** How paths are spelled here. Windows is told by USERPROFILE, which Windows always sets. */
 async function pathsHere($: EngineInterface): Promise<Paths> {
@@ -116,8 +173,11 @@ async function tempDirs($: EngineInterface): Promise<string[]> {
   return dirs.filter((d): d is string => d !== undefined && d.trim() !== '')
 }
 
-/** Says on the status line which files were left out of the review and why, so no skip is silent. */
-function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], said?: string): void {
+/**
+ * Says on the status line which files were left out of the review and why, so no skip is silent, and
+ * adds them to the status file. Never throws.
+ */
+async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], said?: string): Promise<void> {
   const parts = [
     ...(scratch.length ? [`scratch ${scratch.map(p => p.replace(/^.*[\\/]/, '')).join(', ')}`] : []),
     ...(onlyRun.length ? [`only run ${onlyRun.join(', ')}`] : []),
@@ -127,6 +187,10 @@ function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], sa
     // After a line the guard just put there (a security notice), so that line is never hidden.
     $.ui.status(said ? `${said}. Not reviewed: ${parts.join('; ')}` : `review-guard: not reviewed (${parts.join('; ')})`)
   } catch { /* the status line is best effort */ }
+  const at = new Date().toISOString()
+  leftOut.push(...scratch.map((path): LeftOut => ({ path, why: 'scratch', at })), ...onlyRun.map((path): LeftOut => ({ path, why: 'only run', at })))
+  leftOut.splice(0, Math.max(0, leftOut.length - LEFT_OUT_KEPT))
+  await writeStatus($)
 }
 
 /**
@@ -162,243 +226,23 @@ type StopAsk = { kind: 'review'; prompt: string } | { kind: 'held'; files: numbe
 
 const BUSY = new Set(['pending', 'running', 'waiting']) // an agent that has not handed back yet
 
+/** The home folder (`homeFrom`: USERPROFILE, else HOME), or undefined. Never throws. */
 async function homeDir($: EngineInterface): Promise<string | undefined> {
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
-  return home?.replace(/\\/g, '/')
-}
-
-// The outside scanners installed here, found once per load of the module: a scanner to its program.
-/** A scanner's program (`exe`), or why one that is there would not run (`broken`); neither: not installed. */
-type Located = { exe?: string; broken?: string }
-
-// Scanners found so far. Only a working one is kept: a missing or broken one is looked for again next
-// time, so one installed (or unblocked) later is used without reloading the mod.
-const located = new Map<Scanner, Promise<Located>>()
-
-/**
- * Where a scanner is. A file that is there but does not run (blocked, half downloaded, too slow on its
- * first start) is `broken`, never "not installed"; only nothing at any place, and nothing on PATH, is.
- */
-function locate($: EngineInterface, tool: Scanner): Promise<Located> {
-  let found = located.get(tool)
-  if (!found) {
-    found = (async (): Promise<Located> => {
-      const home = await homeDir($).catch(() => undefined)
-      const windows = /^[A-Za-z]:\//.test(home ?? '')
-      for (const exe of candidates(tool, home, windows)) {
-        const isPath = exe.includes('/')
-        if (isPath && !(await $.fs.exists(exe).catch(() => false))) continue
-        try {
-          const r = await $.process.run([exe, ...VERSION_ARGS[tool]], { timeoutMs: 30_000 })
-          if (r.exitCode === 0) return { exe }
-          return { broken: `${exe} exited ${r.exitCode}: ${r.stderr.trim().slice(0, 150) || 'no message'}` }
-        } catch (err) {
-          // A file that is there but would not start is broken; a bare name that would not start is not on PATH.
-          if (isPath) return { broken: `${exe} would not start: ${err instanceof Error ? err.message : String(err)}` }
-        }
-      }
-      return {}
-    })()
-    located.set(tool, found)
-    void found.then(l => { if (!l.exe) located.delete(tool) }, () => located.delete(tool))
-  }
-  return found
-}
-
-/** The review scanners that run here, a scanner to its program. Never throws. */
-async function findScanners($: EngineInterface): Promise<Map<Scanner, string>> {
-  const tools = SCANNERS.filter(t => t !== 'gitleaks')
-  const found = await Promise.all(tools.map(t => locate($, t).catch((): Located => ({}))))
-  return new Map(tools.flatMap((t, i) => (found[i]?.exe ? [[t, found[i].exe] as const] : [])))
+  return homeFrom(await safely(() => $.env.get('USERPROFILE')), await safely(() => $.env.get('HOME')))
 }
 
 /**
- * gitleaks on what a commit or push sends: commit messages, added lines and new files' text. Not
- * installed: nothing, and a note. There but broken, failing, or with no full report: throws, so the
- * command stops. Its own ways to wave a finding through are shut, so allowValues stays the only one:
- * `--ignore-gitleaks-allow` for `gitleaks:allow` comments, the mod's own folder as the working folder
- * and ignore path (no `.gitleaks.toml` or `.gitleaksignore` there), and the config variables emptied.
+ * The engine as the outgoing check's `Host` (hooks/outgoing.ts): the same check the MCP server runs
+ * through Node, here through `$`.
  */
-async function gitleaksScan($: EngineInterface, sent: readonly SentLine[], notes: string[]): Promise<Finding[]> {
-  const { exe, broken } = await locate($, 'gitleaks')
-  if (broken) throw new Error(`gitleaks is installed but would not run (${broken})`)
-  if (!exe) {
-    notes.push('gitleaks is not installed, so only the built-in checks ran')
-    return []
+function hostOf($: EngineInterface): Host {
+  return {
+    run: (argv, init) => $.process.run(argv, init),
+    read: path => $.fs.read(path),
+    exists: path => $.fs.exists(path),
+    home: () => homeDir($),
+    pluginRoot: $.plugin.root,
   }
-  if (sent.length === 0) return []
-  const root = $.plugin.root
-  const r = await $.process.run(
-    [exe, 'stdin', '--no-banner', '--exit-code', '0', '--report-format', 'json', '--report-path', '-', '--log-level', 'error',
-      '--ignore-gitleaks-allow', '--gitleaks-ignore-path', root],
-    { stdin: sent.map(s => s.text).join('\n'), cwd: root, env: { GITLEAKS_CONFIG: '', GITLEAKS_CONFIG_TOML: '' }, timeoutMs: 120_000 },
-  )
-  if (r.exitCode !== 0 || r.isStdoutTruncated) throw new Error(`gitleaks failed: ${(r.stderr || 'its report was cut short').slice(0, 200)}`)
-  return gitleaksFindings(r.stdout, sent.map(s => s.where))
-}
-
-async function configPath($: EngineInterface): Promise<string | undefined> {
-  const home = await homeDir($)
-  return home ? `${home}/${CONFIG_NAME}` : undefined
-}
-
-const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues'] as const
-
-/**
- * The user's config. With no file to read, the secret checks still run and `note` says what was skipped.
- * A file that is there but wrong (bad JSON, a misspelt key, a value that is not a list of text) throws,
- * which stops the command: a typo must not quietly turn the personal checks off.
- */
-async function loadConfig($: EngineInterface): Promise<{ config: Config; note?: string }> {
-  const empty: Config = { personal: [], allowNetworkInfo: [], allowValues: [] }
-  const note = 'personal details were NOT checked (no readable ~/.claude/review-guard.json)'
-  const path = await configPath($)
-  if (!path) return { config: empty, note }
-  let text: string
-  try {
-    text = await $.fs.read(path)
-  } catch {
-    return { config: empty, note }
-  }
-  const raw: unknown = JSON.parse(text)
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('review-guard.json must be a JSON object')
-  const fields = raw as Record<string, unknown>
-  const unknown = Object.keys(fields).filter(k => !(CONFIG_KEYS as readonly string[]).includes(k))
-  if (unknown.length > 0) throw new Error(`review-guard.json has a key it does not know: ${unknown.join(', ')}`)
-  const list = (key: (typeof CONFIG_KEYS)[number]): string[] => {
-    const v = fields[key]
-    if (v === undefined) return []
-    if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) throw new Error(`review-guard.json: "${key}" must be a list of text values`)
-    return (v as string[]).filter(x => x.trim() !== '')
-  }
-  return { config: { personal: list('personal'), allowNetworkInfo: list('allowNetworkInfo'), allowValues: list('allowValues') } }
-}
-
-async function git($: EngineInterface, dir: string | undefined, args: string[], timeoutMs = 60_000) {
-  return $.process.run(dir ? ['git', '-C', dir, ...args] : ['git', ...args], { timeoutMs })
-}
-
-/** The repository's GitHub remote URLs, or [] when it has none (then nothing goes to GitHub). */
-async function githubRemotes($: EngineInterface, dir: string | undefined): Promise<string[]> {
-  const r = await git($, dir, ['remote', '-v'])
-  if (r.exitCode !== 0) {
-    // Not a repository: git itself will refuse the commit or push. Any other failure (a folder this
-    // check could not open) must not pass as "no GitHub remote", so it stops the command.
-    if (/not a git repository/i.test(r.stderr)) return []
-    throw new Error(`git remote failed in ${dir ?? 'the session folder'}: ${r.stderr.slice(0, 200)}`)
-  }
-  return [...new Set(r.stdout.split('\n').map(l => l.split(/\s+/)[1] ?? '').filter(u => /github\.com/i.test(u)))]
-}
-
-const MAX_NEW_FILES = 300
-
-/** Runs git and throws when it fails: a check that could not run must stop the command, not pass it. */
-async function gitOk($: EngineInterface, dir: string | undefined, args: string[], what: string, timeoutMs = 60_000) {
-  const r = await git($, dir, args, timeoutMs)
-  if (r.exitCode !== 0) throw new Error(`${what} failed: ${r.stderr.slice(0, 200)}`)
-  return r
-}
-
-const TOO_MUCH = (what: string): Finding => ({ kind: `more ${what} than can be checked at once (do it in smaller steps)`, where: 'this command' })
-
-/** `notes` collects what could only be partly checked, for the user to see. */
-async function findingsFor($: EngineInterface, action: GitAction, config: Config, notes: string[]): Promise<Finding[]> {
-  const { dir } = action
-  const out: Finding[] = []
-  // What goes out, for gitleaks: one entry per line it reads, with where that line came from. Each text is
-  // one line (every source is split on newlines first), so gitleaks' line i + 1 is `sent[i]`.
-  const sent: SentLine[] = []
-  const send = (diff: string) => sent.push(...addedLines(diff))
-  // Who the commits will say made them.
-  for (const v of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
-    const r = await git($, dir, ['var', v])
-    if (r.exitCode === 0) out.push(...scanLine(r.stdout, `the commit's ${v === 'GIT_AUTHOR_IDENT' ? 'author' : 'committer'}`, config.personal))
-  }
-  if (action.message) {
-    action.message.split('\n').forEach(l => {
-      out.push(...scanLine(l, 'the commit message', config.personal))
-      sent.push({ text: l, where: 'the commit message' })
-    })
-  }
-
-  // A command can do both (`git commit ... && git push`): then the staged changes and the commits
-  // already waiting are each checked.
-  if (action.commits) {
-    const diffArgs = ['-c', 'core.quotePath=false', 'diff', '--no-color', '--no-ext-diff', '-U0']
-    const staged = await gitOk($, dir, [...diffArgs, '--cached'], 'git diff --cached')
-    if (staged.isStdoutTruncated) out.push(TOO_MUCH('staged changes'))
-    out.push(...scanDiff(staged.stdout, config.personal))
-    send(staged.stdout)
-    if (action.addsFiles) {
-      // The same command stages more first: scan the working tree's changes and new files too.
-      const tracked = await gitOk($, dir, diffArgs, 'git diff')
-      if (tracked.isStdoutTruncated) out.push(TOO_MUCH('changes'))
-      out.push(...scanDiff(tracked.stdout, config.personal))
-      send(tracked.stdout)
-      // New files are listed from the top of the repository, not the command's folder: `git add -A`
-      // stages all of them, and the names git prints are then relative to where they are read from.
-      const top = (await gitOk($, dir, ['rev-parse', '--show-toplevel'], 'git rev-parse')).stdout.trim()
-      const untracked = await gitOk($, top, ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard'], 'git ls-files')
-      const files = untracked.stdout.split('\n').filter(Boolean)
-      if (untracked.isStdoutTruncated || files.length > MAX_NEW_FILES) out.push(TOO_MUCH('new files'))
-      let nameOnly = 0
-      for (const rel of files.slice(0, MAX_NEW_FILES)) {
-        try {
-          const text = await $.fs.read(`${top}/${rel}`)
-          out.push(...scanFile(rel, text, config.personal))
-          text.split('\n').forEach((l, i) => sent.push({ text: l, where: `${rel}:${i + 1}` }))
-        } catch {
-          // Over 4 MiB or unreadable: still check its name, and say so.
-          out.push(...scanFile(rel, '', config.personal))
-          nameOnly++
-        }
-      }
-      if (nameOnly > 0) notes.push(`${nameOnly} new file(s) too large or unreadable were checked by name only`)
-    }
-  }
-  if (action.pushes) {
-    // What the push sends: the commits no remote has yet, with their metadata. A push that names
-    // what to send (`origin main`, `--all`, `--tags`) is checked for exactly that.
-    const logArgs = ['-c', 'core.quotePath=false', 'log', '-p', '--no-color', '--no-ext-diff', '-U0',
-      '--format=COMMIT %h%nAUTHOR %an <%ae>%nCOMMITTER %cn <%ce>%n%B']
-    const upstream = await git($, dir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
-    const current = upstream.exitCode === 0 ? ['@{u}..HEAD'] : ['HEAD', '--not', '--remotes']
-    const named = action.refs.length > 0 || action.allBranches || action.tags
-    const heads = action.refs.length > 0 ? action.refs : action.allBranches ? [] : ['HEAD']
-    const wanted = [...heads, ...(action.allBranches ? ['--branches'] : []), ...(action.tags ? ['--tags'] : []), '--not', '--remotes']
-    let log = await git($, dir, [...logArgs, ...(named ? wanted : current)], 120_000)
-    // A branch the same command creates does not exist yet: check the current one instead.
-    if (log.exitCode !== 0 && named) log = await git($, dir, [...logArgs, ...current], 120_000)
-    if (log.exitCode !== 0) {
-      // A repository with no commit yet has nothing waiting; the commit this command makes was checked above.
-      const empty = /does not have any commits yet|unknown revision|bad revision/i.test(log.stderr)
-      if (!(empty && action.commits)) throw new Error(`git log failed: ${log.stderr.slice(0, 200)}`)
-      log = { ...log, stdout: '' }
-    }
-    if (log.isStdoutTruncated) out.push({ kind: 'more history than can be checked at once (push in smaller steps)', where: 'the push' })
-    // Each commit is: COMMIT, AUTHOR, COMMITTER, its message, then its diff.
-    let commit = '?'
-    let inMessage = false
-    for (const line of log.stdout.split('\n')) {
-      const c = /^COMMIT (\w+)$/.exec(line)
-      if (c) {
-        commit = c[1] ?? '?'
-        inMessage = false
-      } else if (/^(AUTHOR|COMMITTER) /.test(line)) {
-        out.push(...scanLine(line, `commit ${commit}'s ${line.startsWith('A') ? 'author' : 'committer'}`, config.personal))
-        inMessage = line.startsWith('COMMITTER')
-      } else if (line.startsWith('diff --git')) {
-        inMessage = false
-      } else if (inMessage) {
-        out.push(...scanLine(line, `commit ${commit}'s message`, config.personal))
-        sent.push({ text: line, where: `commit ${commit}'s message` })
-      }
-    }
-    out.push(...scanDiff(log.stdout, config.personal))
-    send(log.stdout)
-  }
-  out.push(...(await gitleaksScan($, sent, notes)))
-  return out
 }
 
 /** A run script's file as it was just before the command: its spelling in the command, place, time and size. */
@@ -414,7 +258,7 @@ async function fileState($: EngineInterface, place: string): Promise<{ mtimeMs: 
 // (`cp -p`, `rsync -a`, `touch -r` after a write) still shows. Larger ones are compared by time and size.
 const COMPARE_TEXT_UP_TO = 512 * 1024
 
-/** A run script's text, when it is small enough to keep; undefined otherwise or when it can't be read. */
+/** A run script's text, when it is small enough to compare; undefined otherwise or when it can't be read. */
 async function scriptText($: EngineInterface, place: string, size: number): Promise<string | undefined> {
   if (size > COMPARE_TEXT_UP_TO) return undefined
   return Promise.resolve().then(() => $.fs.read(place)).then(t => (typeof t === 'string' ? t : undefined)).catch(() => undefined)
@@ -431,7 +275,11 @@ async function snapshotRunScripts($: EngineInterface, command: string, backgroun
     const out: Snapshot[] = []
     for (const [script, place] of runOnlyScripts(command, await pathsHere($), powershell)) {
       const state = await fileState($, place)
-      if (state) out.push({ script, place, ...state, text: await scriptText($, place, state.size) })
+      if (!state) continue
+      const text = await scriptText($, place, state.size)
+      // A small script whose text can't be read can't be shown unchanged: it stays in the review.
+      if (state.size <= COMPARE_TEXT_UP_TO && text === undefined) continue
+      out.push({ script, place, ...state, text })
     }
     return out
   } catch {
@@ -450,7 +298,7 @@ async function untouched($: EngineInterface, before: readonly Snapshot[]): Promi
   for (const b of before) {
     const now = await fileState($, b.place)
     if (!now || now.mtimeMs !== b.mtimeMs || now.size !== b.size) continue
-    if (b.size <= COMPARE_TEXT_UP_TO && (b.text === undefined || (await scriptText($, b.place, now.size)) !== b.text)) continue
+    if (b.size <= COMPARE_TEXT_UP_TO && (await scriptText($, b.place, now.size)) !== b.text) continue
     out.add(b.script)
   }
   return out
@@ -480,7 +328,7 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
       const kept = written.filter(path => !onlyRun.has(path))
       // A scratch file named by a copy or move may be the source of a write into the project: keep it.
       const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), !powershell, COPIES.test(command))
-      sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said)
+      await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said)
     }
   } catch (err) {
     // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.
@@ -496,6 +344,14 @@ export const register: Register = on => {
 
   // A new session reads them from agents/*.md. A session that was already open when the mod loaded
   // does not, so they are registered here too, at each load: the same names, so nothing doubles.
+  // The session's status file says it ended, so review_status doesn't show it as still running.
+  on('session.end', async ($, e, next) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([writeStatus($, true), new Promise(done => { timer = setTimeout(done, 1000) })])
+    clearTimeout(timer)
+    return next(e)
+  }).catch(($, e, next) => next(e)) // an exit must never wait on or fail for the status file
+
   on('session.start', async ($, e, next) => {
     const failed: string[] = []
     for (const agent of REVIEW_AGENTS) {
@@ -519,6 +375,7 @@ export const register: Register = on => {
       await updateCycle($, c => {
         if (!c.reviewing) return
         c.reviewing = false
+        c.underReview = {}
         c.changed = {} // what the review's own agents wrote (scratch files, fixes) is not new work
       })
     }
@@ -531,7 +388,7 @@ export const register: Register = on => {
       const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
       const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
       // The edit tools take a native path, so /tmp is the Unix temp folder only off Windows.
-      if (lang) sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
+      if (lang) await sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
     }
     return result
   }).catch(($, e, next) => next(e)) // only remembers: a failure must never stop an edit
@@ -544,6 +401,7 @@ export const register: Register = on => {
       await updateCycle($, c => {
         if (c.reviewing) for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
         c.reviewing = false
+        c.underReview = {}
         if (e.reason === 'aborted') c.held = true
       })
     }
@@ -557,7 +415,7 @@ export const register: Register = on => {
     if (settled.block) return settled
     await ensureLoaded($)
     // The scanners installed here, for the review's commands (found once; none is fine).
-    const found = await findScanners($).catch(() => new Map<Scanner, string>())
+    const found = await findScanners(hostOf($)).catch(() => new Map<Scanner, string>())
     // If the agents cannot be listed, the review ends here rather than holding every later review back.
     const busy = cycle.reviewing && (await $.agent.list().catch(() => [])).some(a => BUSY.has(a.status))
     const ask = await updateCycle($, (c): StopAsk => {
@@ -566,6 +424,7 @@ export const register: Register = on => {
         // reports come back as turns of this review. Its own fixes are not sent for another review.
         if (!busy) {
           c.reviewing = false
+          c.underReview = {}
           c.changed = {}
         }
         return undefined
@@ -613,16 +472,16 @@ export const register: Register = on => {
     if (action) {
       const home = await homeDir($)
       if (action.dir) action.dir = resolveDir(action.dir, home, /^[A-Za-z]:\//.test(home ?? ''))
-      remotes = await githubRemotes($, action.dir)
+      remotes = await githubRemotes(hostOf($), action.dir)
       // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
       toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
     }
     if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell)
-    const { config, note } = await loadConfig($)
+    const { config, note } = await loadConfig(hostOf($))
     const notes = note ? [note] : []
     const found: Finding[] = []
     if (gh) found.push(...scanValue(local, 'the gh command', config.personal))
-    if (action && toGitHub) found.push(...(await findingsFor($, action, config, notes)))
+    if (action && toGitHub) found.push(...(await findingsFor(hostOf($), action, config, notes)))
     const left = settle(found, networkAllowed(remotes, config.allowNetworkInfo), config.allowValues)
     const what = action && toGitHub ? (action.commits && action.pushes ? 'commit and push' : action.kind) : 'gh command'
     // What could only be partly checked goes with the refusal too: the status line would be overwritten.
@@ -643,11 +502,11 @@ export const register: Register = on => {
   // GitHub MCP tools that write (files, pull requests, issues, comments, reviews) send their text
   // straight to GitHub: check all of it. The ones that only read are left alone.
   on('tool.call', { tool: /^mcp__.*github.*__(?!get_|list_|search_|issue_read$|pull_request_read$)\w+$/ }, async ($, e, next) => {
-    const { config, note } = await loadConfig($)
+    const { config, note } = await loadConfig(hostOf($))
     const notes = note ? [note] : []
     const where = `the ${String(e.tool).split('__').pop()} call`
     // What the write sends goes through gitleaks too, value by value, like a commit's added lines.
-    const raw = [...scanValue(e, where, config.personal), ...(await gitleaksScan($, valueLines(e, where), notes))]
+    const raw = [...scanValue(e, where, config.personal), ...(await gitleaksScan(hostOf($), valueLines(e, where), notes))]
     const found = settle(raw, false, config.allowValues)
     if (found.length > 0) return { deny: report(found, 'GitHub write') + (notes.length > 0 ? `\nAlso: ${notes.join('; ')}.` : '') }
     if (notes.length > 0) $.ui.status(`review-guard: GitHub write checked, but ${notes.join('; ')}`)

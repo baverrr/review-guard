@@ -1,15 +1,19 @@
 // review-guard's outside scanners: gitleaks, bandit, semgrep, zizmor and trivy. Pure functions over
-// text and paths, like scan.ts; register.ts finds the programs and runs them.
+// text and paths, like scan.ts; outgoing.ts finds the programs and runs gitleaks, and the review gives
+// Claude the commands for the rest.
 //
 // None of them is required. One that is not installed is left out (and said so), never a reason to stop
 // a command, except gitleaks failing to run once found, which stops the commit or push like any failed check.
 
-import type { Finding, Language } from './scan'
+import type { Finding, Language } from './scan.ts'
 
 export const SCANNERS = ['gitleaks', 'bandit', 'semgrep', 'zizmor', 'trivy'] as const
 export type Scanner = typeof SCANNERS[number]
 
-/** The scanners the review step runs; gitleaks runs by itself on every commit and push to GitHub. */
+/**
+ * The scanners the review step runs; gitleaks runs by itself on what leaves: commits and pushes to
+ * GitHub, GitHub writes, and the MCP server's checks.
+ */
 export type ReviewScanner = Exclude<Scanner, 'gitleaks'>
 
 /**
@@ -122,7 +126,13 @@ export function gitleaksFindings(json: string, places: readonly string[]): Findi
   const text = json.trim()
   // gitleaks writes "[]" when it finds nothing, so no report at all means it did not do its job.
   if (text === '') throw new Error('gitleaks gave no report')
-  const parsed: unknown = JSON.parse(text)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // Never the parser's own message: it quotes the report around the mistake, and the report holds secrets.
+    throw new Error('gitleaks gave a report that is not valid JSON')
+  }
   if (!Array.isArray(parsed)) throw new Error('gitleaks gave a report that is not a list')
   return parsed.map((x: { RuleID?: unknown; StartLine?: unknown; Secret?: unknown }) => ({
     kind: `a secret gitleaks found (${typeof x.RuleID === 'string' ? x.RuleID : 'unknown rule'})`,

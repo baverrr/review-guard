@@ -19,7 +19,7 @@ const IPV4 = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d
 // ranges set aside for documentation and examples (RFC 5737), which no real network uses.
 function isHarmlessIp(ip: string, line: string, index: number): boolean {
   if (/^(127\.|0\.0\.0\.0$|255\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)/.test(ip)) return true
-  // A version number like "v1.2.3.4" or "2.16.0.1-beta" is not an address.
+  // A match right after a "v", a dot or a digit is part of a version number, not an address.
   const before = line.slice(Math.max(0, index - 1), index)
   if (/[vV.\d]/.test(before)) return true
   // "version" counts only just before the number ("version": "1.2.3.4"), not anywhere on the line,
@@ -50,7 +50,7 @@ const DETECTORS: Detector[] = [
     re: /\b[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}\b/g,
     network: true,
     // 00:00:5e:00:53:xx is set aside for documentation (RFC 7042): no real device has it.
-    // One run straight into more octets (00:00:5e:00:53:aa:bb:...) is not a documentation address.
+    // One that runs straight on into more pairs is not a documentation address, so it is still reported.
     keep: (m, line) =>
       !/^00[:-]00[:-]5e[:-]00[:-]53[:-]/i.test(m[0]) || /^[:-][0-9A-Fa-f]{2}/.test(line.slice(m.index + m[0].length)),
   },

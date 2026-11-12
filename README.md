@@ -41,10 +41,17 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
   handled like any other finding. Missing ones are named, never silently skipped.
 - **Knows when to wait.** If you stop Claude part way, it waits until work picks up again before asking for
   a review.
+- **Checks on request.** It shows under **Connectors** as review-guard, with three tools Claude can use any
+  time: `check_outgoing` checks what is staged (or every change, when asked) and what a push of the
+  current branch would send,
+  `check_text` checks any text before it is posted, and `review_status` lists what is waiting for review
+  and what was left out. They only look, never show what they found (only its kind and place), and say so
+  when part of a check could not run. None of them can turn the reviews off.
 
 ## What you need
 
 - [Claude Code](https://claude.com/claude-code) on Windows, macOS or Linux
+- [Node.js](https://nodejs.org) 22 or newer, for the Connectors tools
 - `git` (and `gh` if you use it)
 - For a private copy of this repository: access to it on GitHub, and git signed in to GitHub on your computer
 - Optional: the scanners above. They are found on PATH, in `~/.local/bin`, or in `~/Tools/scanners/bin` and
@@ -75,7 +82,9 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 1. **Work as usual.** When Claude changes code, the review starts by itself at the end of the turn.
 2. **Commit and push as usual.** If something should not go to GitHub, the command is stopped and Claude says
    what it found and where.
-3. **Add your own terms.** Create `~/.claude/review-guard.json` with your name, email and usernames:
+3. **Ask before you share.** Say "check what this push would send" or "check this PR text for anything
+   private", and Claude uses the review-guard tools. "What's waiting for review?" shows the queue.
+4. **Add your own terms.** Create `~/.claude/review-guard.json` with your name, email and usernames:
 
    ```json
    {
@@ -111,14 +120,26 @@ a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your
 
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
 
+**"review-guard is not under Connectors", or its tools say "out of date".** The tools need Node.js 22 or
+newer on PATH; start a new session after installing it. "Out of date" means the mod was changed without
+rebuilding its tools: run `node scripts/build-mcp.mjs` in its folder (Node 22.13 or newer), then start a
+new session.
+
 <details>
 <summary><b>For developers</b></summary>
 
-- The hooks are in `hooks/register.ts`; the scanning and command reading are pure functions in `hooks/scan.ts`.
+- The hooks are in `hooks/register.ts`, with the commit and push check in `hooks/outgoing.ts`; the scanning
+  and command reading are pure functions in `hooks/scan.ts`.
+- The MCP server (`mcp/server.mjs`, set up in `.mcp.json`) runs the same check through `mcp/host.mjs`, from
+  a plain-JavaScript copy in `mcp/lib/`, since some Node builds can't run TypeScript. After changing
+  `hooks/scan.ts`, `scanners.ts`, `outgoing.ts` or `status.ts`, rebuild it with `node scripts/build-mcp.mjs`
+  (Node 22.13 or newer); the server's tools refuse a copy that doesn't match.
+- Each session writes its review state to `~/.claude/review-guard/status/` for `review_status`. Old files
+  are not removed (the tool shows the last 24 hours).
 - The review agents are in `agents/`, with the same prompts in `hooks/agents.ts` for sessions that were
   already open when the mod loaded. Refresh both together (see `licenses/NOTICE.md`).
-- Run the tests: `claude plugin test .`
-- Check the plugin: `claude plugin validate .`
+- Run the tests: `claude plugin test .` and `node --test tests/mcp-server.node.mjs`
+- Check the plugin: `claude plugin validate .` and `node scripts/build-mcp.mjs --check`
 </details>
 
 ## License

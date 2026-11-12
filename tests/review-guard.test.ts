@@ -2,9 +2,10 @@ import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
   addedLines, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
-} from '../hooks/scan'
-import { REVIEW_AGENTS } from '../hooks/agents'
-import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners'
+} from '../hooks/scan.ts'
+import { REVIEW_AGENTS } from '../hooks/agents.ts'
+import { statusFrom } from '../hooks/status.ts'
+import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
 // The review prompt is wrapped at a fixed width; tests read it as one line so a rewrap breaks nothing.
 const flat = (text: string) => text.replace(/\s+/g, ' ')
@@ -650,6 +651,96 @@ test('a script only run is left out at every shell call site, the git-checked on
   expect(await stop()).toBe(undefined)
 })
 
+test('the review state is written where the MCP server reads it, and a failed write changes nothing', async ($, on) => {
+  disk(on, { [MAP]: 1 })
+  on('session.id', () => ({ value: 's-1' }))
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  on('session.end', () => ({ sessionId: 's-1' })) // the engine's own end step
+  const writes: { path: string; text: string }[] = []
+  let failWrites = false
+  on('fs.write', (_$, e) => {
+    if (failWrites) throw new Error('disk full')
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/app.py')
+  await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES })
+  const last = writes.at(-1)
+  expect(last?.path.replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/)/, '')).toBe('C:/Users/pat/.claude/review-guard/status/s-1.json')
+  const latest = () => statusFrom(JSON.parse(writes.at(-1)?.text ?? '{}'))
+  const status = latest()
+  expect(status === undefined).toBe(false) // the shape the server reads
+  expect(status?.folder).toBe('C:/proj')
+  expect(status?.phase).toBe('idle')
+  expect(status?.queued).toEqual(['C:/proj/app.py'])
+  expect(status?.leftOut.some(l => l.path === '.scripts/memory-map.py' && l.why === 'only run')).toBe(true)
+  // A review: running, with what it covers; when it ends, nothing is shown as under review any more.
+  expect((await stop())?.includes('app.py')).toBe(true)
+  expect(latest()?.phase).toBe('reviewing')
+  expect(latest()?.underReview).toEqual(['C:/proj/app.py'])
+  await stop(true)
+  await stop()
+  expect(latest()?.phase).toBe('idle')
+  expect(latest()?.underReview).toEqual([])
+  // A failed write: the review goes on, and the next file written says the one before failed.
+  failWrites = true
+  await edit('C:/proj/b.py')
+  expect((await stop())?.includes('b.py')).toBe(true)
+  failWrites = false
+  await edit('C:/proj/c.py')
+  expect(latest()?.writeFailed === undefined).toBe(false) // the kit words the failure its own way
+  await edit('C:/proj/d.py')
+  expect(latest()?.writeFailed).toBe(undefined)
+  // The session's end is written too, so it isn't shown as still running.
+  await $.session.end({ reason: 'exit' } as never)
+  expect(latest()?.phase).toBe('ended')
+})
+
+test('a session id that is not a plain name is made one for the status file name', async ($, on) => {
+  disk(on, {})
+  on('session.id', () => ({ value: 'a/b:..\\c' }))
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  const paths: string[] = []
+  on('fs.write', (_$, e) => {
+    paths.push(e.path.replace(/\\/g, '/'))
+    return { value: undefined }
+  })
+  const { edit } = cycle($, on)
+  await edit('C:/proj/app.py')
+  // Each other character is coded, % too, so "a.b" and "a_b" can't share a file.
+  expect(paths.at(-1)?.endsWith('/.claude/review-guard/status/a%002fb%003a%002e%002e%005cc.json')).toBe(true)
+})
+
+test('a session with nothing to report writes no status file, and one that has a file keeps it current', async ($, on) => {
+  disk(on, {})
+  on('session.id', () => ({ value: 's-2' }))
+  on('session.end', () => ({ sessionId: 's-2' }))
+  let fileThere = false
+  on('fs.exists', (_$, e) => ({ value: e.path.replace(/\\/g, '/').endsWith('/status/s-2.json') && fileThere }))
+  const writes: string[] = []
+  on('fs.write', (_$, e) => {
+    writes.push(e.text)
+    return { value: undefined }
+  })
+  const { stop } = cycle($, on)
+  await $.prompt.submit({ text: 'what is 2 + 2?', wait: false, origin: { kind: 'user' } })
+  expect(await stop()).toBe(undefined)
+  await $.session.end({ reason: 'exit' } as never)
+  expect(writes).toEqual([])
+  // A file from an earlier load of the mod is there: its end is written, so it doesn't look open.
+  fileThere = true
+  await $.session.end({ reason: 'exit' } as never)
+  expect(statusFrom(JSON.parse(writes.at(-1) ?? '{}'))?.phase).toBe('ended')
+})
+
+test('status files with a bad time in them are not read', () => {
+  const good = { v: 1, session: 's', updated: '2026-01-01T00:00:00Z', phase: 'idle', queued: [], underReview: [], leftOut: [], leftOutSince: '2026-01-01T00:00:00Z' }
+  expect(statusFrom(good) === undefined).toBe(false)
+  expect(statusFrom({ ...good, leftOutSince: 'soon' })).toBe(undefined)
+  expect(statusFrom({ ...good, leftOut: [{ path: 'a.py', why: 'scratch', at: 'later' }] })).toBe(undefined)
+})
+
 test('a failed lookup never leaves a file out', async ($, on) => {
   on('env.get', () => { throw new Error('no env') }) // a throw, not a rejection
   on('fs.stat', () => { throw new Error('EACCES') })
@@ -1052,6 +1143,8 @@ function world(on: On, git: Record<string, Run> = {}, config: string | undefined
   const seen = {
     ran: false, status: [] as string[], calls: [] as string[], git, config: config as string | undefined,
     stdin: [] as string[], cwd: [] as (string | undefined)[], missing: [] as string[], // scanners not installed at all
+    configUnreadable: false, // the config file is there but can't be read
+    existsFails: [] as string[], // path endings whose existence can't be told (no permission)
   }
   mock.env(on, { USERPROFILE: 'C:/Users/pat' })
   on('process.run', (_$, e) => {
@@ -1069,12 +1162,15 @@ function world(on: On, git: Record<string, Run> = {}, config: string | undefined
   })
   on('fs.exists', (_$, e) => {
     const p = e.path.replace(/\\/g, '/') // the engine may hand over a Windows path
+    if (seen.existsFails.some(m => p.endsWith(m))) throw new Error('EPERM: operation not permitted')
+    if (p.endsWith('/.claude/review-guard.json')) return { value: seen.config !== undefined }
     return { value: p.includes('/Tools/scanners/bin/') && !seen.missing.some(m => p.endsWith(`/${m}.exe`)) }
   })
   on('fs.read', (_$, e) => {
     const file = Object.keys(files).find(f => e.path.replace(/\\/g, '/').endsWith(`/${f}`))
     if (file) return { value: files[file] ?? '' }
     if (seen.config === undefined) throw new Error('no such file')
+    if (seen.configUnreadable) throw new Error('EACCES: permission denied')
     return { value: seen.config }
   })
   on('ui.status', (_$, e) => {
@@ -1124,7 +1220,7 @@ describe('outside scanners', () => {
     const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') }, ' stdin ': { exitCode: 2, stderr: 'boom' } })
     const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
     expect(r.deny?.includes('could not check')).toBe(true)
-    expect(r.deny?.includes('gitleaks failed: boom')).toBe(true)
+    expect(r.deny?.includes('gitleaks failed (exit 2): boom')).toBe(true)
     expect(seen.ran).toBe(false)
   })
 
@@ -1266,7 +1362,40 @@ describe('the git guard', () => {
     expect(r.deny?.includes('GitHub token at app.py:1')).toBe(true)
     expect(r.deny?.includes(FAKE_GH)).toBe(false)
     expect(seen.ran).toBe(false)
-    expect(seen.calls[0]?.startsWith('git -C C:/proj/app remote -v')).toBe(true)
+    expect(seen.calls[0]?.startsWith('git -C C:/proj/app ')).toBe(true)
+    expect(seen.calls[0]?.endsWith(' remote -v')).toBe(true)
+    // The repository's own config can't run a command or rewrite what is scanned: every git call turns
+    // off its file system monitor, and every diff and log turns off its textconv drivers.
+    const git = seen.calls.filter(c => c.startsWith('git '))
+    expect(git.length > 2 && git.every(c => c.includes('-c core.fsmonitor=false'))).toBe(true)
+    expect(git.filter(c => / (?:diff|log) /.test(c)).every(c => c.includes('--no-textconv'))).toBe(true)
+    // Nor take the index lock, which would make a commit the user runs at that moment fail.
+    expect(git.every(c => c.includes(' --no-optional-locks '))).toBe(true)
+  })
+
+  test("the repository's filter drivers are turned off before git reads the working tree", async ($, on) => {
+    const seen = world(on, {
+      'get-regexp': { stdout: 'filter.lfs.clean\nfilter.My.Odd.process\n' },
+      ' diff ': { stdout: added('app.py', 'x = 1') },
+    })
+    expect((await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m x' })).deny).toBe(undefined)
+    const diffs = seen.calls.filter(c => c.startsWith('git ') && c.includes(' diff '))
+    expect(diffs.length).toBe(2) // staged, and the working tree
+    for (const d of diffs) {
+      for (const k of ['lfs.clean', 'lfs.smudge', 'lfs.process', 'lfs.required=false', 'My.Odd.clean', 'My.Odd.process']) {
+        expect(d.includes(`-c filter.${k}`)).toBe(true)
+      }
+    }
+    // A filter name git can't be told to turn off stops the command: the check can't run safely.
+    seen.git = { 'get-regexp': { stdout: 'filter.a=b.clean\n' } }
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny?.includes('could not be turned off')).toBe(true)
+  })
+
+  test('a scanner whose file can not be looked at counts as broken, not missing', async ($, on) => {
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') } })
+    seen.existsFails.push('/gitleaks.exe')
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(r.deny?.includes("gitleaks is installed but would not run")).toBe(true)
   })
 
   test('a clean commit runs', async ($, on) => {
@@ -1351,6 +1480,41 @@ describe('the git guard', () => {
     }
     w.config = '{"personnal":[]}'
     expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny?.includes('personnal')).toBe(true)
+  })
+
+  test('a config that is there but unreadable or wrong stops the command, and its error never quotes it', async ($, on) => {
+    const w = world(on)
+    // JSON's own error quotes the text around the mistake: the message must not.
+    w.config = `{"personal": ["${PERSONAL[0]}", }`
+    const bad = await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+    expect(bad.deny?.includes('review-guard.json is not valid JSON')).toBe(true) // a line number only where the runtime gives one
+    expect(bad.deny?.toLowerCase().includes(PERSONAL[0] ?? '?')).toBe(false)
+    w.config = '{"allowNetworkInfo": ["not a repo"]}' // ignored without a word before: now an error
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny?.includes('allowNetworkInfo')).toBe(true)
+    w.config = CONFIG
+    w.configUnreadable = true // there, but locked: not the same as missing
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny?.includes("can't be read")).toBe(true)
+    w.configUnreadable = false
+    w.config = `﻿${CONFIG}` // Windows PowerShell's byte-order mark is fine
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny).toBe(undefined)
+  })
+
+  test('a push that names refs falls back to the current branch only when one does not exist yet', async ($, on) => {
+    const w = world(on, { 'new-branch --not': { exitCode: 128, stderr: "fatal: ambiguous argument 'new-branch': unknown revision" } })
+    expect((await $.tool.call({ tool: 'Bash', command: 'git push -u origin new-branch' })).deny).toBe(undefined)
+    expect(w.status.at(-1)?.includes('does not exist yet, so only the current branch was checked')).toBe(true)
+    // Any other failure stops the push: falling back would leave what it names unchecked.
+    w.git = { '--branches': { exitCode: 128, stderr: 'fatal: bad object refs/heads/x' } }
+    w.ran = false
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push --all origin' })
+    expect(r.deny?.includes('git log failed')).toBe(true)
+    expect(w.ran).toBe(false)
+  })
+
+  test("a commit's author that can't be read is said, never skipped quietly", async ($, on) => {
+    const w = world(on, { '--cached': { stdout: added('app.py', 'x = 1') }, 'var GIT_AUTHOR_IDENT': { exitCode: 1, stderr: 'bad config' } })
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny).toBe(undefined)
+    expect(w.status.at(-1)?.includes("the commit's author could not be read")).toBe(true)
   })
 
   test('with no config the secret checks still run and the status says what was skipped', async ($, on) => {
