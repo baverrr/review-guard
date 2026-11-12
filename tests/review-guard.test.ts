@@ -182,6 +182,12 @@ describe('git commands', () => {
     expect(gitAction('ssh box true || git push')?.kind).toBe('push')
     expect(gitAction('(cd /srv/app && git push)')?.dir).toBe('/srv/app')
     expect(localPart('')).toBe('')
+    // `timeout [options] DURATION` comes before the program: an ssh after it is still remote, while
+    // `timeout 90 git push` and a push after the ssh command are still local.
+    expect(gitAction("timeout 90 ssh box 'cd ~/repo && git push origin refs/tags/v1'")).toBe(undefined)
+    expect(gitAction("MSYS_NO_PATHCONV=1 timeout -s KILL 2m /c/Windows/System32/OpenSSH/ssh.exe box 'git push'")).toBe(undefined)
+    expect(gitAction('timeout 90 git push origin main')?.refs).toEqual(['main'])
+    expect(gitAction("timeout 90 ssh box 'uptime' && git push")?.kind).toBe('push')
     // Heredoc lookalikes and odd heredocs never hide the local push that follows.
     expect(gitAction('ssh box cat <<< "note"\ngit push origin main')?.kind).toBe('push')
     expect(gitAction("ssh box 'echo <<X'\ngit push")?.kind).toBe('push')
@@ -569,6 +575,81 @@ test('knows which code files a shell command writes', async () => {
   expect(shellWrites("git ls-files src/app.py | xargs sed -i 's/x/y/'")).toEqual(['src/app.py'])
   expect(shellWrites("Get-ChildItem src/app.ps1 | ForEach-Object { (Get-Content $_) -replace 'a','b' | Set-Content $_ }")).toEqual(['src/app.ps1'])
   expect(shellWrites("cat > a.md <<EOF; python - <<'PY'\nnote\nEOF\nimport pathlib\np = pathlib.Path('w.py')\np.write_text('x')\nPY")).toEqual(['w.py'])
+  // A `cat` heredoc with a quoted terminator is data: what its text says runs nowhere here, as long as
+  // every other command here only reads (the file may go to ssh, which runs it on another machine).
+  const script = "S=/tmp/s\ncat > \"$S/scan.sh\" <<'EOF'\ncp a b\nprint('airplay patch in:')\ndocker run --ignorefile /cfg/ignore.yaml img\nEOF\n"
+  expect(shellWrites(script + "ssh.exe box 'bash -s' < \"$S/scan.sh\"")).toEqual([])
+  expect(shellWrites(script + "MSYS_NO_PATHCONV=1 timeout 600 /c/Windows/System32/OpenSSH/ssh.exe box 'bash -s' < \"$S/scan.sh\"")).toEqual([])
+  expect(shellWrites("cat <<'EOF'\nsed -i s/a/b/ app.py\nEOF")).toEqual([]) // printed, not run
+  // A body written to a file that stays here may run later (`bash /tmp/fix`, `make`, a git hook): its text still counts.
+  for (const c of ["cat > note.md <<'EOF'\nrun: sed -i s/a/b/ app.py\nEOF", "cat > /tmp/fix <<'EOF'\nsed -i s/a/b/ app.py\nEOF",
+    "mkdir -p b\ncat > b/Makefile <<'EOF'\nall:\n\tsed -i s/a/b/ app.py\nEOF", "cat > .git/hooks/pre-commit <<'EOF'\nsed -i s/a/b/ app.py\nEOF",
+    script.replace('cp a b', 'cp a b app.py') + "ssh box 'bash -s' < \"$S/other.sh\""]) {
+    expect(shellWrites(c)).toContain('app.py')
+  }
+  expect(shellWrites("cat > /dev/null <<'EOF'\nsed -i s/a/b/ app.py\nEOF")).toEqual([])
+  // A `<<` the heredoc parser can't read makes its split a guess: a fake opener inside can't hide a line bash runs.
+  for (const open of ["<<'EO F'", "<<'EOF.'", "<<'1E'", "<<$'EOF'"]) {
+    const end = open === "<<$'EOF'" ? 'EOF' : open.slice(3, -1)
+    expect(shellWrites(`cat ${open}\ncat > n.md <<'Z'\n${end}\nsed -i s/a/b/ app.py\nZ`)).toContain('app.py')
+  }
+  expect(shellWrites("cat <<EOF.\nEOF\ncat > n.md <<'Z'\nEOF.\nsed -i s/a/b/ app.py\nZ")).toContain('app.py')
+  // Each guard on its own: the body goes to ssh (so the target check would blank it), and something else
+  // here still runs it, or bash runs part of it here, or the split is a guess.
+  const sent = script.replace('cp a b', 'cp a b app.py') + "ssh box 'bash -s' < \"$S/scan.sh\"\n"
+  for (const run of ['bash "$S/scan.sh"', 'make', 'npm run build', '. "$S/scan.sh"', 'ls "$S" | xargs -n1 bash', 'unknown-tool "$S"',
+    'timeout 60 bash "$S/scan.sh"', 'timeout -k 5 60 bash "$S/x"', 'echo "$(bash "$S/scan.sh")"']) {
+    expect(shellWrites(sent + run)).toContain('app.py')
+  }
+  expect(shellWrites("cat <<EOF\n$(sed -i s/a/b/ app.py)\nEOF")).toEqual(['app.py']) // unquoted bodies run `$(...)` here
+  expect(shellWrites("cat <<EOF\n`sed -i s/a/b/ app.py`\nEOF")).toEqual(['app.py'])
+  expect(shellWrites("S=/tmp/s\ncat > \"$S/a.sh\" <<EOF\n$(cp a.py b.py)\nEOF\nssh box 'bash -s' < \"$S/a.sh\"")).toEqual(['a.py', 'b.py'])
+  for (const c of ["cat <<'EO F'\ncat <<'Z'\nEO F\nsed -i s/a/b/ app.py\nZ", "cat <<'EOF.'\ncat <<'Z'\nEOF.\nsed -i s/a/b/ app.py\nZ",
+    "cat <<$'EOF'\ncat <<'Z'\nEOF\nsed -i s/a/b/ app.py\nZ", "cat <<EOF.\nEOF\ncat <<'Z'\nEOF.\nsed -i s/a/b/ app.py\nZ",
+    "cat <<'EOF'\necho x > app.py\n", "cat <<'EOF'\necho x > app.py\nEOF\necho \"a\\\" b\"", "export PATH=/tmp/x\ncat <<'EOF'\necho x > app.py\nEOF"]) {
+    expect(shellWrites(c)).toEqual(['app.py'])
+  }
+  // timeout's spaced long options, a path or .exe, and a cut-off timeout before the next command.
+  const tscript = script.replace('cp a b', 'cp a b app.py')
+  for (const t of ['timeout -k 5 60', 'timeout --kill-after 5 --signal KILL 60', 'timeout -s KILL 60']) {
+    expect(shellWrites(tscript + `${t} ssh box 'bash -s' < "$S/scan.sh"`)).toEqual([])
+  }
+  for (const c of ["timeout --kill-after 5 60 ssh box 'sed -i s/a/b/ app.py'", "timeout --signal KILL 60 ssh box 'sed -i s/a/b/ app.py'",
+    "/usr/bin/timeout 60 ssh box 'sed -i s/a/b/ app.py'", "timeout.exe 60 ssh box 'sed -i s/a/b/ app.py'",
+    "timeout\nssh box 'sed -i s/a/b/ app.py'", "timeout -s; ssh box 'sed -i s/a/b/ app.py'", "timeout -k\nssh box 'sed -i s/a/b/ app.py'"]) {
+    expect(shellWrites(c)).toEqual([])
+  }
+  expect(gitAction("timeout --signal KILL 60 ssh box 'git push origin main'")).toBe(undefined)
+  expect(gitAction('timeout\ngit push origin main')?.kind).toBe('push')
+  expect(shellWrites('truncate -s 0 app.py')).toEqual(['app.py'])
+  expect(shellWrites('sort -n app.py; grep -o x app.py')).toEqual([])
+  // `rg --pre bash` runs a program on what it searches, so rg is not read-only then.
+  expect(shellWrites(script.replace('cp a b', 'cp a b app.py') + "ssh box 'bash -s' < \"$S/scan.sh\"\nrg --pre bash x /tmp/s")).toContain('app.py')
+  expect(shellWrites("python -I - <<'EOF'\nopen('notes.md', 'w').write('x')\nEOF\nrg --pre=bash -l x . && python app.py")).toContain('app.py')
+  expect(shellWrites(script + 'for n in a b; do echo "$n"; ssh box \'bash -s\' < "$S/scan.sh"; done\nmkdir -p out; date')).toEqual([])
+  // Anything here that might run the file keeps the body: named, globbed, built, looped, or another heredoc's code.
+  for (const run of ['bash "$S/scan.sh"', 'cd "$S" && bash scan.sh', 'bash "$S"/*.sh', 'bash "$(ls -t "$S" | head -1)"', 'eval "$(cat "$S/x")"',
+    'ls "$S" | xargs -n1 bash', 'ls "$S" | while read f; do bash "$S/$f"; done', 'N=scan; bash "$S/$N.sh"', 'bash "$S"/{scan,x}.sh',
+    `python - <<'PY'\nimport subprocess\nsubprocess.run(["bash", "/tmp/s/scan.sh"])\nPY`, '. "$S/scan.sh"', 'source "$S/scan.sh"',
+    'X=1 sh "$S/scan.sh"', 'sudo bash "$S/scan.sh"', 'ssh box true; bash "$S/scan.sh"', 'unknown-tool "$S"',
+    "bash <<'X'\nbash /tmp/s/scan.sh\nX", "bash /tmp/s/sc''an.sh", "sh -c 'for f in /tmp/s/*; do sh \"$f\"; done'",
+    'find /tmp/s -type f -execdir bash {} +', 'make', 'npm run build', 'timeout 60 bash "$S/scan.sh"', 'timeout -k 5 60 make']) {
+    expect(shellWrites(script.replace('cp a b', 'cp a b app.py') + run)).toContain('app.py')
+  }
+  expect(shellWrites("cat > n.md <<EOF\n$(sed -i s/a/b/ app.py)\nEOF")).toContain('app.py') // unquoted: bash runs `$(...)` here
+  // Only `cat` itself reads a data body: not a lookalike name, nor `cat` remade by a function, an alias or PATH.
+  for (const c of ["cat() { bash; }; cat > n.txt <<'EOF'\necho x > app.py\nEOF", "cat () { bash; }\ncat > n.txt <<'EOF'\necho x > app.py\nEOF",
+    "function cat { bash; }\ncat > n.txt <<'EOF'\necho x > app.py\nEOF", "alias cat=bash\ncat > n.txt <<'EOF'\necho x > app.py\nEOF",
+    "PATH=/tmp/x:$PATH cat > n.txt <<'EOF'\necho x > app.py\nEOF", "/tmp/rcat > n.txt <<'EOF'\necho x > app.py\nEOF"]) {
+    expect(shellWrites(c)).toContain('app.py')
+  }
+  expect(shellWrites("/usr/bin/cat <<'EOF'\necho x > app.py\nEOF")).toEqual([]) // cat by its full path is still cat
+  expect(shellWrites("cat > n.md <<'EOF' && cp a.py b.py\nx\nEOF")).toEqual(['a.py', 'b.py']) // the opener's own line still counts
+  // `timeout` and its options come before the program, so the ssh after it is still a remote command.
+  expect(shellWrites("timeout 60 ssh box \"sed -i 's/a/b/' app.py\"")).toEqual([])
+  expect(shellWrites("timeout -k 5 --signal=TERM 1m ssh box 'cp a.py b.py'")).toEqual([])
+  expect(shellWrites("timeout 60 sed -i 's/a/b/' app.py")).toEqual(['app.py'])
+  for (const c of ['sort -o app.py app.py', 'sort -uo app.py app.py', 'sort --output=app.py app.py']) expect(shellWrites(c)).toEqual(['app.py'])
   // Reading, running, and writing something that is not code leave nothing to review.
   for (const c of ['cat src/app.py', 'pytest tests/test_app.py 2>&1 | tail -5', 'python build.py > out.log 2>/dev/null', "sed -n '1,5p' app.py",
     'git diff -- app.py', 'echo done > notes.md', 'ls > /dev/null']) {

@@ -295,6 +295,10 @@ export function localPart(command: string): string {
   // another command's text (`echo "use ssh"`, a commit message, GIT_SSH_COMMAND=...) blanks nothing.
   let i = 0
   let first = true // the next word is the program a command runs
+  // Inside `timeout [options] DURATION program`, the program comes after the duration. `options`: after
+  // `timeout`, skipping its flags until the first non-flag word, the duration. `value`: the last flag
+  // takes the next word as its value (`-k 5`, `--signal KILL`; `--signal=KILL` is one word).
+  let timeout: 'off' | 'options' | 'value' = 'off'
   while (i < n) {
     const c = command[i] ?? ''
     if (c === '>' || c === '<') {
@@ -303,12 +307,25 @@ export function localPart(command: string): string {
       i += 2
     } else if (c === ';' || c === '|' || c === '&' || c === '(' || c === ')' || c === '\n') {
       first = true
+      timeout = 'off'
       i++
     } else if (/\s/.test(c)) {
       i++
     } else {
       const end = Math.max(wordEnd(i), i + 1)
       const word = unquote(command.slice(i, end))
+      if (timeout !== 'off') {
+        if (timeout === 'value') timeout = 'options'
+        else if (/^(?:-[ks]|--kill-after|--signal)$/.test(word)) timeout = 'value'
+        else if (!word.startsWith('-')) timeout = 'off' // the duration: the program is next
+        i = end
+        continue
+      }
+      if (first && /^(?:.*[\\/])?timeout(?:\.exe)?$/i.test(word)) {
+        timeout = 'options'
+        i = end
+        continue
+      }
       if (!first || BEFORE_PROGRAM.has(word) || /^[A-Za-z_]\w*=/.test(word)) {
         i = end
         continue
@@ -434,7 +451,8 @@ const SHELL_WRITE = new RegExp([
   String.raw`\b(?:cp|mv|patch)\s`, String.raw`\bgit\s+apply\b`,
   String.raw`\b(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item)\b`,
   String.raw`\bwrite_(?:text|bytes)\b`, String.raw`\bwriteFile(?:Sync)?\b`, String.raw`\bWriteAll(?:Text|Lines|Bytes)\b`,
-  String.raw`\bopen\([^)]*,\s*["'][wax]`, String.raw`\.write\(`,
+  String.raw`\bopen\([^)]*,\s*["'][wax]`, String.raw`\.write\(`, String.raw`\btruncate(?:Sync)?\b`,
+  String.raw`\bsort\b[^;&|\n]*\s(?:-[a-zA-Z]*o|--output)`, // `-o`, `-uo`, `--output=`
   // Formatters and fixers rewrite the files they are given.
   String.raw`--write\b`, String.raw`--fix\b`, String.raw`\b(?:black|autopep8|rustfmt)\s`, String.raw`\bgofmt\s+-\w*w`, String.raw`\bdotnet\s+format\b`,
 ].join('|'), 'i')
@@ -443,7 +461,15 @@ const SHELL_WRITE = new RegExp([
  * A here-document body and, from its opener's line, the command that reads it (`python -I -`, `cat > n.md`).
  * `quoted` is `<<'EOF'`: bash then takes the body as it is, with no `$`, backtick or backslash expansion.
  */
-type Heredoc = { text: string; reader: string; piped: boolean; quoted: boolean }
+type Heredoc = {
+  text: string; reader: string; piped: boolean; quoted: boolean
+  /**
+   * The opener's line, and the body's lines [from, to): indexes into `command.split('\n')` of the very
+   * string given to `heredocs`, never into `outside` (which drops body lines). With no terminator, `to`
+   * is the end of the command, and `complete` is false.
+   */
+  line: number; from: number; to: number
+}
 
 /**
  * A command's own lines with every here-document body taken out, and the bodies on their own. Openers
@@ -466,16 +492,24 @@ function heredocs(command: string): { outside: string; bodies: Heredoc[]; comple
       .replace(/(^|\s)#.*$/, '$1')
     // A backslash can escape a quote (`-"\" <<EOF"`), which the masking above can't follow.
     if (/["'`\\]/.test(masked.replace(/""/g, '')) || line.includes('\\') || /[<>]\(/.test(masked)) complete = false
-    for (const m of masked.matchAll(/(?<!<)<<(?!<)(-?)\s*(\x01?)([A-Za-z_][\w-]*)/g)) {
+    const opener = i // a second heredoc on this line starts after the first one's body, but opens here
+    const OPENER = /(?<!<)<<(?!<)(-?)\s*(\x01?)([A-Za-z_][\w-]*)/g
+    // A `<<` this parser can't read (`<<'EO F'`, `<<$'EOF'`, `<<'1E'`), or a name that runs on past what it
+    // reads (`<<EOF.`): bash ends that body on another line than this parser would, so the split is a guess.
+    if (/(?<!<)<<(?!<)/.test(masked.replace(OPENER, ''))) complete = false
+    for (const m of masked.matchAll(OPENER)) {
+      if (!/^(?:$|[\s;&|<>()])/.test(masked.slice((m.index ?? 0) + m[0].length))) complete = false
       const before = masked.slice(0, m.index).split(/[;&|(]/).pop() ?? ''
       const after = masked.slice((m.index ?? 0) + m[0].length).split(/[;&]/)[0] ?? ''
       const ends = (l: string) => (m[1] ? l.replace(/^\t+/, '') : l).replace(/\r$/, '') === m[3]
+      const from = i + 1
       const body: string[] = []
       while (i + 1 < lines.length && !ends(lines[i + 1] ?? '')) body.push(lines[++i] ?? '')
+      const to = i + 1
       if (i + 1 < lines.length) i++ // the terminator line
       else complete = false
       const [reads = '', ...rest] = after.split('|')
-      bodies.push({ text: body.join('\n'), reader: `${before} ${reads}`.trim(), piped: rest.length > 0, quoted: m[2] !== '' })
+      bodies.push({ text: body.join('\n'), reader: `${before} ${reads}`.trim(), piped: rest.length > 0, quoted: m[2] !== '', line: opener, from, to })
     }
   }
   return { outside: outside.join('\n'), bodies, complete }
@@ -577,7 +611,8 @@ const REDIRECT = /\d?>>?\s*([^\s<>]+)/g
  */
 function onlyRun(command: string): { outside: string; runs: Map<string, number> } | undefined {
   const { outside, bodies, complete } = heredocs(command)
-  if (!complete || outside.includes('$') || SHELL_WRITE.test(outside)) return undefined
+  // `--pre`: `rg --pre bash` runs a program on every file it reads, so rg is not read-only then.
+  if (!complete || outside.includes('$') || /--pre\b/.test(outside) || SHELL_WRITE.test(outside)) return undefined
   const written = new Set<string>() // what the bodies write: running one of these runs new code
   for (const body of bodies) {
     if (body.piped) return undefined // `cat <<EOF | bash`: the body goes on to something else
@@ -586,7 +621,13 @@ function onlyRun(command: string): { outside: string; runs: Map<string, number> 
     const reader = body.reader.replace(REDIRECT, '').trim()
     if (targets.includes('""')) return undefined // a quoted target was masked: its name is unknown
     targets.forEach(t => written.add(sameFile(t)))
-    if (/^\S*?cat(?:\.exe)?(?:\s+-\S*)*$/i.test(reader)) continue // data, written where the redirect says
+    if (/^(?:\S*[\\/])?cat(?:\.exe)?(?:\s+-\S*)*$/i.test(reader)) {
+      // Data, written where the redirect says. But a body that holds a writer is a script a later command
+      // may run (`bash /tmp/fix`, a git hook), so its text counts. (`blankDataBodies` has already emptied
+      // the ones sent to ssh.)
+      if (SHELL_WRITE.test(body.text)) return undefined
+      continue
+    }
     // Only Python or Node reading the body as its code: not a shell, a script reading stdin, or inline code.
     const words = reader.split(/\s+/)
     if (!/^(?:python[\d.]*|py|node|bun)$/.test(commandName(words[0] ?? '')) || !['', '-'].includes(runTarget(words) ?? 'x')) return undefined
@@ -627,15 +668,71 @@ function onlyRun(command: string): { outside: string; runs: Map<string, number> 
   return { outside, runs }
 }
 
+// Outside the here-documents, the only commands under which a data body is not trusted to stay data:
+// none of them runs a file (`cat` reads one). Shell keywords open and close loops whose commands are checked too.
+const RUNS_NOTHING = new Set(['cat', 'mkdir', 'sleep', 'date', 'export', 'for', 'done', 'fi', 'esac', 'else'])
+
+/**
+ * `local` (the command after `localPart`) with the bodies of its data here-documents blanked, lines
+ * kept so the split still holds. A data body is a quoted here-document read by `cat` alone (bash expands
+ * nothing in it) that goes either onto the screen (`cat <<'EOF'`) or into a file this same command then
+ * sends to ssh (`cat > "$S/x.sh" <<'EOF'` ... `ssh host 'bash -s' < "$S/x.sh"`), which runs it on
+ * another machine. A body written to any other file stays: a later command may run it (`bash x`, `make`,
+ * a git hook), and a write of code this command can't see is still a write of code.
+ *
+ * Kept narrow, as an allowlist: every command outside the bodies must be a read-only tool or one in
+ * RUNS_NOTHING (`bash`, `python`, `xargs`, `eval`, `.`, `read` loops and anything unknown run something,
+ * so nothing is blanked), and none may hold `$(...)`, a backtick, `--pre` (`rg --pre bash` runs a
+ * program), or anything that could make `cat` another program (a PATH assignment, a function or an
+ * alias). Nothing is blanked when the heredoc split is a guess, and a body that is piped on or shares
+ * its opener line with another heredoc is kept.
+ */
+function blankDataBodies(full: string, local: string): string {
+  const command = local
+  const { outside, bodies, complete } = heredocs(command)
+  if (!complete || /\$\(|`|--pre\b|\bPATH=|\(\s*\)|\b(?:function|alias)\b/.test(outside.replace(/'[^'\n]*'/g, "''"))) return command
+  const masked = outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""').replace(/\d*>&\d+/g, '')
+  for (const cmd of masked.split(/&&|\|\||[;&|\n]/)) {
+    const words = cmd.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(REDIRECT, '').trim().split(/\s+/)
+    while (words.length && (BEFORE_PROGRAM.has(words[0] ?? '') || /^[A-Za-z_]\w*=/.test(words[0] ?? ''))) words.shift()
+    if (commandName(words[0] ?? '') === 'timeout') { // `timeout [options] DURATION program`, as in localPart
+      words.shift()
+      while (words[0]?.startsWith('-')) if (/^(?:-[ks]|--kill-after|--signal)$/.test(words.shift() ?? '')) words.shift()
+      words.shift() // the duration
+    }
+    const name = commandName(words[0] ?? '')
+    if (name && !READ_ONLY.test(name) && !RUNS_NOTHING.has(name)) return command
+  }
+  const lines = command.split('\n')
+  const perLine = new Map<number, number>()
+  for (const b of bodies) perLine.set(b.line, (perLine.get(b.line) ?? 0) + 1)
+  // Whether `full` feeds this file, spelled as the opener spells it, to a command `localPart` blanked (ssh).
+  const sentToSsh = (target: string) => {
+    const re = new RegExp(String.raw`(?<!<)<\s*["']?${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?(?=$|[\s;&|)])`, 'g')
+    return [...full.matchAll(re)].some(m => !local.slice(m.index ?? 0, (m.index ?? 0) + m[0].length).trim())
+  }
+  for (const b of bodies) {
+    if (!b.quoted || b.piped || perLine.get(b.line) !== 1) continue
+    if (!/^(?:\S*[\\/])?cat(?:\.exe)?(?:\s+-\S*)*$/i.test(b.reader.replace(REDIRECT, '').trim())) continue
+    // Every redirect target on the opener's line, as spelled there (the masked reader hides quoted names).
+    const targets = [...(lines[b.line] ?? '').matchAll(/(?<![0-9&<])\d?>>?\s*("[^"]+"|'[^']+'|[^\s;&|<>()]+)/g)].map(m => unquote(m[1] ?? ''))
+    if (!targets.every(t => t === '/dev/null' || sentToSsh(t))) continue // a file left here may run later
+    for (let k = b.from; k < b.to; k++) lines[k] = ''
+  }
+  return lines.join('\n')
+}
+
 /**
  * The code files a shell command writes, as the command names them. A redirect counts for its target
  * alone. When anything else in the command writes, every code file it names counts, which can include
  * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
- * safer mistake than a change nobody looked at. The one exception is `onlyRun`: a script run after
- * here-documents that only write notes.
+ * safer mistake than a change nobody looked at. Three things are left out: what ssh runs on another
+ * machine (`localPart`), the text of data here-documents nothing here runs (`blankDataBodies`), and a
+ * script run after here-documents that only write notes (`onlyRun`).
  */
 export function shellWrites(fullCommand: string): string[] {
-  const command = localPart(fullCommand) // what ssh runs on another machine writes no file here
+  // What ssh runs on another machine writes no file here, and a data heredoc's text runs nowhere here.
+  const command = blankDataBodies(fullCommand, localPart(fullCommand))
   // A wildcard, a variable or a sed pattern is not a file name: `src/*.ts`, `$DIR/a.py`, `hooks\/a.ts`.
   const notAName = (raw: string) => /[*?^$]|\\\//.test(raw)
   const out = new Set<string>()

@@ -91,7 +91,8 @@ Claude cannot edit this file; the mod stops it from trying. A typo in it stops c
 **"review-guard could not check this command."** Git could not open the folder the command names, or the
 config file has a mistake. The message gives the reason. Run git with `git -C <full path>` or fix the file.
 
-**"It asks for a review I don't need."** Changes to notes and other non-code files are never reviewed. To turn
+**"It asks for a review I don't need."** Changes to notes and other non-code files are never reviewed, and
+neither is a script that a shell command only prints or sends to another machine over SSH. To turn
 the mod off for a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your settings.
 
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
