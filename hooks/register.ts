@@ -303,30 +303,99 @@ async function remember($: EngineInterface, changed: [string, string][], posixTm
 /** What the end of a turn asks for: a review, a word that one is held, or nothing. */
 type StopAsk = { kind: 'review'; prompt: string } | { kind: 'held'; files: number } | undefined
 
-// An agent that has handed back: anything else (pending, running, waiting, or a status the engine adds
-// later) is still out. A teammate waiting for a message is `idle`, so it does not hold a review open.
-const DONE = new Set(['idle', 'completed', 'failed', 'killed'])
+// An agent that is done for good. `idle` is not: a teammate waits for its next message that way.
+const FINISHED = new Set(['completed', 'failed', 'killed'])
 
-/** An agent as `$.agent.list()` gives it, with only what the review needs, read so that nothing throws. */
-type Listed = { id: string; out: boolean }
+/**
+ * An agent as `$.agent.list()` gives it, read so that nothing throws. `out`: it is working now (anything
+ * but idle or finished, a status the engine adds later included). `finished`: it is done for good.
+ */
+type Listed = { id: string; out: boolean; finished: boolean }
 
-/** The agents still out, from what `$.agent.list()` resolved. Anything that is not a list throws. */
-export function agentsOut(list: unknown): Listed[] {
+/** The session's agents, from what `$.agent.list()` resolved. Anything that is not a list throws. */
+export function agentsListed(list: unknown): Listed[] {
   if (!Array.isArray(list)) throw new Error('the agent list was not a list')
   return list
     .filter((a): a is { id?: unknown; status?: unknown } => typeof a === 'object' && a !== null)
-    .map(a => ({ id: typeof a.id === 'string' ? a.id : '', out: !(typeof a.status === 'string' && DONE.has(a.status)) }))
-    .filter(a => a.out)
+    .map(a => {
+      const status = typeof a.status === 'string' ? a.status : ''
+      return { id: typeof a.id === 'string' ? a.id : '', out: status !== 'idle' && !FINISHED.has(status), finished: FINISHED.has(status) }
+    })
 }
 
 /**
- * Whether one of these agents holds the running review open: one still out that was not already at work
- * when the review began (`othersAtStart`). Whatever its type, an agent started during the review is part
- * of it: a reviewer, a general-purpose agent doing the security review, a fork fixing findings. One that
- * was running before is other work. An agent with no id can't be told apart, so it counts.
+ * Whether one of these agents holds the running review open: one working now that is not other work
+ * (`othersAtStart`). Whatever its type, an agent started during the review is part of it: a reviewer, a
+ * general-purpose agent doing the security review, a fork fixing findings. An agent with no id can't be
+ * told apart, so it counts.
  */
-export function reviewHeldOpen(out: readonly Listed[], othersAtStart: readonly string[]): boolean {
-  return out.some(a => a.id === '' || !othersAtStart.includes(a.id))
+export function reviewHeldOpen(listed: readonly Listed[], othersAtStart: readonly string[]): boolean {
+  return listed.some(a => a.out && (a.id === '' || !othersAtStart.includes(a.id)))
+}
+
+/**
+ * The agents that are still other work at a check: all but those listed as finished. One that has
+ * finished leaves, so if it is started again it counts as part of the review (the `agent.spawn` hook sees
+ * a restart at once and judges it by who started it; this catches one it could not see). An agent the list
+ * does not show stays: a workflow's agents are never listed, and a missing entry proves nothing.
+ */
+export function stillOthers(othersAtStart: readonly string[], listed: readonly Listed[]): string[] {
+  return othersAtStart.filter(id => !listed.some(a => a.id === id && a.finished))
+}
+
+/**
+ * Who is other work after one agent starts or wakes another during a review. `by` is the agent that did
+ * it (undefined for the main loop), `id` the one started or woken. Work that other work hands on stays
+ * other work; work the main loop or the review's own agents hand to an earlier agent makes it the review's.
+ */
+export function afterHandOn(othersAtStart: readonly string[], by: string | undefined, id: string): string[] {
+  if (by !== undefined && othersAtStart.includes(by)) return othersAtStart.includes(id) ? [...othersAtStart] : [...othersAtStart, id]
+  return othersAtStart.filter(other => other !== id)
+}
+
+/**
+ * The id of the agent a message goes to, from what `$.agent.list()` resolved: `to` as SendMessage spells
+ * it (an id, the agent's name, a teammate's `name@team` or bare name, with or without a listing's " [ref]").
+ * When two agents carry the name, the one listed last, the newest, is the one a name reaches. Undefined
+ * for a recipient that is not an agent of this session (the main conversation, another session).
+ */
+export function recipient(to: unknown, list: unknown): string | undefined {
+  if (typeof to !== 'string' || to.trim() === '') return undefined
+  const name = to.trim().replace(/\s+\[[^\]]*\]$/, '')
+  const agents = Array.isArray(list)
+    ? list.filter((a): a is { id: string; name?: unknown; teammateId?: unknown } => typeof a === 'object' && a !== null && typeof a.id === 'string')
+    : []
+  if (agents.some(a => a.id === name)) return name
+  const named = agents.filter(a => a.name === name || a.teammateId === name || (typeof a.teammateId === 'string' && a.teammateId.startsWith(`${name}@`)))
+  return named.at(-1)?.id
+}
+
+// Agent starts (new or again) that may be a review's, so an end-of-turn check can tell whether one began
+// or was under way while it read the agent list: `startsUnderWay` holds those not yet settled, and
+// `agentStarts` counts those that went through (it only ever goes up, so a check that compares two
+// readings never misses one). Not counted: a start by other work (settled as other work when it goes
+// through), a workflow's agent (never listed, so it could never let a review end), and a refused start.
+// Starts the engine raises no event for are not seen at all. Kept in memory only: a reload starts again from 0, and a check
+// compares two readings from the same load.
+let agentStarts = 0
+let startsUnderWay = 0
+// How many reviews this load has started, so a start that began before the running review is told apart.
+let reviewsStarted = 0
+
+/**
+ * Records, during a review, that `by` (undefined: the main loop) started, started again or messaged `id`.
+ * `beforeReview`: the start began before this review did, so it can only be other work.
+ */
+async function handOn($: EngineInterface, by: string | undefined, id: string, beforeReview = false): Promise<void> {
+  await ensureLoaded($)
+  if (!cycle.reviewing) return
+  const others = (list: readonly string[]) =>
+    beforeReview ? (list.includes(id) ? [...list] : [...list, id]) : afterHandOn(list, by, id)
+  // Both only ever add one id or take ids away, so an unchanged length means nothing changed.
+  if (others(cycle.othersAtStart).length === cycle.othersAtStart.length) return
+  await updateCycle($, c => {
+    if (c.reviewing) c.othersAtStart = others(c.othersAtStart)
+  })
 }
 
 /** The home folder (`homeFrom`: USERPROFILE, else HOME), or undefined. Never throws. */
@@ -466,15 +535,17 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
   // The scanners installed here, for the review's commands, and why any that is there would not run
   // or could not be looked for: the prompt names those, never as "not installed".
   const { found, problems } = await findScanners(hostOf($))
-  // The session's agents still out: while a review runs, to see whether it is over; before one starts,
-  // to know which agents are other work. (Background shell commands and a workflow's agents are not in
-  // this list, so they never hold a review open.)
+  // The session's agents: while a review runs, to see whether it is over; before one starts, to know
+  // which agents are other work. (Background shell commands and a workflow's agents are not in this list,
+  // so they never hold a review open; nor are a workflow's agent starts counted below.)
   let listFailed: string | undefined
-  let out: Listed[] = []
+  let listed: Listed[] = []
   const reviewing = cycle.reviewing
+  // An agent started while the list is read may be missing from it: counted, so the check can tell.
+  const startsBefore = agentStarts
   if (reviewing || (!hookActive && !cycle.held && Object.keys(cycle.changed).length > 0)) {
     try {
-      out = agentsOut(await $.agent.list())
+      listed = agentsListed(await $.agent.list())
     } catch (err) {
       listFailed = whyOf(err)
     }
@@ -485,11 +556,20 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
     say($, `review-guard: could not list the session's agents (${listFailed}), so the review counts as over; fixes from reports still to come get a review of their own`)
   }
   if (signal.aborted) return undefined
+  let keptOpenByStart = false
   const ask = await updateCycle($, (c): StopAsk => {
     if (c.reviewing) {
       // The review is over at the first stop with none of its agents still out. Until then the reviewers'
       // reports come back as turns of this review. Its own fixes are not sent for another review.
-      if (listFailed !== undefined || !reviewHeldOpen(out, c.othersAtStart)) endReview(c, 'drop')
+      // An agent started while or since the list was read may be one of the review's, still working: the
+      // review stays open until a check where none started meanwhile.
+      const startedMeanwhile = agentStarts !== startsBefore || startsUnderWay > 0
+      const heldOpen = reviewHeldOpen(listed, c.othersAtStart)
+      if (listFailed !== undefined || (!startedMeanwhile && !heldOpen)) endReview(c, 'drop')
+      else {
+        c.othersAtStart = stillOthers(c.othersAtStart, listed)
+        if (!heldOpen) keptOpenByStart = true
+      }
       return undefined
     }
     // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
@@ -501,17 +581,51 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
     c.underReview = c.changed
     c.changed = {}
     c.reviewing = true
-    c.othersAtStart = out.map(a => a.id).filter(id => id !== '')
+    reviewsStarted++
+    // Other work: every agent not finished, an idle teammate waiting for its next message included.
+    c.othersAtStart = listed.filter(a => !a.finished && a.id !== '').map(a => a.id)
     return { kind: 'review', prompt }
   })
-  if (ask?.kind === 'review' && signal.aborted) {
-    // The dispatch ended while the queue was being moved: put the files back, as no review was asked for.
+  if (keptOpenByStart) {
+    // Not on the status line, which may hold a guard notice: a trace in the log is enough for this.
+    try {
+      $.ui.log('review-guard: the review stays open: an agent start was under way or went through while the agent list was read')
+    } catch { /* the log is best effort */ }
+  }
+  // The dispatch ended while the queue was being moved: put the files back, as no review was asked for.
+  const putBack = async () => {
     await updateCycle($, c => endReview(c, 'requeue'))
     return undefined
   }
+  if (ask?.kind === 'review' && signal.aborted) return putBack()
   if (ask?.kind === 'review' && listFailed !== undefined) {
     // The review started without knowing what other work is going on: every agent at work counts as its own.
     say($, `review-guard: could not list the session's agents (${listFailed}); any agent already at work counts as part of this review`)
+  }
+  if (ask?.kind === 'review' && listFailed === undefined) {
+    // An agent that appeared after the list was read, before the review prompt reaches Claude, can't be one
+    // of the review's: none exists yet, as the prompt goes out only when this hook returns. Read the list
+    // once more and count any newcomer as other work.
+    let again: Listed[] | undefined
+    try {
+      again = agentsListed(await $.agent.list())
+    } catch (err) {
+      hookFailed($, "could not list the session's agents a second time as the review started", err,
+        'an agent started just then counts as part of the review: it holds it open while it works, and its changes are not reviewed, so ask for a review by hand if one started')
+    }
+    if (again !== undefined) {
+      const newcomers = again
+      try {
+        await updateCycle($, c => {
+          if (!c.reviewing) return
+          for (const a of newcomers) if (!a.finished && a.id !== '' && !c.othersAtStart.includes(a.id)) c.othersAtStart.push(a.id)
+        })
+      } catch (err) {
+        hookFailed($, 'could not record the agents that started as the review began', err,
+          'they count as part of the review, so ask for a review by hand if one of them changed code')
+      }
+    }
+    if (signal.aborted) return putBack()
   }
   return ask
 }
@@ -610,6 +724,74 @@ export const register: Register = on => {
     if (!next.called) {
       hookFailed($, 'could not record that this turn ended early', next.error,
         "if a review was running, its files may not come back to the queue, so ask for a review by hand")
+    }
+    return next(e)
+  })
+
+  // During a review, who is other work follows the engine's own events: an agent started or started again
+  // (`agent.spawn`, with the loop that did it), and a message one loop sends to an agent of this session
+  // (`session.send`, with the sender). A refused start or an undelivered message changes nothing.
+  on('agent.spawn', async ($, e, next) => {
+    // Counted before the start, as the agent may show in the list while it happens, and under way until it
+    // settles, so a check that reads the list in between keeps the review open.
+    const reviewsBefore = reviewsStarted
+    await ensureLoaded($) // after a reload, to know who is other work
+    const counted = e.workflow === undefined && !(e.parentAgentId !== undefined && cycle.othersAtStart.includes(e.parentAgentId))
+    if (counted) startsUnderWay++
+    let result: Awaited<ReturnType<typeof next>>
+    try {
+      result = await next(e)
+    } finally {
+      if (counted) startsUnderWay--
+    }
+    if (result.deny === undefined && counted) agentStarts++
+    try {
+      // For a resume, `next` settles with the id the run continues under.
+      const id = result.deny === undefined ? (result.agentId ?? e.resume?.agentId) : undefined
+      if (id) await handOn($, e.parentAgentId, id, reviewsStarted !== reviewsBefore)
+    } catch (err) {
+      hookFailed($, 'could not record an agent started during the review', err,
+        'its work may be counted on the wrong side of the review')
+    }
+    return result
+  }).catch(($, e, next) => {
+    // Only this hook running out of time is said: a start that failed beneath is not this mod's to report.
+    if (next.called && next.error.kind === 'timeout') {
+      hookFailed($, 'ran out of time recording an agent start', next.error, 'if a review is running, that agent may be counted on the wrong side of it')
+    }
+    return next(e)
+  })
+
+  on('session.send', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      if ((result as { isDelivered?: unknown }).isDelivered === true) {
+        await ensureLoaded($)
+        if (cycle.reviewing) {
+          // Settled here, at the send, with the recipient looked up by the names a message may use.
+          let list: unknown
+          try {
+            list = await $.agent.list()
+            if (!Array.isArray(list)) throw new Error('the agent list was not a list')
+          } catch (err) {
+            hookFailed($, "could not list the session's agents to record a message during the review", err,
+              'its work may be counted on the wrong side of the review')
+            list = undefined
+          }
+          // Without a list, only a recipient given by its id can be recorded: use what `to` says as it is.
+          const id = recipient(e.to, Array.isArray(list) ? list : typeof e.to === 'string' ? [{ id: e.to.trim() }] : [])
+          if (id !== undefined) await handOn($, e.agentId, id)
+        }
+      }
+    } catch (err) {
+      hookFailed($, 'could not record a message to an agent during the review', err,
+        'its work may be counted on the wrong side of the review')
+    }
+    return result
+  }).catch(($, e, next) => {
+    // Only this hook running out of time is said: a message that failed beneath is not this mod's to report.
+    if (next.called && next.error.kind === 'timeout') {
+      hookFailed($, 'ran out of time recording a message to an agent', next.error, 'if a review is running, that agent may be counted on the wrong side of it')
     }
     return next(e)
   })

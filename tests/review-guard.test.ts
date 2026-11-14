@@ -5,7 +5,7 @@ import {
 } from '../hooks/scan.ts'
 import { findScanners } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
-import { agentsOut, cycleFrom, reviewFailed, reviewHeldOpen, say, whyOf } from '../hooks/register.ts'
+import { afterHandOn, agentsListed, cycleFrom, recipient, reviewFailed, reviewHeldOpen, say, stillOthers, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -670,17 +670,17 @@ test('agents already at work when a review starts do not hold it open; any agent
   expect((await stop())?.includes('app.py')).toBe(true)
   // The review starts agents of any type: a reviewer, a general-purpose one doing the security review, a fork.
   for (const [id, type, status] of [['r1', 'pr-review-toolkit:code-reviewer', 'running'], ['s1', 'general-purpose', 'pending'], ['f1', 'fork', 'waiting']] as const) {
-    out.agents = [{ id: 'bg1', status: 'running', type: 'general-purpose' }, { id, status, type }]
+    out.agents = [{ id: 'bg1', status: 'running', type: 'general-purpose' }, { id: 'bg2', status: 'waiting' }, { id, status, type }]
     expect(await stop(true)).toBe(undefined)
     await edit('C:/proj/app.py') // a fix while it is out: not sent back
     expect(await stop()).toBe(undefined)
   }
   // An agent with no id can't be told apart from the review's own, so it holds the review open too.
-  out.agents = [{ id: '', status: 'running', type: 'general-purpose' }]
+  out.agents = [{ id: 'bg1', status: 'running' }, { id: 'bg2', status: 'waiting' }, { id: '', status: 'running', type: 'general-purpose' }]
   await edit('C:/proj/app.py')
   expect(await stop()).toBe(undefined)
   // So does a status the engine may add later: only idle, completed, failed and killed have handed back.
-  out.agents = [{ id: 'n1', status: 'queued' as Status }]
+  out.agents = [{ id: 'bg1', status: 'running' }, { id: 'bg2', status: 'waiting' }, { id: 'n1', status: 'queued' as Status }]
   expect(await stop()).toBe(undefined)
   // Only the work that was already going on is left, plus agents that handed back: the review is over.
   out.agents = [{ id: 'bg1', status: 'running' }, { id: 'bg2', status: 'running' }, { id: 'r1', status: 'completed' }, { id: 'f1', status: 'failed' }, { id: 's1', status: 'killed' }]
@@ -695,14 +695,312 @@ test('agents already at work when a review starts do not hold it open; any agent
   expect((await stop())?.includes('last.py')).toBe(true)
 })
 
-test('which agents are still out, and which hold a review open', () => {
-  expect(() => agentsOut(null)).toThrow('the agent list was not a list')
-  expect(agentsOut([null, 5, { id: 'a', status: 'running' }, { id: 'b', status: 'idle' }, { status: 'waiting' }, { id: 7 }]))
-    .toEqual([{ id: 'a', out: true }, { id: '', out: true }, { id: '', out: true }])
+test('an agent from before a review that the review starts again or messages becomes part of it', async ($, on) => {
+  const { out, edit, stop } = cycle($, on)
+  on('agent.spawn', (_$, e) => ({ agentId: e.resume?.agentId ?? 'new1', model: 'm' }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('session.receive', (_$, e) => ({ text: e.text }))
+  const spawn = (input: object) => $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', ...input } as never)
+  // Other work before the review: bg (finishes later), tm (an idle teammate) and peer (keeps working).
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'idle', name: 'helper' } as never, { id: 'peer', status: 'running' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The main loop starts bg again, and messages the idle teammate by its name: both are the review's now.
+  await spawn({ resume: { agentId: 'bg' } })
+  await $.session.send({ to: 'helper', text: 'fix the findings', origin: { kind: 'tool' } } as never)
+  await $.session.receive({ origin: { kind: 'peer' }, text: 'fix the findings', agentId: 'tm' } as never)
+  // peer, which is other work, starts a helper and messages it: both stay other work.
+  await spawn({ parentAgentId: 'peer' })
+  await $.session.send({ to: 'new1', text: 'help', origin: { kind: 'tool' }, agentId: 'peer' } as never)
+  await $.session.receive({ origin: { kind: 'peer' }, text: 'help', agentId: 'new1' } as never)
+  // A message from outside the session, with no send before it, changes nothing.
+  await $.session.receive({ origin: { kind: 'peer' }, text: 'hi', agentId: 'peer' } as never)
+  for (const [who, file] of [['bg', 'bg.py'], ['tm', 'tm.py'], ['peer', 'peer.py'], ['new1', 'helper.py']]) {
+    await $.tool.call({ tool: 'Edit', file_path: `C:/proj/${file}`, old_string: 'a', new_string: 'b', agentId: who } as never)
+  }
+  // bg and tm are out: the review stays open while peer and its helper are not counted.
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }, { id: 'peer', status: 'running' }, { id: 'new1', status: 'running' }]
+  expect(await stop(true)).toBe(undefined)
+  await edit('C:/proj/later.py')
+  expect(await stop()).toBe(undefined) // still open: later.py is a fix, not new work
+  // bg and tm hand back: the review is over. Their edits were fixes; peer's and its helper's get a review.
+  out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'idle' }, { id: 'peer', status: 'running' }, { id: 'new1', status: 'running' }]
+  expect(await stop()).toBe(undefined)
+  const next = await stop()
+  for (const f of ['peer.py', 'helper.py']) expect(next?.includes(f)).toBe(true)
+  for (const f of ['bg.py', 'tm.py', 'later.py', 'app.py']) expect(next?.includes(f)).toBe(false)
+})
+
+test('an agent from before a review that finished and is started again unseen becomes part of it', async ($, on) => {
+  const { out, edit, stop } = cycle($, on)
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'idle' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // At one check bg has finished (and a reviewer is out); the idle teammate tm stays other work.
+  out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'idle' }, { id: 'r1', status: 'running' }]
+  expect(await stop(true)).toBe(undefined)
+  // bg runs again with no event this mod saw: it holds the review open now. tm wakes and does not.
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }]
+  await edit('C:/proj/app.py')
+  expect(await stop()).toBe(undefined)
+  out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'running' }]
+  expect(await stop()).toBe(undefined) // only tm, other work, is out: over
+  await edit('C:/proj/next.py')
+  const next = await stop()
+  expect(next?.includes('next.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+})
+
+test('a refused message, work handed on outside a review, and a reload are handled', async ($, on) => {
+  // A stored review from before a reload, with bg as other work: the first event after it still counts.
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: ['bg', 'tm'], othersChanged: {} })
+  const { out, edit, stop } = cycle($, on)
+  let deliver = false
+  on('agent.spawn', (_$, e) => (e.prompt === 'refuse' ? { deny: 'not now' } : { agentId: e.resume?.agentId ?? 'x', model: 'm' }) as never)
+  on('session.send', () => (deliver ? { isDelivered: true } : { isDelivered: false, reason: 'no such agent' }) as never)
+  on('session.receive', (_$, e) => ({ text: e.text }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', resume: { agentId: 'bg' } } as never)
+  // A refused start of tm, and a refused message to it, leave tm other work; so does a delivery from outside.
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'refuse', description: 'd', resume: { agentId: 'tm' } } as never).catch(() => undefined)
+  await $.session.send({ to: 'tm', text: 'x', origin: { kind: 'tool' } } as never).catch(() => undefined)
+  await $.session.receive({ origin: { kind: 'peer' }, text: 'from elsewhere', agentId: 'tm' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/bg.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/tm.py', old_string: 'a', new_string: 'b', agentId: 'tm' } as never)
+  // bg (the review's now) is out: the review stays open; tm (still other work) does not hold it.
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }]
+  expect(await stop(true)).toBe(undefined)
+  out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'running' }]
+  expect(await stop()).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('tm.py')).toBe(true)
+  expect(next?.includes('bg.py')).toBe(false)
+  // Outside a review, starting or messaging an agent changes nothing: the next edit is queued as usual.
+  expect(await stop(true)).toBe(undefined)
+  out.agents = []
+  expect(await stop()).toBe(undefined) // that review is over too
+  deliver = true
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', resume: { agentId: 'tm' } } as never)
+  await $.session.send({ to: 'tm', text: 'x', origin: { kind: 'tool' } } as never)
+  await $.session.receive({ origin: { kind: 'peer' }, text: 'x', agentId: 'tm' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/after.py', old_string: 'a', new_string: 'b', agentId: 'tm' } as never)
+  expect((await stop())?.includes('after.py')).toBe(true)
+})
+
+test('an agent that appears while a review starts is other work', async ($, on) => {
+  let lists = 0
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  // The first read, as the review starts, misses "late"; it is there by the second read.
+  let afterStart: { id: string; status: Status }[] = []
+  on('agent.list', () => {
+    lists++
+    const now = lists === 1 ? [] : lists === 2 ? [{ id: 'late', status: 'running' as Status }] : afterStart
+    return { value: now.map(a => ({ description: 'other work', type: 'general-purpose', ...a })) }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // Only "late" is working: it is other work, so the review is over and its edit gets a review of its own.
+  afterStart = [{ id: 'late', status: 'running' }]
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/late.py', old_string: 'a', new_string: 'b', agentId: 'late' } as never)
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('late.py')).toBe(true)
+})
+
+test('an agent started while the list is read keeps the review open until the next check', async ($, on) => {
+  const out = { agents: [] as { id: string; status: Status }[] }
+  let startDuringList = false
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.spawn', () => ({ agentId: 'sub1', model: 'm' }))
+  const edit = (file: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  on('agent.list', async () => {
+    // A reviewer starts a helper while the list is being read: the list does not show it yet.
+    if (startDuringList) {
+      startDuringList = false
+      await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'r1' } as never)
+    }
+    return { value: out.agents.map(a => ({ description: 'x', type: 'x', ...a })) }
+  })
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The reviewer has handed back and nothing else shows, but a start happened during the read: still open.
+  out.agents = [{ id: 'r1', status: 'completed' }]
+  startDuringList = true
+  expect(await stop(true)).toBe(undefined)
+  await edit('C:/proj/app.py') // a fix while the helper works: not sent back
+  // Next check, the helper is listed and done, and nothing started meanwhile: the review is over.
+  out.agents = [{ id: 'r1', status: 'completed' }, { id: 'sub1', status: 'completed' }]
+  expect(await stop()).toBe(undefined)
+  await edit('C:/proj/next.py')
+  const next = await stop()
+  expect(next?.includes('next.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+})
+
+test('the second read as a review starts adds newcomers as other work, not finished ones', async ($, on) => {
+  let lists = 0
+  let later: { id: string; status: Status }[] = []
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => {
+    lists++
+    const now = lists === 1 ? [{ id: 'bg', status: 'running' as Status }]
+      : lists === 2 ? [{ id: 'bg', status: 'running' as Status }, { id: 'tm', status: 'idle' as Status }, { id: 'done', status: 'completed' as Status }]
+      : later
+    return { value: now.map(a => ({ description: 'x', type: 'x', ...a })) }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  const edit = (file: string, agentId?: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b', ...(agentId ? { agentId } : {}) } as never)
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // tm (idle at the second read) is other work. "done" had finished, so it is not: when it runs again
+  // unseen it holds the review open.
+  later = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }, { id: 'done', status: 'running' }]
+  await edit('C:/proj/tm.py', 'tm')
+  expect(await stop(true)).toBe(undefined)
+  later = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }, { id: 'done', status: 'completed' }]
+  expect(await stop()).toBe(undefined) // over: only other work is out
+  const next = await stop()
+  expect(next?.includes('tm.py')).toBe(true) // tm's edit was other work: a review of its own
+  expect(next?.includes('app.py')).toBe(false)
+})
+
+test('a second read that fails as a review starts is said, and the first read still stands', async ($, on) => {
+  const status: string[] = []
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  let lists = 0
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => {
+    lists++
+    return lists === 2 ? { deny: 'no list' } : { value: [{ id: 'bg', description: 'x', type: 'x', status: 'running' as Status }] }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true) // the review still starts
+  expect(status.some(s => s.includes("could not list the session's agents a second time as the review started (") && s.includes('ask for a review by hand'))).toBe(true)
+  // bg, other work by the first read, does not hold it open: the review is over at the next check.
+  expect(await stop(true)).toBe(undefined)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/next.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('next.py')).toBe(true)
+})
+
+test('only a start that may be the review\'s keeps it open: not one by other work, a refused one or a workflow\'s', async ($, on) => {
+  const out = { agents: [] as { id: string; status: Status }[] }
+  let during: object | undefined
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.spawn', (_$, e) => (e.prompt === 'refuse' ? { deny: 'not now' } : { agentId: 'h1', model: 'm' }) as never)
+  on('agent.list', async () => {
+    if (during) {
+      const input = during
+      during = undefined
+      await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', ...input } as never).catch(() => undefined)
+    }
+    return { value: out.agents.map(a => ({ description: 'x', type: 'x', ...a })) }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  const edit = (file: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' })
+  for (const input of [{ parentAgentId: 'bg' }, { prompt: 'refuse' }, { workflow: { runId: 'w', agentIndex: 0 } }]) {
+    out.agents = [{ id: 'bg', status: 'running' }]
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    // Each of these starts during the read, and the review still ends at that check.
+    during = input
+    out.agents = [{ id: 'bg', status: 'running' }]
+    expect(await stop(true)).toBe(undefined)
+    await edit('C:/proj/next.py')
+    expect([input, (await stop())?.includes('next.py')]).toEqual([input, true])
+    expect(await stop(true)).toBe(undefined) // close that review too before the next round
+    out.agents = []
+    expect(await stop()).toBe(undefined)
+  }
+})
+
+test('a refused start does not hide a real one in the same check', async ($, on) => {
+  let startDuringList = false
+  let listed: { id: string; status: Status }[] = []
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.spawn', (_$, e) => (e.prompt === 'refuse' ? { deny: 'not now' } : { agentId: 'h1', model: 'm' }) as never)
+  on('agent.list', async () => {
+    if (startDuringList) {
+      startDuringList = false
+      await $.agent.spawn({ tool_use_id: 't', prompt: 'refuse', description: 'd' } as never).catch(() => undefined)
+      await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'r1' } as never)
+    }
+    return { value: listed.map(a => ({ description: 'x', type: 'x', ...a })) }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  startDuringList = true
+  expect(await stop(true)).toBe(undefined) // the helper went through while the list was read: still open
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  listed = [{ id: 'h1', status: 'completed' }]
+  expect(await stop()).toBe(undefined) // over now, and the fix made meanwhile is not sent back
+  expect(await stop()).toBe(undefined)
+})
+
+test('a start still under way when the list is read keeps the review open', async ($, on) => {
+  const out = { agents: [] as { id: string; status: Status }[] }
+  let release: () => void = () => {}
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  // The start is entered before the check, and settles only after the list was read.
+  on('agent.spawn', () => new Promise(done => { release = () => done({ agentId: 'h1', model: 'm' }) }) as never)
+  on('agent.list', () => ({ value: out.agents.map(a => ({ description: 'x', type: 'x', ...a })) }))
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  const starting = $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'r1' } as never)
+  for (let i = 0; i < 5; i++) await Promise.resolve() // let the start reach its hook beneath
+  expect(await stop(true)).toBe(undefined) // nothing listed, but a start is under way: still open
+  release()
+  await starting
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  out.agents = [{ id: 'h1', status: 'completed' }]
+  expect(await stop()).toBe(undefined) // now over, and the fix is not sent back
+  expect(await stop()).toBe(undefined)
+})
+
+test('who is other work after an agent is started or messaged', () => {
+  expect(afterHandOn(['a', 'b'], undefined, 'a')).toEqual(['b']) // the main loop hands a work: the review's
+  expect(afterHandOn(['a', 'b'], 'r1', 'b')).toEqual(['a']) // so does one of the review's agents
+  expect(afterHandOn(['a', 'b'], 'a', 'c')).toEqual(['a', 'b', 'c']) // other work's helper is other work
+  expect(afterHandOn(['a', 'b'], 'a', 'b')).toEqual(['a', 'b']) // other work messaging other work
+  expect(afterHandOn([], undefined, 'x')).toEqual([])
+  const listed = agentsListed([{ id: 'a', status: 'idle' }, { id: 'b', status: 'completed' }, { id: 'c', status: 'running' }, { id: 'd', status: 'killed' }])
+  // Only finished agents leave; one the list does not show (a workflow's agent) stays other work.
+  expect(stillOthers(['a', 'b', 'c', 'd', 'gone'], listed)).toEqual(['a', 'c', 'gone'])
+  // A message's recipient by id, by name, by teammate address or bare name, with a listing's [ref].
+  const agents = [{ id: 'a1', name: 'scout' }, { id: 'a2', teammateId: 'fixer@team' }, { id: 'a3', name: 'scout' }, null, { id: 4, name: 'x' }]
+  expect(recipient('a1', agents)).toBe('a1')
+  expect(recipient('scout', agents)).toBe('a3') // two carry the name: the newest is the one reached
+  expect(recipient('fixer', agents)).toBe('a2')
+  expect(recipient('fixer@team', agents)).toBe('a2')
+  expect(recipient('fixer [ref1]', agents)).toBe('a2')
+  for (const to of ['main', 'x', '', 5, undefined]) expect([to, recipient(to, agents)]).toEqual([to, undefined])
+  expect(recipient('scout', 'not a list')).toBe(undefined)
+})
+
+test('which agents are working, finished, and holding a review open', () => {
+  expect(() => agentsListed(null)).toThrow('the agent list was not a list')
+  expect(agentsListed([null, 5, { id: 'a', status: 'running' }, { id: 'b', status: 'idle' }, { id: 'c', status: 'failed' }, { status: 'waiting' }, { id: 7 }])).toEqual([
+    { id: 'a', out: true, finished: false }, { id: 'b', out: false, finished: false }, { id: 'c', out: false, finished: true },
+    { id: '', out: true, finished: false }, { id: '', out: true, finished: false },
+  ])
+  const at = (id: string, out = true) => ({ id, out, finished: false })
   expect(reviewHeldOpen([], ['x'])).toBe(false)
-  expect(reviewHeldOpen([{ id: 'x', out: true }], ['x'])).toBe(false)
-  expect(reviewHeldOpen([{ id: 'y', out: true }], ['x'])).toBe(true)
-  expect(reviewHeldOpen([{ id: '', out: true }], [''])).toBe(true)
+  expect(reviewHeldOpen([at('x')], ['x'])).toBe(false)
+  expect(reviewHeldOpen([at('y')], ['x'])).toBe(true)
+  expect(reviewHeldOpen([at('y', false)], ['x'])).toBe(false) // idle: not working now
+  expect(reviewHeldOpen([at('')], [''])).toBe(true)
 })
 
 test('a reload of the mod in the middle of a review does not send its fixes for another review', async ($, on) => {
@@ -762,15 +1060,15 @@ test('agents that cannot be listed end the review out loud', async ($, on) => {
   let broken: 'deny' | 'not a list' = 'deny'
   on('agent.list', () => {
     lists++
-    // Nothing is at work as the review starts; then its reviewer is out.
-    if (listWorks) return { value: lists === 1 ? [] : [{ id: 'a0', description: 'reviewer', type: 'review-guard:code-reviewer', status: 'running' as Status }] }
+    // Nothing is at work as the review starts (both reads); then its reviewer is out.
+    if (listWorks) return { value: lists <= 2 ? [] : [{ id: 'a0', description: 'reviewer', type: 'review-guard:code-reviewer', status: 'running' as Status }] }
     return broken === 'deny' ? { deny: 'no list' } : { value: null as never }
   })
   const edit = (file: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' })
   const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
   await edit('C:/proj/app.py')
   expect((await stop())?.includes('app.py')).toBe(true)
-  expect(lists).toBe(1) // listed once as the review starts, to know what other work is going on
+  expect(lists).toBe(2) // read twice as the review starts, to know what other work is going on
   expect(await stop(true)).toBe(undefined) // a reviewer is still out: the review stays open
   expect(status.some(s => s.includes("could not list the session's agents"))).toBe(false)
   listWorks = false

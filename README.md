@@ -142,10 +142,13 @@ new session.
   since some Node builds can't run TypeScript. After changing `hooks/scan.ts`, `scanners.ts`, `outgoing.ts`
   or `status.ts`, rebuild it with `node scripts/build-mcp.mjs` (Node 22.13 or newer);
   the server's tools refuse a copy that doesn't match.
-- A review stays open while any agent started after it began is still out, so fixes from its reports are
-  not reviewed again. Agents already at work when it began are other work: they don't hold it open, and
-  files they change meanwhile get a review of their own. (If the agents can't be listed as it begins,
-  every agent counts as part of it, and the status line says so.)
+- A review stays open while one of its own agents is still working, so fixes from its reports are not
+  reviewed again. Agents already there when it began (idle teammates included) are other work: they don't
+  hold it open, and files they change meanwhile get a review of their own. An earlier agent that the main
+  conversation or one of the review's agents starts again or messages, or one that finishes and later runs
+  again, is part of the review from then on; agents that earlier work starts or messages stay other work.
+  (If the agents can't be listed as a review begins, every agent counts as part of it, and the status line
+  says so.)
 - Each session writes its review state to `~/.claude/review-guard/status/` for `review_status`. Old files
   are not removed (the tool shows the last 24 hours).
 - The review agents are in `agents/`, with the same prompts in `hooks/agents.ts` for sessions that were
