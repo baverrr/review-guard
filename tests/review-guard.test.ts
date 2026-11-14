@@ -1433,7 +1433,9 @@ test('the status file goes under USERPROFILE on Windows and HOME on Linux or WSL
   on('env.get', (_$, e) => ({ value: env[e.name] }))
   on('fs.write', (_$, e) => {
     // The engine puts its own drive or folder before a path it reads as relative here: drop that part.
-    written.push(e.path.replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/Users\/|\/home\/)/, ''))
+    // (Its own folder may start with /home/ too, so the match is on the status folder itself.)
+    const path = e.path.replace(/\\/g, '/')
+    written.push(/[A-Za-z]:\/Users\/pat\/\.claude\/.*|\/home\/pat\/\.claude\/.*/.exec(path)?.[0] ?? path)
     return { value: undefined }
   })
   const { edit } = cycle($, on)
