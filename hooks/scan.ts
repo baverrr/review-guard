@@ -226,7 +226,7 @@ const USER_REQUEST = new Set(['composer', 'bridge', 'sdk', 'scheduled-trigger', 
 
 /**
  * Whether a prompt is a new request from the user. One that arrives during a review ends it early,
- * so what follows gets a review of its own. A review also ends by itself once no agent is still out,
+ * so what follows gets a review of its own. A review also ends by itself once none of its agents is still out,
  * so a report of a kind this list does not know cannot hold a review open.
  */
 export function isNewRequest(originKind: string, isMeta: boolean, asUser = false): boolean {
@@ -1024,7 +1024,8 @@ export function shellWrites(fullCommand: string): string[] {
     const mentions = new Map<string, number>()
     for (const raw of (trusted?.outside ?? command).match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
       if (notAName(raw)) continue
-      const whole = raw.replace(/["']/g, '')
+      // Each quoted part loses only its own quotes, as bash reads it: "pat's/app.py" is pat's/app.py.
+      const whole = raw.replace(/"([^"]*)"|'([^']*)'/g, (_m, dq?: string, sq?: string) => dq ?? sq ?? '')
       // A quoted string with a line break, or a shell operator with a space on either side, or a `#` followed
       // by a space, may be a piece of shell (a test case in a script): the names inside it count one by one.
       // A piece that is not a Windows path is split at `\n` and `\r` escapes too (`C:\tools\new.py` and
@@ -1033,11 +1034,20 @@ export function shellWrites(fullCommand: string): string[] {
       // no file name holds those. Anything else stays whole, as before (`scripts\release.py`).
       // A Windows path: one from a drive or `.\`, or a relative one with no spaces (`src\new.py`, not `true\r# ;`).
       const windowsPath = (s: string) => /^(?:[A-Za-z]:|\.{1,2})?\\/.test(s) || (!/\s/.test(s) && /^[\w.-]+\\[\w.-]/.test(s))
-      const shellLike = /[\r\n]|\s[;|&<>]|[;|&<>]\s|#\s/.test(whole)
+      // A quoted part holding a space and a pair of the other kind of quote is a piece of code (a line a
+      // script writes, `"s = open('../a.ts').read()"`), not one name: the names in it count one by one. A
+      // single apostrophe is a name's own (`"C:\Users\pat\Pat's Files\app.py"`), so that stays whole.
+      const quotedCode = [...raw.matchAll(/"([^"]*)"|'([^']*)'/g)].some(m => {
+        const inner = m[1] ?? m[2] ?? ''
+        return /\s/.test(inner) && inner.split(m[1] !== undefined ? "'" : '"').length >= 3
+      })
+      const shellLike = quotedCode || /[\r\n]|\s[;|&<>]|[;|&<>]\s|#\s/.test(whole)
       const words = shellLike
-        ? whole.split(/[\s;|&<>()#,=[\]{}`]+/).flatMap(piece => (windowsPath(piece) ? [piece] : piece.split(/\\[nr]/)))
+        ? whole.split(/[\s;|&<>()#,=[\]{}`'"]+/).flatMap(piece => (windowsPath(piece) ? [piece] : piece.split(/\\[nr]/)))
         : []
-      if (!/[\r\n]/.test(whole) && (!shellLike || windowsPath(whole) || !/\\[nr]/.test(whole))) words.push(whole)
+      // The whole name, less any quotes left around it (`"'app.py'"` names app.py).
+      const bare = whole.replace(/^['"]+|['"]+$/g, '')
+      if (!quotedCode && !/[\r\n]/.test(bare) && (!shellLike || windowsPath(bare) || !/\\[nr]/.test(bare))) words.push(bare)
       for (const word of words) {
         if (word.length > 2 && !word.startsWith('-') && languageOf(word)) mentions.set(word, (mentions.get(word) ?? 0) + 1)
       }

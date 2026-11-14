@@ -5,7 +5,7 @@ import {
 } from '../hooks/scan.ts'
 import { findScanners } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
-import { reviewFailed, say, whyOf } from '../hooks/register.ts'
+import { agentsOut, cycleFrom, reviewFailed, reviewHeldOpen, say, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -520,7 +520,7 @@ test('registers the five review agents when the mod loads, for sessions already 
 
 // --- the review cycle ----------------------------------------------------------------------
 
-type Status = 'pending' | 'running' | 'waiting' | 'idle' | 'completed'
+type Status = 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed'
 
 /**
  * Plays back what the mod's copy before a reload stored: the first read of the review state answers
@@ -535,9 +535,12 @@ function seed(on: On, value: unknown) {
   })
 }
 
-/** Stands for the engine under the review cycle; `agents` is what is still out, changed by the test. */
+/**
+ * Stands for the engine under the review cycle; `agents` is the session's agents, changed by the test.
+ * Each gets the id `a<index>` unless the test gives one.
+ */
 function cycle($: Engine, on: On) {
-  const out = { agents: [] as { status: Status }[] }
+  const out = { agents: [] as { status: Status; type?: string; id?: string }[] }
   on('tool.call', () => ({ result: {} }))
   on('classic.Stop', () => ({})) // no other Stop hook blocks
   on('prompt.submit', (_$, e) => ({ text: e.text })) // the prompt enters
@@ -576,6 +579,130 @@ test('fixes made during a review are not sent back, however the reports arrive',
   const next = await stop()
   expect(next?.includes('other.py')).toBe(true)
   expect(next?.includes('app.py')).toBe(false)
+})
+
+test('a list that fails as a review starts is said, and every agent then counts as part of the review', async ($, on) => {
+  const status: string[] = []
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  let list: 'fails' | 'bg out' | 'none out' = 'fails'
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => (list === 'fails' ? { deny: 'no list' }
+    : { value: list === 'bg out' ? [{ id: 'bg', description: 'other work', type: 'general-purpose', status: 'running' as Status }] : [] }))
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await $.classic.Stop({ stop_hook_active: false })).block?.includes('app.py')).toBe(true)
+  expect(status.some(s => s.includes('any agent already at work counts as part of this review'))).toBe(true)
+  // The agent that was at work could not be seen as other work, so it holds the review open.
+  list = 'bg out'
+  expect((await $.classic.Stop({ stop_hook_active: true })).block).toBe(undefined)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await $.classic.Stop({ stop_hook_active: false })).block).toBe(undefined) // its fix is not sent back
+  // Once it hands back, the review is over and new work gets its own review.
+  list = 'none out'
+  expect((await $.classic.Stop({ stop_hook_active: false })).block).toBe(undefined)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/next.py', old_string: 'a', new_string: 'b' })
+  expect((await $.classic.Stop({ stop_hook_active: false })).block?.includes('next.py')).toBe(true)
+})
+
+test('a list that fails when no review can start says nothing about a review', async ($, on) => {
+  const status: string[] = []
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  let lists = 0
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => {
+    lists++
+    return { deny: 'no list' }
+  })
+  // Nothing queued, and a review turn ending: no list is asked for, and nothing is said.
+  expect((await $.classic.Stop({ stop_hook_active: false })).block).toBe(undefined)
+  expect((await $.classic.Stop({ stop_hook_active: true })).block).toBe(undefined)
+  expect(lists).toBe(0)
+  expect(status.some(s => s.includes('could not list'))).toBe(false)
+})
+
+test("what other work changes while a review runs is not taken for the review's fixes", async ($, on) => {
+  const { out, edit, stop } = cycle($, on)
+  out.agents = [{ id: 'bg', status: 'running', type: 'general-purpose' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'r1', status: 'running' }]
+  expect(await stop(true)).toBe(undefined)
+  // The agent that was already at work changes a file; the main loop fixes app.py.
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/other.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Bash', command: `sed -i x C:/proj/shell.py`, agentId: 'bg' } as never)
+  await edit('C:/proj/app.py')
+  // The review ends: its fix is not sent back, the other agent's files get a review of their own.
+  out.agents = [{ id: 'bg', status: 'running' }, { id: 'r1', status: 'completed' }]
+  expect(await stop()).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('other.py')).toBe(true)
+  expect(next?.includes('shell.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+})
+
+test('the agents at work when a review began, and what they changed, survive a reload', async ($, on) => {
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: ['bg', 5], othersChanged: { 'C:/proj/bg.py': 'Python' } })
+  const { out, edit, stop } = cycle($, on)
+  // Only the agent from before the review is out: the review is over, and its fix is not sent back.
+  out.agents = [{ id: 'bg', status: 'running' }]
+  await edit('C:/proj/app.py')
+  expect(await stop()).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('bg.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+  // A stored value is read with care: ids that are not text are dropped, and so are non-text languages.
+  expect(cycleFrom({ othersAtStart: ['a', 1, null], othersChanged: { 'x.py': 'Python', 'y.py': 3 } })).toEqual(
+    { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: ['a'], othersChanged: { 'x.py': 'Python' } })
+})
+
+test('agents already at work when a review starts do not hold it open; any agent started during it does', async ($, on) => {
+  const { out, edit, stop } = cycle($, on)
+  // Other work is going on before the review: a general-purpose agent and a reviewer-named one.
+  out.agents = [{ id: 'bg1', status: 'running', type: 'general-purpose' }, { id: 'bg2', status: 'waiting', type: 'acme:security-reviewer' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The review starts agents of any type: a reviewer, a general-purpose one doing the security review, a fork.
+  for (const [id, type, status] of [['r1', 'pr-review-toolkit:code-reviewer', 'running'], ['s1', 'general-purpose', 'pending'], ['f1', 'fork', 'waiting']] as const) {
+    out.agents = [{ id: 'bg1', status: 'running', type: 'general-purpose' }, { id, status, type }]
+    expect(await stop(true)).toBe(undefined)
+    await edit('C:/proj/app.py') // a fix while it is out: not sent back
+    expect(await stop()).toBe(undefined)
+  }
+  // An agent with no id can't be told apart from the review's own, so it holds the review open too.
+  out.agents = [{ id: '', status: 'running', type: 'general-purpose' }]
+  await edit('C:/proj/app.py')
+  expect(await stop()).toBe(undefined)
+  // So does a status the engine may add later: only idle, completed, failed and killed have handed back.
+  out.agents = [{ id: 'n1', status: 'queued' as Status }]
+  expect(await stop()).toBe(undefined)
+  // Only the work that was already going on is left, plus agents that handed back: the review is over.
+  out.agents = [{ id: 'bg1', status: 'running' }, { id: 'bg2', status: 'running' }, { id: 'r1', status: 'completed' }, { id: 'f1', status: 'failed' }, { id: 's1', status: 'killed' }]
+  expect(await stop()).toBe(undefined)
+  await edit('C:/proj/next.py')
+  const next = await stop()
+  expect(next?.includes('next.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+  // That next review started with bg1 and bg2 at work, so they still don't hold it open.
+  expect(await stop(true)).toBe(undefined)
+  await edit('C:/proj/last.py')
+  expect((await stop())?.includes('last.py')).toBe(true)
+})
+
+test('which agents are still out, and which hold a review open', () => {
+  expect(() => agentsOut(null)).toThrow('the agent list was not a list')
+  expect(agentsOut([null, 5, { id: 'a', status: 'running' }, { id: 'b', status: 'idle' }, { status: 'waiting' }, { id: 7 }]))
+    .toEqual([{ id: 'a', out: true }, { id: '', out: true }, { id: '', out: true }])
+  expect(reviewHeldOpen([], ['x'])).toBe(false)
+  expect(reviewHeldOpen([{ id: 'x', out: true }], ['x'])).toBe(false)
+  expect(reviewHeldOpen([{ id: 'y', out: true }], ['x'])).toBe(true)
+  expect(reviewHeldOpen([{ id: '', out: true }], [''])).toBe(true)
 })
 
 test('a reload of the mod in the middle of a review does not send its fixes for another review', async ($, on) => {
@@ -635,19 +762,20 @@ test('agents that cannot be listed end the review out loud', async ($, on) => {
   let broken: 'deny' | 'not a list' = 'deny'
   on('agent.list', () => {
     lists++
-    if (listWorks) return { value: [{ id: 'a0', description: 'reviewer', type: 'review-guard:code-reviewer', status: 'running' as Status }] }
+    // Nothing is at work as the review starts; then its reviewer is out.
+    if (listWorks) return { value: lists === 1 ? [] : [{ id: 'a0', description: 'reviewer', type: 'review-guard:code-reviewer', status: 'running' as Status }] }
     return broken === 'deny' ? { deny: 'no list' } : { value: null as never }
   })
   const edit = (file: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' })
   const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
   await edit('C:/proj/app.py')
   expect((await stop())?.includes('app.py')).toBe(true)
-  expect(lists).toBe(0) // nothing is listed while no review runs
+  expect(lists).toBe(1) // listed once as the review starts, to know what other work is going on
   expect(await stop(true)).toBe(undefined) // a reviewer is still out: the review stays open
-  expect(status.some(s => s.includes('could not list the review agents'))).toBe(false)
+  expect(status.some(s => s.includes("could not list the session's agents"))).toBe(false)
   listWorks = false
   expect(await stop(true)).toBe(undefined)
-  expect(status.some(s => s.includes('could not list the review agents') && s.includes('the review counts as over'))).toBe(true)
+  expect(status.some(s => s.includes("could not list the session's agents") && s.includes('the review counts as over'))).toBe(true)
   // The review is over, so the next change gets a review of its own, without the closed review's files.
   await edit('C:/proj/next.py')
   const next = await stop()
@@ -657,7 +785,7 @@ test('agents that cannot be listed end the review out loud', async ($, on) => {
   status.length = 0
   broken = 'not a list'
   expect(await stop(true)).toBe(undefined)
-  expect(status.some(s => s.includes('could not list the review agents (the agent list was not a list)'))).toBe(true)
+  expect(status.some(s => s.includes("could not list the session's agents (the agent list was not a list)"))).toBe(true)
   await edit('C:/proj/last.py')
   expect((await stop())?.includes('last.py')).toBe(true)
 })
@@ -1277,6 +1405,19 @@ test('knows which code files a shell command writes', async () => {
   for (const name of ['R & D/app.py', 'notes # 2.py', 'x ; y.py', 'a > b.py', 'C:\\R & D\\new.py']) {
     expect([name, shellWrites(`cp a.txt "${name}"`).includes(name)]).toEqual([name, true])
   }
+  // A quoted line of code holding the other quote (a script's text), not a name: the names in it count.
+  const codeLine = `sed -i x a.txt; python fix.py "import { a, b } from '../hooks/register.ts'" 'x = open("lib/util.py")'`
+  const named = shellWrites(codeLine)
+  expect(named.includes('../hooks/register.ts')).toBe(true)
+  expect(named.includes('lib/util.py')).toBe(true)
+  expect(named.some(n => n.includes('import') || n.includes('open('))).toBe(false)
+  // A real name with an apostrophe is still one name, with a space in it too, a Windows one as well.
+  for (const name of ["pat's/app.py", "pat's notes/app.py", "C:\\Users\\pat\\Pat's Files\\app.py"]) {
+    expect([name, shellWrites(`cp a.txt "${name}"`)]).toEqual([name, [name]])
+  }
+  // Quoted parts are read one by one, as bash reads them, and quotes left around a name are dropped.
+  expect(shellWrites(`cp a.txt "src"' my'"/x.py"`)).toEqual(['src my/x.py'])
+  expect(shellWrites(`cp a.txt "'app.py'"`)).toEqual(['app.py'])
   // Windows paths whose `\n` or `\r` is a folder's first letter, and `<>` writes, count as before.
   for (const [c, name] of <[string, string][]>[
     ['Copy-Item a.py src\\new.py', 'src\\new.py'], ['Copy-Item a.py .\\src\\new.py', '.\\src\\new.py'],

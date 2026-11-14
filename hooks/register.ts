@@ -48,14 +48,14 @@ import { type LeftOut, type StatusFile, statusDir, statusFileName } from './stat
 // to forget the review was running, so its own fixes were reviewed again. After a reload the first
 // hook reads the copy back. A failed copy loses nothing now; it only risks that after a reload.
 const CYCLE = { plugin: 'review-guard', key: 'cycle' } as const
-const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {} }
+const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: [], othersChanged: {} }
 
 let cycle: Cycle = copyOf(EMPTY)
 let loaded: Promise<void> | undefined // reading the copy back, once per load of the module
 let saving: Promise<void> = Promise.resolve() // the copies, written one after another
 
 function copyOf(c: Cycle): Cycle {
-  return { reviewing: c.reviewing, held: c.held, changed: { ...c.changed }, underReview: { ...c.underReview } }
+  return { reviewing: c.reviewing, held: c.held, changed: { ...c.changed }, underReview: { ...c.underReview }, othersAtStart: [...c.othersAtStart], othersChanged: { ...c.othersChanged } }
 }
 
 /** A stored value as a cycle, with anything missing or malformed (null, wrong types) read as empty. */
@@ -66,7 +66,9 @@ export function cycleFrom(value: unknown): Cycle {
     typeof x === 'object' && x !== null && !Array.isArray(x)
       ? Object.fromEntries(Object.entries(x).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
       : {}
-  return { reviewing: v.reviewing === true, held: v.held === true, changed: files(v.changed), underReview: files(v.underReview) }
+  // A copy from before 0.3.4 has no list of other agents: then every agent still out holds the review open.
+  const ids = Array.isArray(v.othersAtStart) ? v.othersAtStart.filter((x): x is string => typeof x === 'string') : []
+  return { reviewing: v.reviewing === true, held: v.held === true, changed: files(v.changed), underReview: files(v.underReview), othersAtStart: ids, othersChanged: files(v.othersChanged) }
 }
 
 let readBack = false // the stored copy has been read back (or there was none): saving it is safe
@@ -85,7 +87,7 @@ function ensureLoaded($: EngineInterface): Promise<void> {
     ({ value }) => {
       const stored = cycleFrom(value)
       cycle = changedUnread
-        ? { ...cycle, changed: { ...stored.underReview, ...stored.changed, ...cycle.changed }, underReview: { ...cycle.underReview } }
+        ? { ...cycle, changed: { ...stored.underReview, ...stored.othersChanged, ...stored.changed, ...cycle.changed }, underReview: { ...cycle.underReview } }
         : stored
       readBack = true
       if (readFailSaid) say($, 'review-guard: read back its review state after all; nothing waiting for review was lost')
@@ -272,13 +274,16 @@ async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string
  * Files in Claude's scratch folders (`inScratch`) are throwaway: they are left out, and an edit only to
  * them does not count as work picking up again. `posixTmp`: whether /tmp means the Unix temp folder
  * (not for the PowerShell tool). `keepScratch`: keep them too (a copy or move may have taken them into
- * the project). Returns the scratch files left out.
+ * the project). `agentId`: the agent that made the change, when not the main loop; one that was already
+ * at work when the running review began is other work, so its files wait for a review of their own instead
+ * of counting as the review's fixes. Returns the scratch files left out.
  */
-async function remember($: EngineInterface, changed: [string, string][], posixTmp: boolean, keepScratch = false): Promise<string[]> {
+async function remember($: EngineInterface, changed: [string, string][], posixTmp: boolean, keepScratch = false, agentId?: string): Promise<string[]> {
   if (changed.length === 0) return []
+  const queue = (c: Cycle) => (c.reviewing && agentId !== undefined && c.othersAtStart.includes(agentId) ? c.othersChanged : c.changed)
   if (keepScratch) {
     await updateCycle($, c => {
-      for (const [path, lang] of changed) c.changed[path] = lang
+      for (const [path, lang] of changed) queue(c)[path] = lang
       c.held = false
     })
     return []
@@ -289,7 +294,7 @@ async function remember($: EngineInterface, changed: [string, string][], posixTm
   const files = changed.filter(([path]) => !scratch.includes(path))
   if (files.length === 0) return scratch
   await updateCycle($, c => {
-    for (const [path, lang] of files) c.changed[path] = lang
+    for (const [path, lang] of files) queue(c)[path] = lang
     c.held = false
   })
   return scratch
@@ -298,7 +303,31 @@ async function remember($: EngineInterface, changed: [string, string][], posixTm
 /** What the end of a turn asks for: a review, a word that one is held, or nothing. */
 type StopAsk = { kind: 'review'; prompt: string } | { kind: 'held'; files: number } | undefined
 
-const BUSY = new Set(['pending', 'running', 'waiting']) // an agent that has not handed back yet
+// An agent that has handed back: anything else (pending, running, waiting, or a status the engine adds
+// later) is still out. A teammate waiting for a message is `idle`, so it does not hold a review open.
+const DONE = new Set(['idle', 'completed', 'failed', 'killed'])
+
+/** An agent as `$.agent.list()` gives it, with only what the review needs, read so that nothing throws. */
+type Listed = { id: string; out: boolean }
+
+/** The agents still out, from what `$.agent.list()` resolved. Anything that is not a list throws. */
+export function agentsOut(list: unknown): Listed[] {
+  if (!Array.isArray(list)) throw new Error('the agent list was not a list')
+  return list
+    .filter((a): a is { id?: unknown; status?: unknown } => typeof a === 'object' && a !== null)
+    .map(a => ({ id: typeof a.id === 'string' ? a.id : '', out: !(typeof a.status === 'string' && DONE.has(a.status)) }))
+    .filter(a => a.out)
+}
+
+/**
+ * Whether one of these agents holds the running review open: one still out that was not already at work
+ * when the review began (`othersAtStart`). Whatever its type, an agent started during the review is part
+ * of it: a reviewer, a general-purpose agent doing the security review, a fork fixing findings. One that
+ * was running before is other work. An agent with no id can't be told apart, so it counts.
+ */
+export function reviewHeldOpen(out: readonly Listed[], othersAtStart: readonly string[]): boolean {
+  return out.some(a => a.id === '' || !othersAtStart.includes(a.id))
+}
 
 /** The home folder (`homeFrom`: USERPROFILE, else HOME), or undefined. Never throws. */
 async function homeDir($: EngineInterface): Promise<string | undefined> {
@@ -393,7 +422,7 @@ const mayStillRun = (result: { result?: unknown }) => {
  * written, so it counts; one that was refused never ran. What is left out is named on the status line,
  * after `said` when the guard already put a line there. Never throws: it only remembers.
  */
-async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string): Promise<R> {
+async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string): Promise<R> {
   try {
     if (result.deny === undefined) {
       const written = shellWrites(command)
@@ -401,7 +430,7 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
       const onlyRun = compare ? await untouched($, before).catch(() => new Set<string>()) : new Set<string>()
       const kept = written.filter(path => !onlyRun.has(path))
       // A scratch file named by a copy or move may be the source of a write into the project: keep it.
-      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), !powershell, COPIES.test(command))
+      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), !powershell, COPIES.test(command), agentId)
       await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said)
     }
   } catch (err) {
@@ -409,6 +438,21 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
     say($, `review-guard: could not record the files a shell command wrote (${whyOf(err)}); ask for a review by hand`)
   }
   return result
+}
+
+/**
+ * Ends the running review. `fixes`: what to do with the files changed while it ran, its own fixes: drop
+ * them (the review is over), or queue them with the files it covered (it was cut short). Files other
+ * agents changed meanwhile are queued either way.
+ */
+function endReview(c: Cycle, fixes: 'drop' | 'requeue'): void {
+  if (fixes === 'drop') c.changed = {}
+  else for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
+  Object.assign(c.changed, c.othersChanged)
+  c.reviewing = false
+  c.underReview = {}
+  c.othersAtStart = []
+  c.othersChanged = {}
 }
 
 /**
@@ -422,34 +466,30 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
   // The scanners installed here, for the review's commands, and why any that is there would not run
   // or could not be looked for: the prompt names those, never as "not installed".
   const { found, problems } = await findScanners(hostOf($))
-  // If the agents cannot be listed, the review ends here rather than holding every later review back,
-  // and the status line says so: reports still to come then count as new work.
+  // The session's agents still out: while a review runs, to see whether it is over; before one starts,
+  // to know which agents are other work. (Background shell commands and a workflow's agents are not in
+  // this list, so they never hold a review open.)
   let listFailed: string | undefined
-  const listAgents = async (): Promise<readonly { status?: unknown }[]> => {
+  let out: Listed[] = []
+  const reviewing = cycle.reviewing
+  if (reviewing || (!hookActive && !cycle.held && Object.keys(cycle.changed).length > 0)) {
     try {
-      const list: unknown = await $.agent.list()
-      if (!Array.isArray(list)) throw new Error('the agent list was not a list')
-      return list.filter((a): a is { status?: unknown } => typeof a === 'object' && a !== null)
+      out = agentsOut(await $.agent.list())
     } catch (err) {
       listFailed = whyOf(err)
-      return []
     }
   }
-  const agents = cycle.reviewing ? await listAgents() : []
-  const busy = agents.some(a => typeof a.status === 'string' && BUSY.has(a.status))
-  if (signal.aborted) return undefined
-  if (listFailed !== undefined) {
-    say($, `review-guard: could not list the review agents (${listFailed}), so the review counts as over; fixes from reports still to come get a review of their own`)
+  if (listFailed !== undefined && reviewing) {
+    // While a review runs, it ends here rather than holding every later review back: reports still to come
+    // then count as new work.
+    say($, `review-guard: could not list the session's agents (${listFailed}), so the review counts as over; fixes from reports still to come get a review of their own`)
   }
+  if (signal.aborted) return undefined
   const ask = await updateCycle($, (c): StopAsk => {
     if (c.reviewing) {
-      // The review is over at the first stop with no agent still out. Until then the reviewers'
+      // The review is over at the first stop with none of its agents still out. Until then the reviewers'
       // reports come back as turns of this review. Its own fixes are not sent for another review.
-      if (!busy) {
-        c.reviewing = false
-        c.underReview = {}
-        c.changed = {}
-      }
+      if (listFailed !== undefined || !reviewHeldOpen(out, c.othersAtStart)) endReview(c, 'drop')
       return undefined
     }
     // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
@@ -461,16 +501,17 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
     c.underReview = c.changed
     c.changed = {}
     c.reviewing = true
+    c.othersAtStart = out.map(a => a.id).filter(id => id !== '')
     return { kind: 'review', prompt }
   })
   if (ask?.kind === 'review' && signal.aborted) {
     // The dispatch ended while the queue was being moved: put the files back, as no review was asked for.
-    await updateCycle($, c => {
-      for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
-      c.underReview = {}
-      c.reviewing = false
-    })
+    await updateCycle($, c => endReview(c, 'requeue'))
     return undefined
+  }
+  if (ask?.kind === 'review' && listFailed !== undefined) {
+    // The review started without knowing what other work is going on: every agent at work counts as its own.
+    say($, `review-guard: could not list the session's agents (${listFailed}); any agent already at work counts as part of this review`)
   }
   return ask
 }
@@ -522,9 +563,7 @@ export const register: Register = on => {
     if (isNewRequest(e.origin.kind, e.isMeta === true, asUser)) {
       await updateCycle($, c => {
         if (!c.reviewing) return
-        c.reviewing = false
-        c.underReview = {}
-        c.changed = {} // what the review's own agents wrote (scratch files, fixes) is not new work
+        endReview(c, 'drop') // what the review's own agents wrote (scratch files, fixes) is not new work
       })
     }
     return next(e)
@@ -547,7 +586,7 @@ export const register: Register = on => {
         const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
         const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
         // The edit tools take a native path, so /tmp is the Unix temp folder only off Windows.
-        if (lang) await sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
+        if (lang) await sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows, false, e.agentId), [])
       }
     } catch (err) {
       hookFailed($, 'could not record an edited file for review', err, 'ask for a review by hand')
@@ -561,9 +600,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && e.reason !== 'answer') {
       await updateCycle($, c => {
-        if (c.reviewing) for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
-        c.reviewing = false
-        c.underReview = {}
+        if (c.reviewing) endReview(c, 'requeue')
         if (e.reason === 'aborted') c.held = true
       })
     }
@@ -616,7 +653,7 @@ export const register: Register = on => {
         said = 'review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here'
         say($, said)
       }
-      return rememberShellWrites($, await next(e), e.command, before, powershell, said)
+      return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId)
     }
     let remotes: string[] = []
     let toGitHub = false
@@ -627,7 +664,7 @@ export const register: Register = on => {
       // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
       toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
     }
-    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell)
+    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell, undefined, e.agentId)
     const { config, note } = await loadConfig(hostOf($))
     const notes = note ? [note] : []
     const found: Finding[] = []
@@ -641,7 +678,7 @@ export const register: Register = on => {
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
       : `review-guard: ${what} checked, nothing personal or secret found`
     say($, said)
-    return rememberShellWrites($, await next(e), e.command, before, powershell, said)
+    return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId)
   }).catch(($, e, next) =>
     next.called ? next(e) : {
       deny: `review-guard could not check this command, so it stopped it (${whyOf(next.error)}). If the command names ` +
