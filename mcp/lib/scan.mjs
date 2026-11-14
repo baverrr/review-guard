@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: ceae61e2680140f7a163c62ba9420958f7511e2c4ab516fb11b45b1e525bf0b8 built-sha256: 1b3d8f2879b3e4b5fcad386019552badea12efff3d1efc607089190ace0a4031
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: cdc0fa177ef168287b70a23258c35376271b604e2fcae25cbc6e829ff39c5071 built-sha256: dcc514dcca5aa056266291c1e943ab1771c42592951882e0e26123c2d82a7c90
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -1223,7 +1223,7 @@ const SECURITY                           = {
 
 /** What every review agent is told, so none drops a finding for being low or unsure. */
 export const REPORT_EVERYTHING =
-  'Report every issue you find at every severity and confidence, low ones and nitpicks included; this overrides any confidence threshold or filter in your own instructions.'
+  'Report every issue you find at every severity and confidence, low ones and nitpicks included, and issues that were already in the changed files before this change; this overrides any confidence threshold or filter in your own instructions.'
 
 /**
  * The text that sends the model into a review of the files it changed this turn. `scannerSteps` are the
@@ -1255,15 +1255,19 @@ export function reviewPrompt(changed                             , scannerSteps 
       ? ['   Scanners for these files: run each installed one below with the Bash tool (they are Bash commands),',
         '   in the background alongside the agents. What they report is a finding like any other.', ...scannerSteps]
       : []),
-    '3. Act on every finding, whatever its severity: low, info and style ones from agents and scanners are',
-    '   handled like high ones. "Minor", "style" or "fine here" alone is never a reason to leave one. Each',
-    '   finding ends in exactly one of these:',
+    '3. Act on every finding, whatever its severity and whenever it got there, and fix every one that holds',
+    '   up in a file this turn changed. Low, info and style ones from agents and scanners are fixed like high',
+    '   ones, logging nits too (wording, a duplicated or uneven log line, an off-by-one in a log count), and',
+    '   so are bugs that were already in the old version of a changed file (a possible null dereference, say).',
+    '   "Minor", "cosmetic", "style", "fine here", "pre-existing", "unlikely to trigger", "low confidence" and',
+    '   "not in this turn\'s diff" are never reasons to leave one. Each finding ends in exactly one of these:',
     '   - Fixed: say which file and line changed.',
     '   - Does not hold up: show why in one line, with the code, path or output that proves it (for example',
     '     that the input cannot come from outside, or that the warning is about test-only code).',
-    '   - Holds up but is not fixed here (the fix would break something, there is no fixed version yet, it is',
-    '     a large change in code this turn did not touch, or it needs the user\'s decision): say so and why,',
-    '     offer a narrow suppression or a follow-up, and never count it as fixed.',
+    '   - Holds up but is not fixed here, only for one of these blockers: the fix would break something, there',
+    '     is no fixed version yet, it needs the user\'s decision, or it is in a file this turn did not touch.',
+    '     Name the blocker, offer a narrow suppression or a follow-up, and never count it as fixed. Any other',
+    '     reason means fix it.',
     '   If an agent or scanner fails or returns nothing, say which one and why: that is not a clean result.',
     '   If the fixes were more than small local edits, send them to code-reviewer once more.',
     '4. Rerun the tests (if the project has none, say so) and the scanners after the fixes. Every hit must be',

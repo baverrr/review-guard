@@ -448,13 +448,22 @@ describe('review prompt', () => {
     // The agents get a sentence to pass on that overrides their own cutoffs.
     expect(text.includes(`prompt word for word: "${REPORT_EVERYTHING}"`)).toBe(true)
     expect(REPORT_EVERYTHING.includes('overrides any confidence threshold')).toBe(true)
+    expect(REPORT_EVERYTHING.includes('already in the changed files before this change')).toBe(true)
+    // The old escape hatch for big changes in touched code is gone: only an untouched file is a blocker.
+    expect(text.includes('a large change in code this turn did not touch')).toBe(false)
     for (const part of [
-      'Act on every finding, whatever its severity: low, info and style ones',
-      '"Minor", "style" or "fine here" alone is never a reason to leave one',
+      'Act on every finding, whatever its severity and whenever it got there',
+      'fix every one that holds up in a file this turn changed',
+      'Low, info and style ones from agents and scanners are fixed like high ones',
+      'logging nits too',
+      'bugs that were already in the old version of a changed file',
+      '"Minor", "cosmetic", "style", "fine here", "pre-existing", "unlikely to trigger", "low confidence" and "not in this turn\'s diff" are never reasons to leave one',
       'Fixed: say which file and line changed',
       'Does not hold up: show why in one line, with the code, path or output that proves it',
-      'Holds up but is not fixed here',
+      'Holds up but is not fixed here, only for one of these blockers',
+      'it needs the user\'s decision, or it is in a file this turn did not touch',
       'never count it as fixed',
+      'Any other reason means fix it',
       'If an agent or scanner fails or returns nothing, say which one and why',
       'Rerun the tests (if the project has none, say so) and the scanners',
       'Stop after three rounds and list what is still open',

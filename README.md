@@ -23,8 +23,10 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 - **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it, once per
   turn, with review agents (code review, hidden errors, test gaps). Claude's own scratch files are skipped.
-- **Leaves no finding behind.** Low and style warnings count like serious ones. Claude fixes each real one,
-  says why for any that isn't real, and names any it can't fix yet. Then it reruns the tests and scanners
+- **Leaves no finding behind.** Low and style warnings count like serious ones, and so do old bugs in the
+  files it changed. Claude fixes each real one, says why for any that isn't real, and leaves one unfixed
+  only for a real blocker (the fix would break something, no fixed version yet, it needs your call, or it
+  is in a file the turn didn't touch). Then it reruns the tests and scanners
   and tells you the outcome of every finding.
 - **Adds a security check per language.** Python, TypeScript, Docker, shell, C# and others each get their own
   short list of things to look for.
