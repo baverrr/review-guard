@@ -5,7 +5,7 @@ import {
 } from '../hooks/scan.ts'
 import { findScanners } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
-import { afterHandOn, agentsListed, cycleFrom, recipient, reviewFailed, reviewHeldOpen, say, stillOthers, whyOf } from '../hooks/register.ts'
+import { afterHandOn, agentsListed, cycleFrom, recipient, reviewFailed, reviewHeldOpen, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -657,9 +657,12 @@ test('the agents at work when a review began, and what they changed, survive a r
   const next = await stop()
   expect(next?.includes('bg.py')).toBe(true)
   expect(next?.includes('app.py')).toBe(false)
-  // A stored value is read with care: ids that are not text are dropped, and so are non-text languages.
-  expect(cycleFrom({ othersAtStart: ['a', 1, null], othersChanged: { 'x.py': 'Python', 'y.py': 3 } })).toEqual(
-    { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: ['a'], othersChanged: { 'x.py': 'Python' } })
+  // A stored value is read with care: what is not text is dropped. With no review running, nothing
+  // review-only stands and no file is lost; during one, a hold is dropped and no id is on both lists.
+  expect(cycleFrom({ othersAtStart: ['a', 1, null], underReview: { 'u.py': 'Python' }, othersChanged: { 'x.py': 'Python', 'y.py': 3 }, joined: ['b'], promptPending: true })).toEqual(
+    { reviewing: false, held: false, changed: { 'u.py': 'Python', 'x.py': 'Python' }, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false })
+  expect(cycleFrom({ reviewing: true, held: true, othersAtStart: ['a', 'a'], joined: ['a', 'b', 'b', 2], promptPending: true })).toEqual(
+    { reviewing: true, held: false, changed: {}, underReview: {}, othersAtStart: ['a'], othersChanged: {}, joined: ['b'], promptPending: true })
 })
 
 test('agents already at work when a review starts do not hold it open; any agent started during it does', async ($, on) => {
@@ -715,7 +718,8 @@ test('an agent from before a review that the review starts again or messages bec
   await $.session.receive({ origin: { kind: 'peer' }, text: 'help', agentId: 'new1' } as never)
   // A message from outside the session, with no send before it, changes nothing.
   await $.session.receive({ origin: { kind: 'peer' }, text: 'hi', agentId: 'peer' } as never)
-  for (const [who, file] of [['bg', 'bg.py'], ['tm', 'tm.py'], ['peer', 'peer.py'], ['new1', 'helper.py']]) {
+  // bg and tm, now the review's, fix app.py (under review); bg also edits bgown.py, its own work.
+  for (const [who, file] of [['bg', 'app.py'], ['tm', 'app.py'], ['bg', 'bgown.py'], ['peer', 'peer.py'], ['new1', 'helper.py']]) {
     await $.tool.call({ tool: 'Edit', file_path: `C:/proj/${file}`, old_string: 'a', new_string: 'b', agentId: who } as never)
   }
   // bg and tm are out: the review stays open while peer and its helper are not counted.
@@ -723,15 +727,17 @@ test('an agent from before a review that the review starts again or messages bec
   expect(await stop(true)).toBe(undefined)
   await edit('C:/proj/later.py')
   expect(await stop()).toBe(undefined) // still open: later.py is a fix, not new work
-  // bg and tm hand back: the review is over. Their edits were fixes; peer's and its helper's get a review.
+  // bg and tm hand back: the review is over. Their edits to app.py were fixes; bg's own file, peer's and
+  // its helper's get a review.
   out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'idle' }, { id: 'peer', status: 'running' }, { id: 'new1', status: 'running' }]
   expect(await stop()).toBe(undefined)
   const next = await stop()
-  for (const f of ['peer.py', 'helper.py']) expect(next?.includes(f)).toBe(true)
-  for (const f of ['bg.py', 'tm.py', 'later.py', 'app.py']) expect(next?.includes(f)).toBe(false)
+  for (const f of ['peer.py', 'helper.py', 'bgown.py']) expect(next?.includes(f)).toBe(true)
+  for (const f of ['later.py', 'app.py']) expect(next?.includes(f)).toBe(false)
 })
 
 test('an agent from before a review that finished and is started again unseen becomes part of it', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' }) // Windows: a path in another case is the same file
   const { out, edit, stop } = cycle($, on)
   out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'idle' }]
   await edit('C:/proj/app.py')
@@ -742,13 +748,17 @@ test('an agent from before a review that finished and is started again unseen be
   // bg runs again with no event this mod saw: it holds the review open now. tm wakes and does not.
   out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }]
   await edit('C:/proj/app.py')
+  // bg, joined: its fix to app.py (with another spelling) is the review's; its own file is not.
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\APP.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/bgown.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   expect(await stop()).toBe(undefined)
   out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'running' }]
   expect(await stop()).toBe(undefined) // only tm, other work, is out: over
   await edit('C:/proj/next.py')
   const next = await stop()
   expect(next?.includes('next.py')).toBe(true)
-  expect(next?.includes('app.py')).toBe(false)
+  expect(next?.includes('bgown.py')).toBe(true)
+  expect(next?.toLowerCase().includes('app.py')).toBe(false)
 })
 
 test('a refused message, work handed on outside a review, and a reload are handled', async ($, on) => {
@@ -764,6 +774,7 @@ test('a refused message, work handed on outside a review, and a reload are handl
   await $.agent.spawn({ tool_use_id: 't', prompt: 'refuse', description: 'd', resume: { agentId: 'tm' } } as never).catch(() => undefined)
   await $.session.send({ to: 'tm', text: 'x', origin: { kind: 'tool' } } as never).catch(() => undefined)
   await $.session.receive({ origin: { kind: 'peer' }, text: 'from elsewhere', agentId: 'tm' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/bg.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/tm.py', old_string: 'a', new_string: 'b', agentId: 'tm' } as never)
   // bg (the review's now) is out: the review stays open; tm (still other work) does not hold it.
@@ -773,7 +784,8 @@ test('a refused message, work handed on outside a review, and a reload are handl
   expect(await stop()).toBe(undefined)
   const next = await stop()
   expect(next?.includes('tm.py')).toBe(true)
-  expect(next?.includes('bg.py')).toBe(false)
+  expect(next?.includes('bg.py')).toBe(true) // bg joined after the reload: its own file gets a review
+  expect(next?.includes('app.py')).toBe(false) // bg's fix to the file under review
   // Outside a review, starting or messaging an agent changes nothing: the next edit is queued as usual.
   expect(await stop(true)).toBe(undefined)
   out.agents = []
@@ -967,6 +979,204 @@ test('a start still under way when the list is read keeps the review open', asyn
   out.agents = [{ id: 'h1', status: 'completed' }]
   expect(await stop()).toBe(undefined) // now over, and the fix is not sent back
   expect(await stop()).toBe(undefined)
+})
+
+test('a start stuck for over two minutes no longer holds a review open', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const logged: string[] = []
+  on('ui.log', (_$, e) => {
+    logged.push(e.text)
+    return { value: undefined }
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => ({ value: [] }))
+  on('agent.spawn', () => new Promise(() => {}) as never) // a hook beneath that never answers
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  void $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'r1' } as never).catch(() => undefined)
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  expect(await stop(true)).toBe(undefined)
+  // Just under two minutes: still under way, so the review stays open and a fix made now is not new work.
+  await clock.advance(119_000)
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/fix.py', old_string: 'a', new_string: 'b' })
+  expect(await stop()).toBe(undefined)
+  await clock.advance(2_000)
+  expect(await stop()).toBe(undefined) // stuck: no longer counted, so the review is over now
+  expect(await stop()).toBe(undefined) // and fix.py was a fix: not asked for
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/next.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('next.py')).toBe(true)
+  expect(await stop(true)).toBe(undefined) // a check in the next review, with the same start still stuck
+  expect(logged.filter(l => l.includes('under way for over two minutes no longer hold')).length).toBe(1) // said once
+})
+
+test('a review prompt still on its way survives a reload', async ($, on) => {
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: [], promptPending: true })
+  const { edit, stop } = cycle($, on)
+  // The prompt was handed out before the reload; this stop is not its continuation: it never arrived.
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('a new request right after a reload keeps a review whose prompt never arrived', async ($, on) => {
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: [], promptPending: true })
+  const { edit, stop } = cycle($, on)
+  await $.prompt.submit({ text: 'new work', wait: false, origin: { kind: 'composer' } })
+  await edit('C:/proj/other.py')
+  const next = await stop()
+  expect(next?.includes('other.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(true)
+})
+
+test('a turn that ends without the review prompt puts its files back, before anything can drop them', async ($, on) => {
+  const { edit, stop } = cycle($, on)
+  on('turn.complete', () => ({ text: '' }))
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The block did not take: the turn ends with an answer. Then a turn started by something else gets a
+  // message typed mid-turn: that is not proof the review prompt arrived, and app.py is still kept.
+  await $.turn.complete({ reason: 'answer', answer: 'done', durationMs: 1, isAborted: false, turnId: 't1' })
+  await $.prompt.submit({ text: 'and this', wait: true, origin: { kind: 'composer' }, turnId: 't2' } as never)
+  await edit('C:/proj/other.py')
+  const next = await stop()
+  expect(next?.includes('app.py')).toBe(true)
+  expect(next?.includes('other.py')).toBe(true)
+})
+
+test('a hook beneath that blocks while the review prompt is still on its way does not lose its files', async ($, on) => {
+  const out = { agents: [] as { id: string; status: Status }[] }
+  let beneathBlocks = false
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => (beneathBlocks ? { block: 'another hook wants more' } : {}))
+  on('agent.list', () => ({ value: out.agents.map(a => ({ description: 'x', type: 'x', ...a })) }))
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The prompt is lost; the next stop is not its continuation, and a hook beneath blocks there.
+  beneathBlocks = true
+  expect(await stop()).toBe('another hook wants more')
+  beneathBlocks = false
+  // That block's continuation must not count as the review prompt arriving: app.py is asked for again.
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('a joined agent messaging one of the review\'s own agents does not make it joined', async ($, on) => {
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  const { out, stop } = cycle($, on)
+  on('session.send', () => ({ isDelivered: true }))
+  out.agents = [{ id: 'r1', status: 'running' }]
+  await $.session.send({ to: 'r1', text: 'look here', origin: { kind: 'tool' }, agentId: 'bg' } as never)
+  // r1, the review's own, adds a test file as a fix: it stays a fix.
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/test_app.py', old_string: 'a', new_string: 'b', agentId: 'r1' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined) // the review is over
+  expect(await stop()).toBe(undefined) // and test_app.py was a fix: nothing to review
+})
+
+test('two spellings of one file compare equal', () => {
+  const win = (p: string, folder?: string) => samePath(p, folder, true)
+  expect(win('C:\\proj\\App.py')).toBe('c:/proj/app.py')
+  expect(win('/c/proj/app.py')).toBe('c:/proj/app.py') // Git Bash
+  expect(win('app.py', 'C:\\proj')).toBe('c:/proj/app.py') // relative, against the session's folder
+  expect(win('./src/../app.py', 'C:/proj/')).toBe('c:/proj/app.py')
+  expect(win('app.py')).toBe('app.py') // no folder known: left as it is (so it can only fail to match)
+  expect(samePath('src/App.py', '/home/pat/proj', false)).toBe('/home/pat/proj/src/App.py') // Linux keeps case
+  expect(samePath('/c/x.py', undefined, false)).toBe('/c/x.py') // and has no drive letters
+  // `..` steps: one never cancels another, and nothing goes above the root.
+  expect(win('a/../../b')).toBe('../b')
+  expect(win('../../../a')).toBe('../../../a')
+  expect(win('C:/../../b')).toBe('c:/b')
+  expect(win('C:/x/../../proj/app.py')).toBe('c:/proj/app.py')
+  expect(win('/c')).toBe('c:/') // a drive alone
+  expect(win('app.py', '/')).toBe('/app.py') // a folder of `/` still joins
+  expect(samePath('app.py', '/', false)).toBe('/app.py')
+})
+
+test('how long a start has been under way is read on one clock only', () => {
+  expect(underWayFor({ machine: 1000, engine: 5000 }, 125_000, 2000)).toBe(120_000) // both on the engine's
+  expect(underWayFor({ machine: 1000 }, 125_000, 2000)).toBe(1000) // the start has no engine time: machine
+  expect(underWayFor({ machine: 1000, engine: 5000 }, undefined, 2000)).toBe(1000) // no engine time now: machine
+  // A clock that has stopped can't keep a stuck start from counting: the longer reading wins.
+  expect(underWayFor({ machine: 0, engine: 5000 }, 5000, 200_000)).toBe(200_000)
+})
+
+test('a joined agent fixing a file under review through a relative shell path is a fix', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ own.py', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('own.py')).toBe(true) // its own work
+  expect(next?.includes('app.py')).toBe(false) // its fix, though spelled another way
+})
+
+for (const [name, under, setup, command, agent] of [
+  ['after a cd', 'C:/proj/app.py', false, 'cd sub && sed -i s/a/b/ app.py', 'bg'],
+  ['from an agent with a folder of its own', 'C:/proj/app.py', true, 'sed -i s/a/b/ app.py', 'wt'],
+  ['against a relative path under review', 'util.py', false, 'cd sub && sed -i s/a/b/ util.py', 'bg'],
+] as const) {
+  test(`a relative path is never taken for a file under review when its folder is not sure: ${name}`, async ($, on) => {
+    mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+    on('session.cwd', () => ({ value: 'C:/proj' }))
+    seed(on, { reviewing: true, held: false, changed: {}, underReview: { [under]: 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg', 'wt'], promptPending: false })
+    const { out, stop } = cycle($, on)
+    on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
+    // wt is started again in a folder of its own (a worktree).
+    if (setup) await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', resume: { agentId: 'wt' }, cwd: 'C:/wt' } as never)
+    await $.tool.call({ tool: 'Bash', command, agentId: agent } as never)
+    out.agents = []
+    expect(await stop(true)).toBe(undefined)
+    // The file it wrote gets a review of its own: it was not taken for a fix to the file under review.
+    const file = under.endsWith('util.py') ? 'util.py' : 'app.py'
+    expect((await stop())?.includes(file)).toBe(true)
+  })
+}
+
+test('a helper started by an agent that joined the review joins it too', async ($, on) => {
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  const { out, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'h1', model: 'm' }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'bg' } as never)
+  for (const [who, file] of [['bg', 'own.py'], ['h1', 'helper.py'], ['h1', 'app.py']]) {
+    await $.tool.call({ tool: 'Edit', file_path: `C:/proj/${file}`, old_string: 'a', new_string: 'b', agentId: who } as never)
+  }
+  out.agents = []
+  expect(await stop(true)).toBe(undefined) // the review is over
+  const next = await stop()
+  for (const f of ['own.py', 'helper.py']) expect(next?.includes(f)).toBe(true) // their own work
+  expect(next?.includes('app.py')).toBe(false) // the helper's fix
+})
+
+test('a review prompt that never reached Claude puts its files back, also when a new request comes first', async ($, on) => {
+  const status: string[] = []
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  // The next end of a turn is not the prompt's continuation: it never arrived. Said, and asked for again.
+  expect((await stop())?.includes('app.py')).toBe(true)
+  expect(status.some(s => s.includes('the review prompt did not reach Claude'))).toBe(true)
+  // Again lost, and this time a new request comes before any stop: its files are kept, not dropped.
+  await $.prompt.submit({ text: 'something else', wait: false, origin: { kind: 'composer' } })
+  await edit('C:/proj/other.py')
+  const next = await stop()
+  expect(next?.includes('app.py')).toBe(true)
+  expect(next?.includes('other.py')).toBe(true)
+  // Delivered this time: its continuation ends with stop_hook_active, and a new request then drops its fixes.
+  expect(await stop(true)).toBe(undefined)
+  await $.prompt.submit({ text: 'and now this', wait: false, origin: { kind: 'composer' } })
+  await edit('C:/proj/last.py')
+  const last = await stop()
+  expect(last?.includes('last.py')).toBe(true)
+  expect(last?.includes('app.py')).toBe(false)
 })
 
 test('who is other work after an agent is started or messaged', () => {
@@ -1226,9 +1436,25 @@ test('a new request in the middle of a review gets its own review', async ($, on
   await edit('C:/proj/app.py')
   expect((await stop())?.includes('app.py')).toBe(true)
   out.agents = [{ status: 'running' }]
+  expect(await stop(true)).toBe(undefined) // the review prompt arrived and its turn ended
   await $.prompt.submit({ text: 'also change the other file', wait: false, origin: { kind: 'composer' } })
   await edit('C:/proj/other.py')
-  expect((await stop())?.includes('other.py')).toBe(true)
+  const next = await stop()
+  expect(next?.includes('other.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false) // reviewed already: not again
+})
+
+test('a request typed while the review prompt\'s turn still runs shows the prompt arrived', async ($, on) => {
+  const { out, edit, stop } = cycle($, on)
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  out.agents = [{ status: 'running' }]
+  // Typed mid-turn (the turn that carries the review prompt): the review was delivered, so it is dropped.
+  await $.prompt.submit({ text: 'also this', wait: true, origin: { kind: 'composer' }, turnId: 't1' } as never)
+  await edit('C:/proj/other.py')
+  const next = await stop()
+  expect(next?.includes('other.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
 })
 
 test('an interrupted turn asks for no review until work on code picks up again', async ($, on) => {
@@ -2003,8 +2229,8 @@ test('a review whose turn dies on an error keeps its files, and an answered turn
   await edit('C:/proj/a.py')
   expect((await stop())?.includes('a.py')).toBe(true)
   out.agents = [{ status: 'running' }]
+  expect(await stop(true)).toBe(undefined) // the review prompt's own turn ends: still the same review
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1' })
-  expect(await stop()).toBe(undefined) // still the same review
   await $.turn.complete({ reason: 'error', answer: '', durationMs: 1, isAborted: false, turnId: 't2' })
   await edit('C:/proj/b.py')
   const prompt = await stop() // no hold after an error: the next stop asks, for both files

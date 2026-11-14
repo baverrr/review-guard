@@ -11,7 +11,8 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 > [!TIP]
 > It needs no setup to start: install it and the reviews and the GitHub check begin in your next session.
-> Add your own name and email to a small config file (see [How to use it](#how-to-use-it)) so it can watch for those too.
+> Add your own name and email to a small config file (see [How to use it](#how-to-use-it)) so it can watch
+> for those too.
 
 > [!IMPORTANT]
 > It catches common mistakes, not every leak. It knows the usual key and token formats, not every secret
@@ -21,34 +22,24 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 ## What it does
 
-- **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it, once per
-  turn, with review agents (code review, hidden errors, test gaps). Claude's own scratch files are skipped.
-- **Leaves no finding behind.** Low and style warnings count like serious ones, logging nits too, and so do
-  old problems in the files it changed. Claude fixes each real one, says why for any that isn't real, and
-  leaves one unfixed only for a real blocker: the fix would break something, there is no fixed version of
-  the package yet, it needs your call, or it is in a file outside the review. Then it reruns the tests and
-  scanners and tells you the outcome of every finding.
-- **Adds a security check per language.** Python, TypeScript, Docker, shell, C# and others each get their own
-  short list of things to look for.
-- **Brings its own reviewers.** It ships five review agents, so the review works even where the
-  pr-review-toolkit plugin is not installed.
-- **Stops leaks to GitHub.** A `git commit`, `git push`, `gh pr create` or GitHub tool call that would send a
-  key, a token, a private key, an IP or MAC address, or one of your personal terms is stopped, and Claude is
-  told what and where, never the value itself. With [gitleaks](https://github.com/gitleaks/gitleaks)
-  installed, commits, pushes and GitHub writes also go through its hundreds of key patterns.
-- **Uses the scanners you have.** The review lists ready-to-run commands for the ones installed that suit the
-  changed files: [bandit](https://github.com/PyCQA/bandit) for Python, [Semgrep](https://semgrep.dev) for
-  most languages, [zizmor](https://github.com/zizmorcore/zizmor) for GitHub Actions and
-  [Trivy](https://github.com/aquasecurity/trivy) for dependency files and Dockerfiles. Their warnings are
-  handled like any other finding. Missing ones are named, never silently skipped.
-- **Knows when to wait.** If you stop Claude part way, it waits until work picks up again before asking for
-  a review.
-- **Checks on request.** It shows under **Connectors** as review-guard, with three tools Claude can use any
-  time: `check_outgoing` checks what is staged (or every change, when asked) and what a push of the
-  current branch would send,
-  `check_text` checks any text before it is posted, and `review_status` lists what is waiting for review
-  and what was left out. They only look, never show what they found (only its kind and place), and say so
-  when part of a check could not run. None of them can turn the reviews off.
+- **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it with
+  review agents (code review, hidden errors, test gaps), plus a short security check per language.
+- **Leaves no finding behind.** Low and style warnings count like serious ones, and so do old problems in
+  the files it changed. Claude fixes each real one, says why for any that isn't, and leaves one unfixed only
+  for a real blocker (the fix would break something, no fixed version yet, it needs your call, or it is an
+  old problem in a file outside the review). Then it reruns the tests and scanners and tells you the outcome
+  of every finding.
+- **Brings its own reviewers.** It ships five review agents, so it works without the pr-review-toolkit plugin.
+- **Stops leaks to GitHub.** A commit, push or GitHub write that would send a key, a token, an IP or MAC
+  address, or one of your personal terms is stopped, and Claude is told what and where, never the value.
+  With [gitleaks](https://github.com/gitleaks/gitleaks) installed, its key patterns are checked too.
+- **Uses the scanners you have.** [bandit](https://github.com/PyCQA/bandit), [Semgrep](https://semgrep.dev),
+  [zizmor](https://github.com/zizmorcore/zizmor) and [Trivy](https://github.com/aquasecurity/trivy), when
+  installed and suited to the changed files. Missing ones are named, never silently skipped.
+- **Knows when to wait.** If you stop Claude part way, it holds the review until Claude edits code again.
+- **Checks on request.** Under **Connectors**, `check_outgoing` checks what a commit or push would send,
+  `check_text` checks any text before it is posted, and `review_status` lists what is waiting for review.
+  They only look, and say what kind of thing they found and where, never the value itself.
 
 ## What you need
 
@@ -113,12 +104,10 @@ Claude cannot edit this file; the mod stops it from trying. A typo in it stops c
 **"review-guard could not check this command."** Git could not open the folder the command names, or the
 config file has a mistake. The message gives the reason. Run git with `git -C <full path>` or fix the file.
 
-**"It asks for a review I don't need."** Changes to notes and other non-code files are never reviewed, and
-neither is a script that a shell command only prints or sends to another machine over SSH. Claude's own
-scratch files (its scratchpad in your temp folder) are left out, unless a command copies them somewhere.
-So is a script a command only runs, when its file is unchanged after the command (same time and size,
-and for small scripts the same text). The status line names each file left out. To turn the mod off for
-a while, set `"review-guard@review-guard": false` under `enabledPlugins` in your settings.
+**"It asks for a review I don't need."** Notes and other non-code files are never reviewed, nor are
+Claude's own scratch files (unless a command copies them into the project) or a script a command only runs
+and leaves unchanged. The status line names each file left out. To turn the mod off for a while, set
+`"review-guard@review-guard": false` under `enabledPlugins` in `~/.claude/settings.json`.
 
 **"It checked a commit or push I didn't make."** A command that writes a file holding a git command (a test,
 a note) and also runs a script is checked, since the guard can't tell whether the script runs it. A test
@@ -127,30 +116,20 @@ that only calls a helper like `git(repo, 'commit')` is not.
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
 
 **"review-guard is not under Connectors", or its tools say "out of date".** The tools need Node.js 22 or
-newer on PATH; start a new session after installing it. "Out of date" means the mod was changed without
-rebuilding its tools: run `node scripts/build-mcp.mjs` in its folder (Node 22.13 or newer), then start a
-new session.
+newer on PATH. "Out of date" means the tools need rebuilding: run `node scripts/build-mcp.mjs` in the
+mod's folder (Node 22.13 or newer). Then start a new session.
 
 <details>
 <summary><b>For developers</b></summary>
 
 - The hooks are in `hooks/register.ts`, with the commit and push check in `hooks/outgoing.ts`; the scanning
   and command reading are pure functions in `hooks/scan.ts`.
-- The MCP server (`mcp/server.mjs`) is set up under `mcpServers` in `.claude-plugin/plugin.json`, not in a
-  root `.mcp.json`: Claude would also load that one as a project server when run inside this folder, where
-  it fails. It runs the same check through `mcp/host.mjs`, from a plain-JavaScript copy in `mcp/lib/`,
-  since some Node builds can't run TypeScript. After changing `hooks/scan.ts`, `scanners.ts`, `outgoing.ts`
-  or `status.ts`, rebuild it with `node scripts/build-mcp.mjs` (Node 22.13 or newer);
-  the server's tools refuse a copy that doesn't match.
-- A review stays open while one of its own agents is still working, so fixes from its reports are not
-  reviewed again. Agents already there when it began (idle teammates included) are other work: they don't
-  hold it open, and files they change meanwhile get a review of their own. An earlier agent that the main
-  conversation or one of the review's agents starts again or messages, or one that finishes and later runs
-  again, is part of the review from then on; agents that earlier work starts or messages stay other work.
-  (If the agents can't be listed as a review begins, every agent counts as part of it, and the status line
-  says so.)
-- Each session writes its review state to `~/.claude/review-guard/status/` for `review_status`. Old files
-  are not removed (the tool shows the last 24 hours).
+- The MCP server (`mcp/server.mjs`) is set up in `.claude-plugin/plugin.json`, not a root `.mcp.json`
+  (Claude would load that as a broken project server inside this folder). It runs a plain-JavaScript copy
+  in `mcp/lib/`: after changing `hooks/scan.ts`, `scanners.ts`, `outgoing.ts` or `status.ts`, run
+  `node scripts/build-mcp.mjs` (Node 22.13 or newer).
+- How a review decides it is over, and what happens to edits made meanwhile:
+  [docs/review-cycle.md](docs/review-cycle.md).
 - The review agents are in `agents/`, with the same prompts in `hooks/agents.ts` for sessions that were
   already open when the mod loaded. Refresh both together (see `licenses/NOTICE.md`).
 - Run the tests: `claude plugin test .` and `node --test tests/mcp-server.node.mjs`
