@@ -33,20 +33,27 @@ export type Cycle = {
    * reload keeps it. A copy from before 0.3.6 has none, and is read as arrived.
    */
   promptPending: boolean
-  /**
-   * Agents whose relative paths are not read against the session's folder: those started (or started
-   * again) in a folder of their own, those that ran a command that changed folder (a shell may keep it for
-   * later commands), any agent started or resumed by one already on the list, and any agent started by
-   * another before the saved state was read back. Kept outside a review too: only the last 500 marked
-   * (`OWN_FOLDER_KEPT`), each once (`ownFolderOf`).
-   */
-  ownFolder: string[]
 }
-// Outside a review (`reviewing` false), `underReview`, `othersAtStart`, `othersChanged` and `joined` are
-// empty and `promptPending` is false (`ownFolder` is kept); `cycleFrom` restores that for any stored copy.
+// In a Cycle, outside a review (`reviewing` false), `underReview`, `othersAtStart`, `othersChanged` and
+// `joined` are empty and `promptPending` is false; `cycleFrom` restores that for any stored copy.
+
+/**
+ * What is saved: the review cycle, plus the agents whose relative paths are not read against the
+ * session's folder (`ownFolder`): those started (or started again) in a folder of their own, those that
+ * ran a command that changed folder (a shell may keep it for later commands), any agent started or
+ * resumed by one already on the list, and any agent started by another before the saved state was read
+ * back. That list is about the session's agents, not a review, so it is kept apart from `Cycle` and lasts
+ * across reviews: only the last 500 marked (`OWN_FOLDER_KEPT`), each once (`ownFolderOf`).
+ */
+export type SavedState = Cycle & {
+  ownFolder: string[]
+  /** Some agent may be missing from `ownFolder` (it was damaged or cut): kept until the session ends. */
+  ownFolderDoubtful?: true
+}
 
 declare module 'claude-code' {
   interface PluginState {
-    'review-guard': { cycle: Cycle }
+    // Still under the key `cycle`, so a copy saved before 0.3.8 (with `ownFolder` inside it) reads the same.
+    'review-guard': { cycle: SavedState }
   }
 }

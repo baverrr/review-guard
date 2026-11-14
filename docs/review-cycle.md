@@ -20,20 +20,29 @@ page says when that review counts as over, and what happens to the edits made wh
   from then on. Its edits to files under review are fixes; its edits to any other file still get their
   own review, and so do those of a helper it starts.
 - **Paths.** To tell whether a joined agent's edit is to a file under review, a path is matched
-  however it is spelled: on Windows `\` and `/` are the same and case is ignored, and Git Bash's
-  `/c/...` is drive C (a file it changes is listed as `C:/...`). In PowerShell and the edit tools
-  `/c/...` is a folder `c` on the current drive, so it is never taken for drive C. On Windows a path
-  with no drive (`/proj/x.py`) names a different file in each shell, so it never counts as a file under
-  review. A relative path is read against the session's folder only when that is surely its folder:
-  not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`), and
-  never again for an agent that has run such a command (a shell may keep the folder), was started in a
-  folder of its own, or was started or resumed by an agent on this list. The list is saved, so a reload
-  keeps it (the last 500 agents). Until the saved state is read back after a reload, no relative path is
-  read against the session's folder, and an agent that another agent starts meanwhile goes on the list.
-  A path that is still relative never counts as a file under review, which can only mean more review.
-- **Windows or not.** The mod takes the machine for Windows when `OS` is `Windows_NT`, or when
-  `USERPROFILE` has a drive letter and `HOME` is missing, a Windows path or Git Bash's `/c/...` (Linux and
-  WSL have a `HOME` like `/home/pat`, and may have a `USERPROFILE` passed in from Windows).
+  however it is spelled. On Windows `\` and `/` are the same and case is ignored, and in Git Bash and the
+  edit tools `/c/...` is drive C (a file changed that way is listed as `C:/...`); in PowerShell `/c/...`
+  is a folder `c` on the current drive, so it is never taken for drive C, and so is `\c\...` from any tool.
+  On Windows a path with no drive
+  (`/proj/x.py`) names a different file in each tool, so it never counts as a file under review. A file
+  changed under two full spellings is listed once in the same list, under the first (not across a `..`
+  step, which through a link may name another file).
+- **Relative paths.** A relative path is read against the session's folder only when that is surely its
+  folder: not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`),
+  and never again for an agent that has run such a command (a shell may keep the folder), was started in
+  a folder of its own, or was started or resumed by an agent on this list. The list is saved, so a reload
+  keeps it (the last 500 agents). If the saved list was damaged or full, or before it is read back after
+  a reload, no agent's relative path is read against the session's folder, and an agent that another
+  agent starts before the read goes on the list. A path that is still relative never counts as a file
+  under review, which can only mean more review.
+- **Windows or not.** The hooks take the machine for Windows when `OS` is `Windows_NT`. Without it they
+  go by `HOME`: one that starts with `/` means Linux or WSL (which may have `USERPROFILE` or `SystemRoot`
+  passed in from Windows), unless it is Git Bash's spelling of a folder on the drive `USERPROFILE` or
+  `SystemRoot` names (`/c/Users/pat`). Any other `HOME`, or none, means Windows when `USERPROFILE` or
+  `SystemRoot` names a drive. The MCP server asks Node instead, which gives the same answer on a normal
+  Windows, Linux or WSL setup. The home folder (for the config and status files) is `USERPROFILE` on
+  Windows and `HOME` elsewhere; when that one is missing or blank, the other is used. On WSL with
+  `USERPROFILE` passed in, `~/.claude/review-guard.json` is read from the Linux home, not the Windows one.
 
 ## Timing
 

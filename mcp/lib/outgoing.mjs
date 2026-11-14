@@ -1,4 +1,4 @@
-// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: f3e863b57396159c1e9dde6643f32826bfb70a6acd616b367019d48891c5f013 built-sha256: 06451b7f9f49396978ae5af2983c5915921c149418867c384e4c1c69b79800c5
+// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 86130747551fe21369aa547763ab1c97cf74bf6d526a47acee7a88e994b28301 built-sha256: 2ce5bb038390714d0c677c414f0f23eca3583d35101693ea169de6cde20d3d81
 // review-guard's check of what leaves this machine: what a git commit or push would send, and the
 // user's config of personal terms. It runs git and gitleaks through `Host`, so the hooks (through the
 // engine's `$`) and the MCP server (through Node) run the same code.
@@ -7,6 +7,7 @@ import {
                
                  
   githubRepo,
+             
   scanDiff,
   scanFile,
   scanLine,
@@ -45,11 +46,14 @@ export const MAX_BYTES = 4 * 1024 * 1024
  
 
 /**
- * The home folder from USERPROFILE (Windows) or HOME: forward slashes, no trailing slash, and undefined
- * for a value that is empty or blank. Both hosts use this, so they agree.
+ * The home folder: USERPROFILE first on Windows, HOME first elsewhere (Linux and WSL may have a
+ * USERPROFILE passed in from Windows), the other when the first is missing or blank. Forward slashes, no
+ * trailing slash, and undefined when neither is set. Both hosts use this; they agree as long as they
+ * agree on whether this is Windows (the hooks tell it from the environment, the MCP server from Node).
  */
-export function homeFrom(userProfile                    , home                    )                     {
-  const value = [userProfile, home].find(v => v !== undefined && v.trim() !== '')
+export function homeFrom(paths                                                 )                     {
+  const { windows, home, userProfile } = paths
+  const value = (windows ? [userProfile, home] : [home, userProfile]).find(v => v !== undefined && v.trim() !== '')
   return value?.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
 }
 
@@ -176,7 +180,7 @@ const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues']
  */
 export async function loadConfig(host      )                                             {
   const empty         = { personal: [], allowNetworkInfo: [], allowValues: [] }
-  const note = 'personal details were NOT checked (no ~/.claude/review-guard.json)'
+  const note = 'personal details were NOT checked (no ~/.claude/review-guard.json; ~ is USERPROFILE on Windows and HOME elsewhere, or the other when that one is not set)'
   const path = await configPath(host)
   if (!path) return { config: empty, note: 'personal details were NOT checked (the home folder is not known)' }
   let text        

@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: a07ec124b128fa3029ff43a4d68559565a0c3e083832729ff22ca9b8c77fd399 built-sha256: 4c651fbd563cb614887a4b571fee02cb3dd9eb01a7e12594651ef5ed5abd4d11
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 90beccb4eac440f65f66c896f40aa39baab7b6f924108b731e9e14e39b61dd94 built-sha256: 9d3db8677c5ed7ce0b01fca7aeaceeee005c8bcb5022c14fb7690380a577194b
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -254,9 +254,12 @@ function unquote(s        )         {
   return s.replace(/^"(.*)"$/s, '$1').replace(/^'(.*)'$/s, '$1')
 }
 
-/** Git Bash paths (/c/Users/...) as native git on Windows reads them. */
+/**
+ * Git Bash paths (/c/Users/..., or a bare /c) as native Windows reads them (C:/Users/..., C:/). The one
+ * place that turns `/c/` into a drive: `comparable`, `samePath` and `keyOf` all use it.
+ */
 export function nativePath(p        )         {
-  const m = /^\/([a-zA-Z])\/(.*)$/.exec(p)
+  const m = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(p)
   return m ? `${(m[1] ?? '').toUpperCase()}:/${m[2] ?? ''}` : p
 }
 
@@ -1058,32 +1061,70 @@ export function shellWrites(fullCommand        )           {
   return [...out]
 }
 
-/** How paths are spelled on this machine: Windows (drive letters, Git Bash's `/c/` for its own paths, any case) or not. */
+/**
+ * How paths are spelled on this machine: Windows (drive letters, `\` and `/` alike, any case) or not. How
+ * one tool reads a path there, `/c/...` included, is `rulesFor`.
+ */
                                                                              
 
-// A path as one comparable string: no trailing slash, and on Windows forward slashes, Git Bash's `/c/` as
-// `C:/` (when `gitBash`: in PowerShell and the edit tools it is a folder `c`) and lower case. Elsewhere a
-// `\` is part of a file name and case counts, so they stay.
-function comparable(p        , windows         , gitBash         )         {
-  if (!windows) return p.trim().replace(/\/+$/, '')
-  const s = p.trim().replace(/\\/g, '/').replace(/\/+$/, '')
-  return (gitBash ? nativePath(s) : s).toLowerCase()
+/**
+ * How a tool spells paths. `posix`: Linux, macOS and WSL, where a `\` is part of a file name and case
+ * counts. `windows`: PowerShell, where `\` and `/` are the same, case is ignored, and `/c/...` is a folder
+ * `c` on the current drive. `windows-msys`: the same, except that `/c/...` is drive C. That is Git Bash,
+ * and the edit tools on Windows: checked on 2026-11-14, when Write, Edit and NotebookEdit each put a
+ * `/c/Users/...` path on drive C. Stored keys, temp folders and the session's folder are native
+ * (`nativeSpelling`).
+ */
+                                                           
+
+/** How a native path (a stored key, a temp folder, the session's folder) is read here: never `/c/` as a drive. */
+export const nativeSpelling = (windows         )           => (windows ? 'windows' : 'posix')
+
+/** Whether a spelling is one of Windows'. */
+export const windowsSpelling = (s          )          => s === 'windows' || s === 'windows-msys'
+
+/** How one tool reads paths here: its spelling, and whether its `/tmp` is the Unix temp folder. */
+                                                                                   
+
+/** The tool that named a path: a Bash command, a PowerShell command, or an edit tool (Edit, Write, ...). */
+                                                   
+
+/**
+ * How `writer` reads paths on this machine (see `Spelling`), and whether its `/tmp` is the Unix temp
+ * folder: always off Windows; on Windows only in Git Bash. PowerShell and the edit tools read it as `\tmp`
+ * on the current drive: so the edit tools read `/c/...` as Git Bash does but `/tmp` as Windows does (the
+ * Write tool did both on 2026-11-14). Both rules come from here, so the scratch check and the path
+ * matching never read one path two ways.
+ */
+export function rulesFor(writer        , windows         )            {
+  if (!windows) return { spelling: 'posix', posixTmp: true }
+  return writer === 'powershell' ? { spelling: 'windows', posixTmp: false } : { spelling: 'windows-msys', posixTmp: writer === 'bash' }
+}
+
+// A path as one comparable string: no trailing slash, and on Windows forward slashes, `/c/` as `C:/` (in
+// `windows-msys` only, by `nativePath`) and lower case. Elsewhere a `\` is part of a file name and case
+// counts, so they stay.
+function comparable(p        , spelling          )         {
+  if (spelling === 'posix') return p.trim().replace(/\/+$/, '')
+  // `/c/` before `\` is folded: `\c\...` is a folder `c` on the current drive, as Windows reads it.
+  const t = p.trim()
+  return (spelling === 'windows-msys' ? nativePath(t) : t).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 }
 
 /**
- * Whether a path is in one of Claude's own scratch folders: a `claude` or `claude-<number>` folder right inside
- * a temp folder (`tempDirs`, the machine's TEMP, TMP and TMPDIR, plus /tmp and /var/tmp when `posixTmp`:
- * on Windows that is Git Bash only, as PowerShell and the edit tools read /tmp as C:\tmp). That is where the session's scratchpad and task output live,
- * and code there is throwaway, so it is never sent for review. Anything else in a temp folder, such as a
- * repo cloned to /tmp, still is. A path with a `..`, and a temp folder that is not absolute or is a drive
- * root or `/`, never count.
+ * Whether a path is in one of Claude's own scratch folders: a `claude` or `claude-<number>` folder right
+ * inside a temp folder (`tempDirs`, the machine's TEMP, TMP and TMPDIR, plus /tmp and /var/tmp when
+ * `rules.posixTmp`). That is where the session's scratchpad and task output live, and code there is
+ * throwaway, so it is never sent for review. Anything else in a temp folder, such as a repo cloned to
+ * /tmp, still is. A path with a `..`, and a temp folder that is not absolute or is a drive root or `/`,
+ * never count. `rules` is how the tool that wrote the path reads it (`rulesFor`).
  */
-export function inScratch(path        , tempDirs                   , windows         , posixTmp         )          {
-  // On Windows `posixTmp` is true only for Git Bash, whose `/c/...` is drive C. The temp folders come
-  // from the environment as native paths, so their `/c/` is never read as a drive.
-  const p = comparable(path, windows, posixTmp)
+export function inScratch(path        , tempDirs                   , rules           )          {
+  const windows = windowsSpelling(rules.spelling)
+  const p = comparable(path, rules.spelling)
   if (p.split('/').includes('..')) return false
-  const roots = [...tempDirs, ...(posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, windows, false))
+  // The temp folders come from the environment as native paths, so their `/c/` is never read as a drive.
+  const roots = [...tempDirs, ...(rules.posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, nativeSpelling(windows)))
   const claude = windows ? /^claude(?:-\d+)?\/./i : /^claude(?:-\d+)?\/./
   return roots.some(r => /^(?:[a-z]:)?\/[^/]/i.test(r) && p.startsWith(`${r}/`) && claude.test(p.slice(r.length + 1)))
 }
@@ -1188,7 +1229,7 @@ export function runOnlyScripts(command        , paths       , powershell = false
     if (!e || /[$`%*?~]/.test(e)) return undefined
     if (!paths.windows) return e // a `\` is part of a file name there
     const f = e.replace(/\\/g, '/')
-    return powershell ? f : nativePath(f) // in PowerShell `/c/...` is a folder `c`, not drive C
+    return powershell ? f : nativePath(f) // Git Bash's `/c/...` is drive C, PowerShell's a folder `c` (`rulesFor`)
   }
   const absolute = (p        ) => (paths.windows ? /^[A-Za-z]:\// : /^\//).test(p)
   // The programs, after `sudo`, `env` and VAR=value.

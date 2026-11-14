@@ -6,6 +6,7 @@ import {
   type Finding,
   type GitAction,
   githubRepo,
+  type Paths,
   scanDiff,
   scanFile,
   scanLine,
@@ -44,11 +45,14 @@ export type Host = {
 }
 
 /**
- * The home folder from USERPROFILE (Windows) or HOME: forward slashes, no trailing slash, and undefined
- * for a value that is empty or blank. Both hosts use this, so they agree.
+ * The home folder: USERPROFILE first on Windows, HOME first elsewhere (Linux and WSL may have a
+ * USERPROFILE passed in from Windows), the other when the first is missing or blank. Forward slashes, no
+ * trailing slash, and undefined when neither is set. Both hosts use this; they agree as long as they
+ * agree on whether this is Windows (the hooks tell it from the environment, the MCP server from Node).
  */
-export function homeFrom(userProfile: string | undefined, home: string | undefined): string | undefined {
-  const value = [userProfile, home].find(v => v !== undefined && v.trim() !== '')
+export function homeFrom(paths: Pick<Paths, 'windows' | 'home' | 'userProfile'>): string | undefined {
+  const { windows, home, userProfile } = paths
+  const value = (windows ? [userProfile, home] : [home, userProfile]).find(v => v !== undefined && v.trim() !== '')
   return value?.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
 }
 
@@ -175,7 +179,7 @@ const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues'] as const
  */
 export async function loadConfig(host: Host): Promise<{ config: Config; note?: string }> {
   const empty: Config = { personal: [], allowNetworkInfo: [], allowValues: [] }
-  const note = 'personal details were NOT checked (no ~/.claude/review-guard.json)'
+  const note = 'personal details were NOT checked (no ~/.claude/review-guard.json; ~ is USERPROFILE on Windows and HOME elsewhere, or the other when that one is not set)'
   const path = await configPath(host)
   if (!path) return { config: empty, note: 'personal details were NOT checked (the home folder is not known)' }
   let text: string

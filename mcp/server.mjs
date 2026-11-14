@@ -86,12 +86,25 @@ async function loadCheck() {
  * load), the same rules written out here, so even that error is masked.
  */
 function homeHere() {
-  if (check) return check.outgoing.homeFrom(process.env.USERPROFILE, process.env.HOME)
-  const value = [process.env.USERPROFILE, process.env.HOME].find(v => v !== undefined && v.trim() !== '')
+  // Node knows; the hooks tell it from the environment (`isWindows`), which gives the same answer on a
+  // normal Windows, Linux or WSL setup.
+  const windows = process.platform === 'win32'
+  if (check) return check.outgoing.homeFrom({ windows, home: process.env.HOME, userProfile: process.env.USERPROFILE })
+  const order = windows ? [process.env.USERPROFILE, process.env.HOME] : [process.env.HOME, process.env.USERPROFILE]
+  const value = order.find(v => v !== undefined && v.trim() !== '')
   return value?.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
 }
 
 const host = { run, read, exists, home: async () => homeHere(), pluginRoot: ROOT }
+
+/**
+ * Every home folder spelling there is (the one in use, USERPROFILE and HOME), so a mask hides each: on
+ * WSL the home is HOME, and a USERPROFILE passed in from Windows names the user too.
+ */
+function homesHere() {
+  const plain = v => (v === undefined || v.trim() === '' ? undefined : v.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, ''))
+  return [...new Set([homeHere(), plain(process.env.USERPROFILE), plain(process.env.HOME)].filter(Boolean))]
+}
 
 // --- what the tools print -------------------------------------------------------------------------
 
@@ -112,10 +125,11 @@ const fold = text => text.split('').map(c => {
  * folder matches in each way it is written (C:/Users/x, C:\Users\x, JSON's C:\\Users\\x, Git Bash's
  * /c/Users/x), and only whole: C:/Users/xy is another folder.
  */
-function masker(home, personal = []) {
+function masker(homes, personal = []) {
   const rules = []
-  if (home) {
+  for (const home of homes) {
     const forward = home.replace(/\\/g, '/')
+    if (/^(?:[A-Za-z]:|\/[A-Za-z])?\/?$/.test(forward)) continue // a bare root or drive names nobody, and would mask every path on it
     const spellings = [forward, forward.replace(/\//g, '\\'), forward.replace(/\//g, '\\\\')]
     if (/^[A-Za-z]:\//.test(forward)) spellings.push(`/${forward[0].toLowerCase()}${forward.slice(2)}`)
     for (const s of new Set(spellings)) rules.push({ needle: fold(s), to: '~', whole: true })
@@ -203,7 +217,7 @@ async function checkOutgoing({ repo, what = 'both', message, includeUnstaged = f
   if (!['commit', 'push', 'both'].includes(what)) throw new Error('what: one of "commit", "push" or "both"')
   if (typeof includeUnstaged !== 'boolean') throw new Error('includeUnstaged: true or false')
   const { config, note } = await outgoing.loadConfig(host)
-  const mask = masker(await host.home(), config.personal)
+  const mask = masker(homesHere(), config.personal)
   const notes = note ? [note] : []
   const remotes = await outgoing.githubRemotes(host, dir)
   const commits = what !== 'push'
@@ -246,7 +260,7 @@ async function checkText({ text, label }) {
   const where = textArg(label, 'label', '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'the text'
   const { scan, outgoing } = await loadCheck()
   const { config, note } = await outgoing.loadConfig(host)
-  const mask = masker(await host.home(), config.personal)
+  const mask = masker(homesHere(), config.personal)
   const notes = note ? [note] : []
   const found = [
     ...scan.scanValue(text, where, config.personal),
@@ -271,7 +285,7 @@ async function reviewStatus() {
     r => ({ personal: r.config.personal }),
     err => ({ personal: [], unmasked: `Personal terms are NOT masked below: ~/.claude/review-guard.json could not be used (${messageOf(err)}).` }),
   )
-  const mask = text => masker(home, personal)(unmasked ? `${unmasked}\n${text}` : text)
+  const mask = text => masker(homesHere(), personal)(unmasked ? `${unmasked}\n${text}` : text)
   const dir = status.statusDir(home)
   let names
   try {
@@ -372,7 +386,7 @@ const messageOf = err => (err instanceof Error ? err.message : String(err))
 /** Masks an error message as the results are masked, as far as the config can be read. */
 async function maskError(text) {
   const personal = check ? await check.outgoing.loadConfig(host).then(r => r.config.personal, () => []) : []
-  return masker(homeHere(), personal)(text)
+  return masker(homesHere(), personal)(text)
 }
 
 async function handle(msg) {

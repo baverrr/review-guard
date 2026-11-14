@@ -60,9 +60,9 @@ function fakeGitleaks(home, kind) {
  * answer (rejecting if the server exits first), `raw` sends a line as it is, and `exit` resolves with the
  * exit code.
  */
-function server(home, root = ROOT) {
+function server(home, root = ROOT, env = {}) {
   const child = spawn(process.execPath, [join(root, 'mcp', 'server.mjs')], {
-    env: { ...process.env, HOME: home, USERPROFILE: WINDOWS ? home : '', PATH, Path: PATH },
+    env: { ...process.env, HOME: home, USERPROFILE: WINDOWS ? home : '', PATH, Path: PATH, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   const lines = []
@@ -441,6 +441,36 @@ function modCopy() {
   for (const part of ['mcp', 'hooks', 'scripts', '.claude-plugin']) cpSync(join(ROOT, part), join(root, part), { recursive: true })
   return root
 }
+
+test('the home folder is USERPROFILE on Windows and HOME elsewhere, and both are masked', async () => {
+  const fromHome = fakeHome({ status: { h: status('h') } })
+  const fromProfile = fakeHome({ status: { u: status('u') } })
+  for (const [h, u] of [[fromHome, 'h'], [fromProfile, 'u']]) {
+    writeFileSync(join(h, '.claude', 'review-guard', 'status', `${u}.json`), JSON.stringify(status(u, { folder: `${fromHome}/a and ${fromProfile}/b` })))
+  }
+  const s = server(fromHome, ROOT, { HOME: fromHome, USERPROFILE: fromProfile })
+  try {
+    const t = text(await s.tool('review_status', {}))
+    assert.match(t, WINDOWS ? /Session u / : /Session h /) // the status folder under the home in use
+    assert.ok(!t.includes(WINDOWS ? 'Session h ' : 'Session u '))
+    for (const h of [fromHome, fromProfile]) assert.ok(!t.includes(h) && !t.includes(h.replace(/\\/g, '/')), 'a home folder showed')
+  } finally {
+    s.stop()
+  }
+})
+
+test('a home folder that is a bare root or drive masks nothing', async () => {
+  const home = fakeHome({ status: { r: status('r', { folder: 'C:/proj/x and /c/proj/z and /proj/y' }) } })
+  // The home in use is a real folder; the other one is a bare drive, which names nobody.
+  for (const bare of ['C:/', '/c/']) {
+    const s = server(home, ROOT, WINDOWS ? { USERPROFILE: home, HOME: bare } : { HOME: home, USERPROFILE: bare })
+    try {
+      assert.match(text(await s.tool('review_status', {})), /in C:\/proj\/x and \/c\/proj\/z and \/proj\/y,/, bare) // nothing masked
+    } finally {
+      s.stop()
+    }
+  }
+})
 
 test('a built copy that does not match hooks/*.ts is refused, not run', async () => {
   for (const [file, change, why] of [
