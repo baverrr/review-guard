@@ -1,4 +1,4 @@
-// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 62433319648a8aec6df06ed69a2202d7571fbfdf6823cddd0baeb2fe7e841e01 built-sha256: 6e4237c29a4876f51f6a90df3fbec82dd0bb9886cac40eddef47b44618b1f743
+// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: f3e863b57396159c1e9dde6643f32826bfb70a6acd616b367019d48891c5f013 built-sha256: 06451b7f9f49396978ae5af2983c5915921c149418867c384e4c1c69b79800c5
 // review-guard's check of what leaves this machine: what a git commit or push would send, and the
 // user's config of personal terms. It runs git and gitleaks through `Host`, so the hooks (through the
 // engine's `$`) and the MCP server (through Node) run the same code.
@@ -110,11 +110,28 @@ function locate(host      , tool         )                   {
   return found
 }
 
-/** The review scanners that run here, a scanner to its program. Never throws. */
-export async function findScanners(host      )                                {
+/**
+ * The review scanners that run here (`found`, a scanner to its program), and why each one that is there
+ * would not run or could not be looked for (`problems`), so none of those is called "not installed".
+ * Never throws.
+ */
+export async function findScanners(host      )                                                                           {
   const tools = SCANNERS.filter(t => t !== 'gitleaks')
-  const found = await Promise.all(tools.map(t => locate(host, t).catch(()          => ({}))))
-  return new Map(tools.flatMap((t, i) => (found[i]?.exe ? [[t, found[i].exe]         ] : [])))
+  const results = await Promise.all(tools.map(t => locate(host, t).catch((err)          => ({
+    broken: `looking for it failed: ${err instanceof Error ? err.message : String(err)}`,
+  }))))
+  // Without the home folder the usual places were never searched, so "not installed" is not known.
+  // (Only here, for the review: gitleaks' own lookup keeps saying "not installed" with its note.)
+  const homeKnown = (await host.home().catch(() => undefined)) !== undefined
+  const found = new Map                 ()
+  const problems = new Map                 ()
+  tools.forEach((t, i) => {
+    const l = results[i]
+    if (l?.exe) found.set(t, l.exe)
+    else if (l?.broken) problems.set(t, l.broken)
+    else if (!homeKnown) problems.set(t, 'the home folder is not known, so only PATH was searched')
+  })
+  return { found, problems }
 }
 
 /**

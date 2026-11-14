@@ -102,18 +102,27 @@ const PURPOSE: Record<ReviewScanner, string> = {
 
 /**
  * The review prompt's scanner lines: one ready-to-run command per scanner that suits the changed files
- * and is installed (`found` maps a scanner to its program), then one line naming the suitable ones that
- * are not installed, so a skipped scanner is never silent.
+ * and is installed (`found` maps a scanner to its program), then a line naming the suitable ones that
+ * would not run or could not be looked for, each with why (`problems`), and one naming those that are not
+ * installed, so a skipped scanner is never silent and never called missing when it is there.
  */
-export function scannerSteps(changed: ReadonlyMap<string, string>, found: ReadonlyMap<Scanner, string>): string[] {
+export function scannerSteps(
+  changed: ReadonlyMap<string, string>,
+  found: ReadonlyMap<Scanner, string>,
+  problems: ReadonlyMap<Scanner, string> = new Map(),
+): string[] {
   const lines: string[] = []
   const missing: string[] = []
+  const broken: string[] = []
   for (const [tool, files] of scannersFor(changed)) {
     const exe = found.get(tool)
+    const why = problems.get(tool)
     if (exe) lines.push(`   - ${tool} (${PURPOSE[tool]}): ${scannerCommand(tool, exe, files)}`)
+    else if (why) broken.push(`${tool} (${why.replace(/\s+/g, ' ').trim().slice(0, 200)})`)
     else missing.push(tool)
   }
-  if (missing.length > 0) lines.push(`   - Not installed here (or would not run), so skipped (say so in your summary): ${missing.join(', ')}`)
+  if (broken.length > 0) lines.push(`   - There but would not run, or could not be checked, so skipped (say so in your summary): ${broken.join('; ')}`)
+  if (missing.length > 0) lines.push(`   - Not installed here, so skipped (say so in your summary): ${missing.join(', ')}`)
   return lines
 }
 

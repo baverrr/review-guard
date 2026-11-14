@@ -1,10 +1,16 @@
 {
   "name": "review-guard",
-  "version": "0.3.2",
-  "description": "After code changes, sends Claude to review them with review agents, a per-language security review and the scanners you have, and to act on every finding, low ones included. Stops git commits, pushes and GitHub writes that would send keys, tokens, MAC or IP addresses, or your personal details (with gitleaks when installed). Under Connectors, its tools check a push or any text on request and list what waits for review.",
+  "version": "0.3.3",
+  "description": "After code changes, sends Claude to review them with review agents, a per-language security review and the scanners you have, and to fix every real finding, low ones and old ones in the changed files included. Stops git commits, pushes and GitHub writes that would send keys, tokens, MAC or IP addresses, or your personal details (with gitleaks when installed). Under Connectors, its tools check a push or any text on request and list what waits for review.",
   "author": {
     "name": "baverrr"
   },
   "license": "MIT",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "mcpServers": {
+    "review-guard": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"]
+    }
+  }
 }

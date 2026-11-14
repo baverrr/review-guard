@@ -1,4 +1,4 @@
-// Generated from hooks/scanners.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: b6094b65f9841c71ad272f91a8687268afde06825702eaffdb8b34cd30a7f84b built-sha256: bcaa4f2c68d7fbfdc5b51b36594d41973aa43f54d8437c4732d63ce128b2e6f8
+// Generated from hooks/scanners.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: ddfabed3d209a77205925b6d4d100a986811ba4ac44aeedc7a0a2fb14796715b built-sha256: b15bccc6ed7b2b0e300f03d1da37d556c82efa4eba275defc88883a69c352ca3
 // review-guard's outside scanners: gitleaks, bandit, semgrep, zizmor and trivy. Pure functions over
 // text and paths, like scan.ts; outgoing.ts finds the programs and runs gitleaks, and the review gives
 // Claude the commands for the rest.
@@ -103,18 +103,27 @@ const PURPOSE                                = {
 
 /**
  * The review prompt's scanner lines: one ready-to-run command per scanner that suits the changed files
- * and is installed (`found` maps a scanner to its program), then one line naming the suitable ones that
- * are not installed, so a skipped scanner is never silent.
+ * and is installed (`found` maps a scanner to its program), then a line naming the suitable ones that
+ * would not run or could not be looked for, each with why (`problems`), and one naming those that are not
+ * installed, so a skipped scanner is never silent and never called missing when it is there.
  */
-export function scannerSteps(changed                             , found                              )           {
+export function scannerSteps(
+  changed                             ,
+  found                              ,
+  problems                               = new Map(),
+)           {
   const lines           = []
   const missing           = []
+  const broken           = []
   for (const [tool, files] of scannersFor(changed)) {
     const exe = found.get(tool)
+    const why = problems.get(tool)
     if (exe) lines.push(`   - ${tool} (${PURPOSE[tool]}): ${scannerCommand(tool, exe, files)}`)
+    else if (why) broken.push(`${tool} (${why.replace(/\s+/g, ' ').trim().slice(0, 200)})`)
     else missing.push(tool)
   }
-  if (missing.length > 0) lines.push(`   - Not installed here (or would not run), so skipped (say so in your summary): ${missing.join(', ')}`)
+  if (broken.length > 0) lines.push(`   - There but would not run, or could not be checked, so skipped (say so in your summary): ${broken.join('; ')}`)
+  if (missing.length > 0) lines.push(`   - Not installed here, so skipped (say so in your summary): ${missing.join(', ')}`)
   return lines
 }
 

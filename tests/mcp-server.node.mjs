@@ -504,3 +504,18 @@ test('the host runs like the engine: a timeout rejects, output is cut cleanly pe
   assert.equal(echo.stdout, 'envin')
   await assert.rejects(run(['rg-no-such-program-here'], {}))
 })
+
+// hooks/agents.ts is edited by hand alongside agents/*.md, so check the two still say the same thing.
+test('each agent prompt in hooks/agents.ts matches its agents/*.md file', () => {
+  const ts = readFileSync(join(ROOT, 'hooks', 'agents.ts'), 'utf8')
+  const entries = [...ts.matchAll(/name: ("[^"]+"),\s*description: ("(?:[^"\\]|\\.)*"),\s*model: ("[^"]+"),\s*prompt: ("(?:[^"\\]|\\.)*")/g)]
+  assert.equal(entries.length, 5)
+  for (const [, name, description, model, prompt] of entries) {
+    const md = readFileSync(join(ROOT, 'agents', `${JSON.parse(name)}.md`), 'utf8').replace(/\r\n/g, '\n')
+    const [, front, body] = md.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/) ?? []
+    assert.ok(body !== undefined, `${JSON.parse(name)}.md has no frontmatter`)
+    assert.equal(JSON.parse(prompt).trim(), body.trim(), `${JSON.parse(name)}: prompt differs from the .md body`)
+    assert.ok(front.includes(`description: ${JSON.parse(description)}`), `${JSON.parse(name)}: description differs`)
+    assert.ok(front.includes(`model: ${JSON.parse(model)}`), `${JSON.parse(name)}: model differs`)
+  }
+})

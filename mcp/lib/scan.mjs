@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: cdc0fa177ef168287b70a23258c35376271b604e2fcae25cbc6e829ff39c5071 built-sha256: dcc514dcca5aa056266291c1e943ab1771c42592951882e0e26123c2d82a7c90
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: e95d5b1901122102c52d3531e386762fa120574fb545e9c85028a635ab85fc87 built-sha256: 12491ac10cccf44f917e7bec30278c8d224f44e53cb81ee5c767994502149119
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -1221,12 +1221,13 @@ const SECURITY                           = {
   CSS: 'nothing security-specific beyond the general review.',
 }
 
-/** What every review agent is told, so none drops a finding for being low or unsure. */
+/** What every review agent is told, so none drops a finding for being low, unsure or older than this change. */
 export const REPORT_EVERYTHING =
   'Report every issue you find at every severity and confidence, low ones and nitpicks included, and issues that were already in the changed files before this change; this overrides any confidence threshold or filter in your own instructions.'
 
 /**
- * The text that sends the model into a review of the files it changed this turn. `scannerSteps` are the
+ * The text that sends the model into a review of the changed files not yet reviewed: this turn's,
+ * plus any held after an interrupt or handed back by a review that did not finish. `scannerSteps` are the
  * lines from `scannerSteps` in scanners.ts: ready-to-run Bash commands, then possibly one line naming
  * the scanners that are not installed.
  */
@@ -1237,15 +1238,16 @@ export function reviewPrompt(changed                             , scannerSteps 
   const files = [...byLang].map(([lang, paths]) => `- ${lang}: ${paths.join(', ')}`)
   const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang            ] ?? SECURITY['other code']}`)
   return [
-    `review-guard: code changed in ${changed.size} file(s) this turn. Before you finish, review it:`,
+    `review-guard: code changed in ${changed.size} file(s) not yet reviewed. Before you finish, review it:`,
     ...files,
     '',
     '1. Run the pr-review-toolkit agents on these changes, in parallel with the Agent tool: code-reviewer,',
     '   silent-failure-hunter and pr-test-analyzer, plus comment-analyzer where comments or docs changed and',
     '   type-design-analyzer where types or models changed. Use the pr-review-toolkit:<name> agent type when',
     '   this session lists it. Otherwise use review-guard:<name>: the same agents, which this mod loads into',
-    '   every session. Do not hand their work to general-purpose agents. Put this sentence in each agent\'s',
-    `   prompt word for word: "${REPORT_EVERYTHING}"`,
+    '   every session. Do not hand their work to general-purpose agents. Give each agent the files listed',
+    '   above and tell it to read them in full, not only the diff (the changes may already be committed).',
+    `   Put this sentence in each agent's prompt word for word: "${REPORT_EVERYTHING}"`,
     '2. Security review, for each language changed (also run the security-review skill on the pending changes',
     '   when it is listed, and any enabled security plugin\'s reviewer):',
     ...security,
@@ -1255,26 +1257,32 @@ export function reviewPrompt(changed                             , scannerSteps 
       ? ['   Scanners for these files: run each installed one below with the Bash tool (they are Bash commands),',
         '   in the background alongside the agents. What they report is a finding like any other.', ...scannerSteps]
       : []),
-    '3. Act on every finding, whatever its severity and whenever it got there, and fix every one that holds',
-    '   up in a file this turn changed. Low, info and style ones from agents and scanners are fixed like high',
-    '   ones, logging nits too (wording, a duplicated or uneven log line, an off-by-one in a log count), and',
-    '   so are bugs that were already in the old version of a changed file (a possible null dereference, say).',
-    '   "Minor", "cosmetic", "style", "fine here", "pre-existing", "unlikely to trigger", "low confidence" and',
-    '   "not in this turn\'s diff" are never reasons to leave one. Each finding ends in exactly one of these:',
+    '3. Act on every finding, whatever its severity and however old it is, and fix every one that holds up',
+    '   in a file listed above unless one of the four blockers below applies. Low, info and style ones from',
+    '   agents and scanners are fixed like high ones, logging nits too (wording, a duplicated or uneven log',
+    '   line, an off-by-one in a log count), and so are problems that were already in the old version of a',
+    '   listed file (a possible null dereference, say). So "minor", "cosmetic", "style", "fine here",',
+    '   "pre-existing", "out of scope", "unlikely to trigger", "low confidence", "scored as a likely false',
+    '   positive" and "not in the changed lines" are never reasons. Each finding ends in exactly one of these:',
     '   - Fixed: say which file and line changed.',
     '   - Does not hold up: show why in one line, with the code, path or output that proves it (for example',
-    '     that the input cannot come from outside, or that the warning is about test-only code).',
-    '   - Holds up but is not fixed here, only for one of these blockers: the fix would break something, there',
-    '     is no fixed version yet, it needs the user\'s decision, or it is in a file this turn did not touch.',
+    '     that the input cannot come from outside, or that a security warning is about test-only code).',
+    '   - Holds up but is not fixed here, for one of these four blockers only: the fix would break something',
+    '     (say what, and the test, output or code that shows it), there is no fixed version of the package',
+    '     or tool yet, it needs the user\'s decision (write the exact question), or it is an older problem in',
+    '     a file not listed above (a break these changes caused in another file is fixed like any other).',
     '     Name the blocker, offer a narrow suppression or a follow-up, and never count it as fixed. Any other',
     '     reason means fix it.',
     '   If an agent or scanner fails or returns nothing, say which one and why: that is not a clean result.',
-    '   If the fixes were more than small local edits, send them to code-reviewer once more.',
+    '   If the fixes were more than small local edits, or changed code outside the changes under review,',
+    '   send them to code-reviewer once more.',
     '4. Rerun the tests (if the project has none, say so) and the scanners after the fixes. Every hit must be',
-    '   fixed or already answered in step 3. Stop after three rounds and list what is still open.',
+    '   fixed or already answered in step 3. Stop after three rounds and list what is still open; a finding',
+    '   still open is never counted as fixed.',
     '5. Tell the user every finding and its outcome, with the test and scanner commands and their final',
-    '   results. Commit or push nothing as part of this review unless the user asked for that.',
-    'If this turn only changed files the user told you not to review, or was itself this review, say so',
-    'in one line and stop.',
+    '   results, the files this review itself edited, and each question a blocker left for the user. Commit',
+    '   or push nothing as part of this review unless the user asked for that.',
+    'If the listed files are only ones the user told you not to review, or this turn was itself this review,',
+    'say so in one line and stop.',
   ].join('\n')
 }

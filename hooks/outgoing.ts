@@ -109,11 +109,28 @@ function locate(host: Host, tool: Scanner): Promise<Located> {
   return found
 }
 
-/** The review scanners that run here, a scanner to its program. Never throws. */
-export async function findScanners(host: Host): Promise<Map<Scanner, string>> {
+/**
+ * The review scanners that run here (`found`, a scanner to its program), and why each one that is there
+ * would not run or could not be looked for (`problems`), so none of those is called "not installed".
+ * Never throws.
+ */
+export async function findScanners(host: Host): Promise<{ found: Map<Scanner, string>; problems: Map<Scanner, string> }> {
   const tools = SCANNERS.filter(t => t !== 'gitleaks')
-  const found = await Promise.all(tools.map(t => locate(host, t).catch((): Located => ({}))))
-  return new Map(tools.flatMap((t, i) => (found[i]?.exe ? [[t, found[i].exe] as const] : [])))
+  const results = await Promise.all(tools.map(t => locate(host, t).catch((err): Located => ({
+    broken: `looking for it failed: ${err instanceof Error ? err.message : String(err)}`,
+  }))))
+  // Without the home folder the usual places were never searched, so "not installed" is not known.
+  // (Only here, for the review: gitleaks' own lookup keeps saying "not installed" with its note.)
+  const homeKnown = (await host.home().catch(() => undefined)) !== undefined
+  const found = new Map<Scanner, string>()
+  const problems = new Map<Scanner, string>()
+  tools.forEach((t, i) => {
+    const l = results[i]
+    if (l?.exe) found.set(t, l.exe)
+    else if (l?.broken) problems.set(t, l.broken)
+    else if (!homeKnown) problems.set(t, 'the home folder is not known, so only PATH was searched')
+  })
+  return { found, problems }
 }
 
 /**

@@ -21,7 +21,7 @@ import {
   settle,
   shellWrites,
 } from './scan.ts'
-import { type Scanner, scannerSteps } from './scanners.ts'
+import { scannerSteps } from './scanners.ts'
 import { type Config, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
 import { type LeftOut, type StatusFile, statusDir, statusFileName } from './status.ts'
 
@@ -69,20 +69,43 @@ export function cycleFrom(value: unknown): Cycle {
   return { reviewing: v.reviewing === true, held: v.held === true, changed: files(v.changed), underReview: files(v.underReview) }
 }
 
-/** Reads the copy back after a reload; every hook waits for it before using the cycle. */
+let readBack = false // the stored copy has been read back (or there was none): saving it is safe
+let readFailSaid = false // a failed read back is said once, not on every hook that retries it
+let changedUnread = false // the cycle was changed in memory while the stored copy could not be read
+
+/**
+ * Reads the copy back after a reload; every hook waits for it before using the cycle. A read that fails
+ * is tried again by the next hook, and until one works nothing is saved, so the stored review is never
+ * written over with an empty one. If this load changed the cycle meanwhile, what it decided (a review
+ * running or over, a hold) stands, and every file the stored copy still had waiting or under review is
+ * queued again: more review, never less.
+ */
 function ensureLoaded($: EngineInterface): Promise<void> {
   loaded ??= $.state.get(CYCLE).then(
-    ({ value }) => { cycle = cycleFrom(value) },
-    () => { $.ui.status('review-guard: could not read back its review state; a review running before the reload may be asked for again') },
+    ({ value }) => {
+      const stored = cycleFrom(value)
+      cycle = changedUnread
+        ? { ...cycle, changed: { ...stored.underReview, ...stored.changed, ...cycle.changed }, underReview: { ...cycle.underReview } }
+        : stored
+      readBack = true
+      if (readFailSaid) say($, 'review-guard: read back its review state after all; nothing waiting for review was lost')
+    },
+    err => {
+      loaded = undefined
+      if (readFailSaid) return
+      readFailSaid = true
+      say($, `review-guard: could not read back its review state (${whyOf(err)}); it tries again at the next step, and a review running before the reload may be asked for again`)
+    },
   )
   return loaded
 }
 
 /** Copies the cycle as it stands when the write runs, after any earlier write; says so if it fails. */
 function save($: EngineInterface): Promise<void> {
+  if (!readBack) return saving
   saving = saving.then(() => $.state.set(CYCLE, copyOf(cycle))).then(
     () => undefined,
-    () => { $.ui.status('review-guard: could not save its review state; if the mod reloads now, a running review may be asked for again') },
+    err => say($, `review-guard: could not save its review state (${whyOf(err)}); if the mod reloads now, a running review may be asked for again`),
   )
   return saving
 }
@@ -91,6 +114,7 @@ function save($: EngineInterface): Promise<void> {
 async function updateCycle<T>($: EngineInterface, change: (c: Cycle) => T): Promise<T> {
   await ensureLoaded($)
   const result = change(cycle)
+  if (!readBack) changedUnread = true
   await save($)
   await writeStatus($)
   return result
@@ -144,7 +168,7 @@ function writeStatus($: EngineInterface, ended = false): Promise<void> {
       statusFailed = undefined
     } catch (err) {
       const first = statusFailed === undefined
-      statusFailed = err instanceof Error ? err.message.slice(0, 200) : String(err)
+      statusFailed = whyOf(err)
       if (first) {
         // In the log, not on the status line: that line may hold a guard notice that must stay seen.
         try {
@@ -160,6 +184,58 @@ function writeStatus($: EngineInterface, ended = false): Promise<void> {
 // treats undefined as "not known", which keeps a file in the review. An environment read names its
 // variable as a literal, as the engine asks.
 const safely = <T>(read: () => Promise<T | undefined>): Promise<T | undefined> => Promise.resolve().then(read).catch(() => undefined)
+
+/**
+ * A failure's message on one line, short enough for the status line: an Error's message, the engine's
+ * HookFailure (`message`, else its `kind`, such as "timeout"), or the thrown value as text.
+ */
+export function whyOf(err: unknown): string {
+  let text: string
+  try {
+    if (err instanceof Error) text = err.message
+    else if (typeof err === 'object' && err !== null) {
+      const { message, kind } = err as { message?: unknown; kind?: unknown }
+      text = typeof message === 'string' && message.trim() ? message : typeof kind === 'string' ? kind : JSON.stringify(err) ?? ''
+    } else text = err === undefined ? '' : String(err)
+  } catch {
+    text = 'a failure that could not be put into words' // a circular object, a BigInt, a getter that throws
+  }
+  // Cut by characters, not code units, so a cut never splits one in two.
+  return Array.from(text.replace(/\s+/g, ' ').trim()).slice(0, 200).join('') || 'no message'
+}
+
+/**
+ * Says that review-guard's own end-of-turn check failed. The queue is changed only after the review
+ * prompt is built, and the hook leaves it alone once its dispatch is over, so any queued files wait for
+ * the next turn that ends. `failure` is anything thrown.
+ */
+export function reviewFailed($: EngineInterface, failure: unknown): void {
+  hookFailed($, 'its end-of-turn check failed', failure, 'any changed files stay queued for the next turn that ends')
+}
+
+/** Says that one of the mod's hooks failed, why, and what to do about it. */
+function hookFailed($: EngineInterface, what: string, failure: unknown, advice: string): void {
+  say($, `review-guard: ${what} (${whyOf(failure)}); ${advice}`)
+}
+
+/**
+ * Puts a line on the status line. A failure to show it never stops anything: the line goes to the log
+ * instead, so it still leaves a trace. (`ui.status` is typed to return nothing; a promise from it is
+ * handled all the same.)
+ */
+export function say($: EngineInterface, text: string): void {
+  const toLog = () => {
+    try {
+      $.ui.log(text)
+    } catch { /* nowhere left to say it */ }
+  }
+  try {
+    const shown: unknown = $.ui.status(text)
+    if (typeof (shown as { then?: unknown } | undefined)?.then === 'function') (shown as PromiseLike<unknown>).then(undefined, toLog)
+  } catch {
+    toLog()
+  }
+}
 
 /** How paths are spelled here. Windows is told by USERPROFILE, which Windows always sets. */
 async function pathsHere($: EngineInterface): Promise<Paths> {
@@ -183,10 +259,8 @@ async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string
     ...(onlyRun.length ? [`only run ${onlyRun.join(', ')}`] : []),
   ]
   if (parts.length === 0) return
-  try {
-    // After a line the guard just put there (a security notice), so that line is never hidden.
-    $.ui.status(said ? `${said}. Not reviewed: ${parts.join('; ')}` : `review-guard: not reviewed (${parts.join('; ')})`)
-  } catch { /* the status line is best effort */ }
+  // After a line the guard just put there (a security notice), so that line is never hidden.
+  say($, said ? `${said}. Not reviewed: ${parts.join('; ')}` : `review-guard: not reviewed (${parts.join('; ')})`)
   const at = new Date().toISOString()
   leftOut.push(...scratch.map((path): LeftOut => ({ path, why: 'scratch', at })), ...onlyRun.map((path): LeftOut => ({ path, why: 'only run', at })))
   leftOut.splice(0, Math.max(0, leftOut.length - LEFT_OUT_KEPT))
@@ -332,11 +406,73 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
     }
   } catch (err) {
     // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.
-    try {
-      $.ui.status(`review-guard: could not record the files a shell command wrote (${err instanceof Error ? err.message : String(err)}); ask for a review by hand`)
-    } catch { /* the status line is best effort */ }
+    say($, `review-guard: could not record the files a shell command wrote (${whyOf(err)}); ask for a review by hand`)
   }
   return result
+}
+
+/**
+ * What the end of a turn asks for, once nothing beneath has blocked it. A dispatch that is already over
+ * (an interrupt, or the hook's time ran out) takes no files off the queue: the review prompt would
+ * never reach Claude.
+ */
+async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSignal): Promise<StopAsk> {
+  await ensureLoaded($)
+  if (signal.aborted) return undefined
+  // The scanners installed here, for the review's commands, and why any that is there would not run
+  // or could not be looked for: the prompt names those, never as "not installed".
+  const { found, problems } = await findScanners(hostOf($))
+  // If the agents cannot be listed, the review ends here rather than holding every later review back,
+  // and the status line says so: reports still to come then count as new work.
+  let listFailed: string | undefined
+  const listAgents = async (): Promise<readonly { status?: unknown }[]> => {
+    try {
+      const list: unknown = await $.agent.list()
+      if (!Array.isArray(list)) throw new Error('the agent list was not a list')
+      return list.filter((a): a is { status?: unknown } => typeof a === 'object' && a !== null)
+    } catch (err) {
+      listFailed = whyOf(err)
+      return []
+    }
+  }
+  const agents = cycle.reviewing ? await listAgents() : []
+  const busy = agents.some(a => typeof a.status === 'string' && BUSY.has(a.status))
+  if (signal.aborted) return undefined
+  if (listFailed !== undefined) {
+    say($, `review-guard: could not list the review agents (${listFailed}), so the review counts as over; fixes from reports still to come get a review of their own`)
+  }
+  const ask = await updateCycle($, (c): StopAsk => {
+    if (c.reviewing) {
+      // The review is over at the first stop with no agent still out. Until then the reviewers'
+      // reports come back as turns of this review. Its own fixes are not sent for another review.
+      if (!busy) {
+        c.reviewing = false
+        c.underReview = {}
+        c.changed = {}
+      }
+      return undefined
+    }
+    // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
+    const files = Object.keys(c.changed).length
+    if (c.held && files > 0) return { kind: 'held', files }
+    if (hookActive || files === 0) return undefined
+    const changed = new Map(Object.entries(c.changed))
+    const prompt = reviewPrompt(changed, scannerSteps(changed, found, problems))
+    c.underReview = c.changed
+    c.changed = {}
+    c.reviewing = true
+    return { kind: 'review', prompt }
+  })
+  if (ask?.kind === 'review' && signal.aborted) {
+    // The dispatch ended while the queue was being moved: put the files back, as no review was asked for.
+    await updateCycle($, c => {
+      for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
+      c.underReview = {}
+      c.reviewing = false
+    })
+    return undefined
+  }
+  return ask
 }
 
 export const register: Register = on => {
@@ -346,11 +482,19 @@ export const register: Register = on => {
   // does not, so they are registered here too, at each load: the same names, so nothing doubles.
   // The session's status file says it ended, so review_status doesn't show it as still running.
   on('session.end', async ($, e, next) => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    await Promise.race([writeStatus($, true), new Promise(done => { timer = setTimeout(done, 1000) })])
-    clearTimeout(timer)
+    // At most a second, on the engine's own clock. An exit never waits longer for the status file: if the
+    // clock itself fails, the exit goes ahead at once, and review_status may then show the session open.
+    await Promise.race([writeStatus($, true), $.clock.sleep(1000, { signal: next.signal }).catch(() => undefined)])
     return next(e)
-  }).catch(($, e, next) => next(e)) // an exit must never wait on or fail for the status file
+  }).catch(($, e, next) => {
+    // An exit must never wait on or fail for the status file; the log keeps a trace.
+    if (!next.called) {
+      try {
+        $.ui.log(`review-guard: could not mark this session as ended in its status file (${whyOf(next.error)})`)
+      } catch { /* nowhere left to say it */ }
+    }
+    return next(e)
+  })
 
   on('session.start', async ($, e, next) => {
     const failed: string[] = []
@@ -361,9 +505,13 @@ export const register: Register = on => {
         failed.push(agent.name)
       }
     }
-    if (failed.length > 0) $.ui.status(`review-guard: could not load its review agents (${failed.join(', ')}); a new session will have them`)
+    if (failed.length > 0) say($, `review-guard: could not load its review agents (${failed.join(', ')}); a new session will have them`)
     return next(e)
-  }).catch(($, e, next) => next(e)) // a session must start whether or not the agents load
+  }).catch(($, e, next) => {
+    // A session must start whether or not the agents load, but not quietly.
+    if (!next.called) hookFailed($, 'could not load its review agents', next.error, 'a new session will have them')
+    return next(e)
+  })
 
   // --- 1. remember the code a turn changes --------------------------------------------------
 
@@ -380,18 +528,32 @@ export const register: Register = on => {
       })
     }
     return next(e)
-  }).catch(($, e, next) => next(e)) // only keeps a flag: a failure must never stop a prompt
+  }).catch(($, e, next) => {
+    // Only keeps a flag: a failure must never stop a prompt. Said, because a review left running would
+    // count the edits for this request as its own fixes.
+    if (!next.called) {
+      hookFailed($, 'could not check whether this new request ends a running review', next.error,
+        'if one was running, the edits for this request may go unreviewed, so ask for a review by hand')
+    }
+    return next(e)
+  })
 
   on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit'] }, async ($, e, next) => {
     const result = await next(e)
-    if (result.deny === undefined && result.isError !== true) {
-      const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
-      const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
-      // The edit tools take a native path, so /tmp is the Unix temp folder only off Windows.
-      if (lang) await sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
+    // Only remembers: a failure here must never stop an edit, but a file left out of the review is said.
+    // (A failure beneath, in the edit itself, is not this mod's to report.)
+    try {
+      if (result.deny === undefined && result.isError !== true) {
+        const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
+        const lang = languageOf(path) ?? (/\.ipynb$/i.test(path) ? 'Python' : undefined)
+        // The edit tools take a native path, so /tmp is the Unix temp folder only off Windows.
+        if (lang) await sayLeftOut($, await remember($, [[path, lang]], !(await pathsHere($)).windows), [])
+      }
+    } catch (err) {
+      hookFailed($, 'could not record an edited file for review', err, 'ask for a review by hand')
     }
     return result
-  }).catch(($, e, next) => next(e)) // only remembers: a failure must never stop an edit
+  }).catch(($, e, next) => next(e))
 
   // The user stopped the main turn part way: the work is unfinished, so no review is asked for yet.
   // A review that was itself interrupted gives its files back to the queue.
@@ -406,47 +568,36 @@ export const register: Register = on => {
       })
     }
     return next(e)
-  }).catch(($, e, next) => next(e)) // only keeps flags: a failure must never change how a turn ends
+  }).catch(($, e, next) => {
+    // Only keeps flags: a failure must never change how a turn ends, but lost files are said.
+    if (!next.called) {
+      hookFailed($, 'could not record that this turn ended early', next.error,
+        "if a review was running, its files may not come back to the queue, so ask for a review by hand")
+    }
+    return next(e)
+  })
 
   // --- 2. at the end of the turn, send Claude back to review it ------------------------------
 
   on('classic.Stop', async ($, e, next) => {
     const settled = await next(e)
     if (settled.block) return settled
-    await ensureLoaded($)
-    // The scanners installed here, for the review's commands (found once; none is fine).
-    const found = await findScanners(hostOf($)).catch(() => new Map<Scanner, string>())
-    // If the agents cannot be listed, the review ends here rather than holding every later review back.
-    const busy = cycle.reviewing && (await $.agent.list().catch(() => [])).some(a => BUSY.has(a.status))
-    const ask = await updateCycle($, (c): StopAsk => {
-      if (c.reviewing) {
-        // The review is over at the first stop with no agent still out. Until then the reviewers'
-        // reports come back as turns of this review. Its own fixes are not sent for another review.
-        if (!busy) {
-          c.reviewing = false
-          c.underReview = {}
-          c.changed = {}
-        }
-        return undefined
+    // review-guard's own part. A failure in it lets the turn end as it would have, but never quietly; a
+    // failure beneath, in the end of the turn itself, is not this mod's to report.
+    try {
+      const ask = await stopAsk($, e.stop_hook_active, next.signal)
+      if (ask?.kind === 'held') {
+        // The status line says so, so the queue is never silent.
+        say($, `review-guard: review of ${ask.files} changed file(s) held after your interrupt; it runs when work on code resumes`)
+        return settled
       }
-      // After an interrupt the files stay queued, and the review comes with the next turn that changes code.
-      const files = Object.keys(c.changed).length
-      if (c.held && files > 0) return { kind: 'held', files }
-      if (e.stop_hook_active || files === 0) return undefined
-      const changed = new Map(Object.entries(c.changed))
-      const prompt = reviewPrompt(changed, scannerSteps(changed, found))
-      c.underReview = c.changed
-      c.changed = {}
-      c.reviewing = true
-      return { kind: 'review', prompt }
-    })
-    if (ask?.kind === 'held') {
-      // The status line says so, so the queue is never silent.
-      $.ui.status(`review-guard: review of ${ask.files} changed file(s) held after your interrupt; it runs when work on code resumes`)
+      return ask === undefined ? settled : { ...settled, block: ask.prompt }
+    } catch (err) {
+      reviewFailed($, err)
       return settled
     }
-    return ask === undefined ? settled : { ...settled, block: ask.prompt }
-  }).catch(($, e, next) => next(e)) // a failed check lets the turn end as it would have
+  }).catch(($, e, next) => next(e))
+
 
   // --- 3. keep secrets and personal data out of GitHub ---------------------------------------
 
@@ -463,7 +614,7 @@ export const register: Register = on => {
       let said: string | undefined
       if (local !== e.command && /\bgit\b[^;&|\n]*\b(?:commit|push)\b/.test(e.command)) {
         said = 'review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here'
-        $.ui.status(said)
+        say($, said)
       }
       return rememberShellWrites($, await next(e), e.command, before, powershell, said)
     }
@@ -489,11 +640,11 @@ export const register: Register = on => {
     const said = notes.length > 0
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
       : `review-guard: ${what} checked, nothing personal or secret found`
-    $.ui.status(said)
+    say($, said)
     return rememberShellWrites($, await next(e), e.command, before, powershell, said)
   }).catch(($, e, next) =>
     next.called ? next(e) : {
-      deny: `review-guard could not check this command, so it stopped it (${next.error.message ?? next.error.kind}). If the command names ` +
+      deny: `review-guard could not check this command, so it stopped it (${whyOf(next.error)}). If the command names ` +
         'its folder with a variable or a relative path, run it again with `git -C <absolute path>`. If the reason is about ' +
         'review-guard.json, tell the user what is wrong in it. Otherwise tell the user: the check itself failed.',
     },
@@ -509,10 +660,10 @@ export const register: Register = on => {
     const raw = [...scanValue(e, where, config.personal), ...(await gitleaksScan(hostOf($), valueLines(e, where), notes))]
     const found = settle(raw, false, config.allowValues)
     if (found.length > 0) return { deny: report(found, 'GitHub write') + (notes.length > 0 ? `\nAlso: ${notes.join('; ')}.` : '') }
-    if (notes.length > 0) $.ui.status(`review-guard: GitHub write checked, but ${notes.join('; ')}`)
+    if (notes.length > 0) say($, `review-guard: GitHub write checked, but ${notes.join('; ')}`)
     return next(e)
   }).catch(($, e, next) =>
-    next.called ? next(e) : { deny: `review-guard could not check this GitHub write, so it stopped it (${next.error.message ?? next.error.kind}).` },
+    next.called ? next(e) : { deny: `review-guard could not check this GitHub write, so it stopped it (${whyOf(next.error)}).` },
   )
 
   // The allowlist is the user's to edit, not Claude's.
@@ -520,5 +671,7 @@ export const register: Register = on => {
     /(^|[\\/])\.claude[\\/]review-guard\.json$/i.test(e.file_path)
       ? { deny: 'review-guard: ~/.claude/review-guard.json is the user\'s to edit. Tell them what to change instead.' }
       : next(e),
-  ).catch(($, e, next) => (next.called ? next(e) : { deny: 'review-guard: its guard failed.' }))
+  ).catch(($, e, next) => (next.called ? next(e) : {
+    deny: `review-guard: its guard for review-guard.json failed (${whyOf(next.error)}), so it stopped this edit. Tell the user.`,
+  }))
 }

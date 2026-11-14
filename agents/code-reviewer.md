@@ -18,7 +18,7 @@ Three representative scenarios:
 
 ## Review Scope
 
-By default, review unstaged changes from `git diff`. The user may specify different files or scope to review.
+By default, review unstaged changes from `git diff`, and read each changed file in full: issues already in those files count too. The user may specify different files or scope to review.
 
 ## Core Review Responsibilities
 
@@ -32,7 +32,7 @@ By default, review unstaged changes from `git diff`. The user may specify differ
 
 Rate each issue from 0-100:
 
-- **0-25**: Likely false positive or pre-existing issue
+- **0-25**: Likely false positive. (An issue that was already there before this change is not put here for being old: score it on its merits.)
 - **26-50**: Minor nitpick not explicitly in CLAUDE.md
 - **51-75**: Valid but low-impact issue
 - **76-90**: Important issue requiring attention

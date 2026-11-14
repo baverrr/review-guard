@@ -3,7 +3,9 @@ import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
   addedLines, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan.ts'
+import { findScanners } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
+import { reviewFailed, say, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -443,27 +445,38 @@ describe('review prompt', () => {
     expect(prompt.includes('Do not hand their work to general-purpose agents')).toBe(true)
   })
 
-  test('every finding is acted on, low ones included, and each ends in one stated outcome', async () => {
+  test('every finding is acted on, old and low ones included, and fixed unless one of four blockers applies', async () => {
     const text = flat(reviewPrompt(new Map([['a.py', 'Python']])))
-    // The agents get a sentence to pass on that overrides their own cutoffs.
+    // The agents get a sentence to pass on that overrides their own cutoffs and asks for old issues too.
     expect(text.includes(`prompt word for word: "${REPORT_EVERYTHING}"`)).toBe(true)
     expect(REPORT_EVERYTHING.includes('overrides any confidence threshold')).toBe(true)
-    expect(REPORT_EVERYTHING.includes('already in the changed files before this change')).toBe(true)
-    // The old escape hatch for big changes in touched code is gone: only an untouched file is a blocker.
-    expect(text.includes('a large change in code this turn did not touch')).toBe(false)
+    expect(REPORT_EVERYTHING.includes('and issues that were already in the changed files before this change')).toBe(true)
+    expect(text.includes('tell it to read them in full, not only the diff')).toBe(true)
+    // The list may hold files held or handed back from earlier turns, so it is not called "this turn's".
+    expect(text.includes('file(s) not yet reviewed')).toBe(true)
+    expect(text.includes('this turn\'s own edits')).toBe(false)
+    // The old way out for a large change in code the turn did not touch is gone, in any wording, and
+    // "alone is never a reason" (which let a second excuse through) has not come back.
+    expect(text.includes('large change')).toBe(false)
+    expect(text.includes('alone is never a reason')).toBe(false)
     for (const part of [
-      'Act on every finding, whatever its severity and whenever it got there',
-      'fix every one that holds up in a file this turn changed',
+      'Act on every finding, whatever its severity and however old it is',
+      'fix every one that holds up in a file listed above unless one of the four blockers below applies',
       'Low, info and style ones from agents and scanners are fixed like high ones',
-      'logging nits too',
-      'bugs that were already in the old version of a changed file',
-      '"Minor", "cosmetic", "style", "fine here", "pre-existing", "unlikely to trigger", "low confidence" and "not in this turn\'s diff" are never reasons to leave one',
+      'logging nits too (wording, a duplicated or uneven log line, an off-by-one in a log count)',
+      'problems that were already in the old version of a listed file',
+      '"minor", "cosmetic", "style", "fine here", "pre-existing", "out of scope", "unlikely to trigger", "low confidence", "scored as a likely false positive" and "not in the changed lines" are never reasons',
       'Fixed: say which file and line changed',
       'Does not hold up: show why in one line, with the code, path or output that proves it',
-      'Holds up but is not fixed here, only for one of these blockers',
-      'it needs the user\'s decision, or it is in a file this turn did not touch',
-      'never count it as fixed',
+      'or that a security warning is about test-only code',
+      // All four blockers, in one closed list, each with what it must show.
+      'Holds up but is not fixed here, for one of these four blockers only: the fix would break something (say what, and the test, output or code that shows it), there is no fixed version of the package or tool yet, it needs the user\'s decision (write the exact question), or it is an older problem in a file not listed above (a break these changes caused in another file is fixed like any other).',
+      'Name the blocker, offer a narrow suppression or a follow-up, and never count it as fixed',
       'Any other reason means fix it',
+      'or changed code outside the changes under review, send them to code-reviewer once more',
+      'a finding still open is never counted as fixed',
+      'the files this review itself edited, and each question a blocker left for the user',
+      'If the listed files are only ones the user told you not to review',
       'If an agent or scanner fails or returns nothing, say which one and why',
       'Rerun the tests (if the project has none, say so) and the scanners',
       'Stop after three rounds and list what is still open',
@@ -473,7 +486,7 @@ describe('review prompt', () => {
     ]) expect(text.includes(part)).toBe(true)
     // The steps come once each, in order.
     const at = ['1. Run the', '2. Security review', '3. Act on every finding', '4. Rerun', '5. Tell the user'].map(s => text.indexOf(s))
-    expect(at.every((n, i) => n >= 0 && (i === 0 || n > at[i - 1]))).toBe(true)
+    expect(at.every((n, i) => n >= 0 && (i === 0 || n > (at[i - 1] ?? -1)))).toBe(true)
     // No file is cut from the list: a file left off would get no findings.
     const many = new Map(Array.from({ length: 12 }, (_, i) => [`f${i}.py`, 'Python']))
     expect(reviewPrompt(many).includes('f11.py')).toBe(true)
@@ -486,6 +499,10 @@ describe('review prompt', () => {
     expect(prompt('code-reviewer').includes('filter aggressively')).toBe(false)
     expect(prompt('pr-test-analyzer').includes('**Minor Gaps**')).toBe(true)
     expect(prompt('pr-test-analyzer').includes('overly pedantic')).toBe(false)
+    // Old issues are scored on their merits, not filed as likely false positives, and whole files are read.
+    expect(prompt('code-reviewer').includes('Likely false positive or pre-existing issue')).toBe(false)
+    expect(prompt('code-reviewer').includes('is not put here for being old: score it on its merits.')).toBe(true)
+    expect(prompt('code-reviewer').includes('read each changed file in full')).toBe(true)
   })
 })
 
@@ -603,6 +620,172 @@ test('a save that fails loses no edit and says so', async ($, on) => {
   expect(prompt?.includes('a.py')).toBe(true)
   expect(prompt?.includes('b.py')).toBe(true)
   expect(status.some(s => s.includes('could not save'))).toBe(true)
+})
+
+test('agents that cannot be listed end the review out loud', async ($, on) => {
+  const status: string[] = []
+  let listWorks = true
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('classic.Stop', () => ({}))
+  let lists = 0
+  let broken: 'deny' | 'not a list' = 'deny'
+  on('agent.list', () => {
+    lists++
+    if (listWorks) return { value: [{ id: 'a0', description: 'reviewer', type: 'review-guard:code-reviewer', status: 'running' as Status }] }
+    return broken === 'deny' ? { deny: 'no list' } : { value: null as never }
+  })
+  const edit = (file: string) => $.tool.call({ tool: 'Edit', file_path: file, old_string: 'a', new_string: 'b' })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  expect(lists).toBe(0) // nothing is listed while no review runs
+  expect(await stop(true)).toBe(undefined) // a reviewer is still out: the review stays open
+  expect(status.some(s => s.includes('could not list the review agents'))).toBe(false)
+  listWorks = false
+  expect(await stop(true)).toBe(undefined)
+  expect(status.some(s => s.includes('could not list the review agents') && s.includes('the review counts as over'))).toBe(true)
+  // The review is over, so the next change gets a review of its own, without the closed review's files.
+  await edit('C:/proj/next.py')
+  const next = await stop()
+  expect(next?.includes('next.py')).toBe(true)
+  expect(next?.includes('app.py')).toBe(false)
+  // A list that comes back as something other than a list ends the review the same way, out loud.
+  status.length = 0
+  broken = 'not a list'
+  expect(await stop(true)).toBe(undefined)
+  expect(status.some(s => s.includes('could not list the review agents (the agent list was not a list)'))).toBe(true)
+  await edit('C:/proj/last.py')
+  expect((await stop())?.includes('last.py')).toBe(true)
+})
+
+test('a failure beneath at the end of a turn is not blamed on review-guard, and the files wait', async ($, on) => {
+  const status: string[] = []
+  let broken = true
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('agent.list', () => ({ value: [] }))
+  on('classic.Stop', () => {
+    if (broken) throw new Error('boom beneath')
+    return {}
+  })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/app.py', old_string: 'a', new_string: 'b' })
+  // The failure is passed on as the turn would have ended; it is not review-guard's, so it says nothing.
+  await $.classic.Stop({ stop_hook_active: false }).catch(() => undefined)
+  expect(status.some(s => s.includes('end-of-turn check failed'))).toBe(false)
+  broken = false
+  expect((await $.classic.Stop({ stop_hook_active: false })).block?.includes('app.py')).toBe(true)
+})
+
+test("a failure's reason is one short line, from an Error, the engine's HookFailure, or anything", () => {
+  expect(whyOf(new Error('one\n  two'))).toBe('one two')
+  expect(whyOf({ kind: 'throw', message: 'boom', budget: 1000 })).toBe('boom')
+  expect(whyOf({ kind: 'timeout', budget: 1000 })).toBe('timeout') // a timeout carries no message
+  expect(whyOf(undefined)).toBe('no message')
+  expect(whyOf(new Error(''))).toBe('no message')
+  expect(whyOf('x'.repeat(300))).toBe('x'.repeat(200))
+  expect(whyOf('😀'.repeat(300))).toBe('😀'.repeat(200)) // cut by characters: no half of one is left
+  const circular: Record<string, unknown> = {}
+  circular.self = circular
+  expect(whyOf(circular)).toBe('a failure that could not be put into words') // never a second failure
+  expect(whyOf({ other: 1 })).toBe('{"other":1}')
+  // review-guard's own end-of-turn failure, as the status line shows it.
+  const status: string[] = []
+  reviewFailed({ ui: { status: (t: string) => { status.push(t) } } } as never, new Error('scan blew up'))
+  expect(status).toEqual(['review-guard: its end-of-turn check failed (scan blew up); any changed files stay queued for the next turn that ends'])
+})
+
+test('a status line that fails to show goes to the log instead, and never fails twice', () => {
+  const logged: string[] = []
+  let onRejected: unknown
+  const engine = (show: (text: string) => unknown, log = (text: string) => { logged.push(text) }) => ({ ui: { status: show, log } }) as never
+  // It throws at once: the line goes to the log.
+  say(engine(() => { throw new Error('no status line') }), 'first')
+  expect(logged).toEqual(['first'])
+  // It hands back a promise: a rejection is handled, and that line goes to the log too.
+  say(engine(() => ({ then: (_ok: unknown, bad: unknown) => { onRejected = bad } })), 'second')
+  expect(typeof onRejected).toBe('function')
+  ;(onRejected as () => void)()
+  expect(logged).toEqual(['first', 'second'])
+  // Both fail: nothing is thrown.
+  expect(() => say(engine(() => { throw new Error('a') }, () => { throw new Error('b') }), 'third')).not.toThrow()
+})
+
+test('a review state that cannot be read back is said once, retried, and never written over', async ($, on) => {
+  const status: string[] = []
+  let reads = 0
+  let sets = 0
+  let storeUp = false
+  on('ui.status', (_$, e) => {
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('state.get', ($$, e, next) => {
+    reads++
+    return storeUp ? next(e) : { deny: 'store offline' }
+  })
+  on('state.set', ($$, e, next) => {
+    sets++
+    return next(e)
+  })
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/a.py') // read fails: remembered in memory, nothing saved over the stored copy
+  await edit('C:/proj/b.py') // read fails again: said only once
+  expect(reads >= 2).toBe(true) // tried again
+  expect(sets).toBe(0)
+  expect(status.filter(s => s.includes('could not read back its review state')).length).toBe(1)
+  expect(status.some(s => s.includes('store offline'))).toBe(true)
+  expect(status.some(s => s.includes('it tries again at the next step'))).toBe(true)
+  // The next try works: both edits are still there, saving starts, and the recovery is said.
+  storeUp = true
+  const prompt = await stop()
+  expect(prompt?.includes('a.py')).toBe(true)
+  expect(prompt?.includes('b.py')).toBe(true)
+  expect(sets > 0).toBe(true)
+  expect(status.some(s => s.includes('read back its review state after all'))).toBe(true)
+})
+
+test('a stored review read back late is joined to what this load did meanwhile, never undoing it', async ($, on) => {
+  let storeUp = false
+  // The copy a load before this one left: a review running over old.py, and queued.py waiting.
+  const stored = { reviewing: true, held: true, changed: { 'C:/proj/queued.py': 'Python' }, underReview: { 'C:/proj/old.py': 'Python' } }
+  on('state.get', ($$, e, next) => (storeUp ? { value: { value: stored as never, version: 1 } } : { deny: 'store offline' }))
+  const { edit, stop } = cycle($, on)
+  // While the copy can't be read, the user asks for something new and it is edited.
+  await $.prompt.submit({ text: 'new request', wait: false, origin: { kind: 'composer' } })
+  await edit('C:/proj/new.py')
+  storeUp = true
+  // What this load decided stands (no review running, no hold), and every stored file is queued again.
+  const prompt = await stop()
+  for (const f of ['new.py', 'queued.py', 'old.py']) expect(prompt?.includes(f)).toBe(true)
+})
+
+test('a review held after an interrupt says so on the status line, even if that line fails', async ($, on) => {
+  const status: string[] = []
+  let statusWorks = true
+  on('ui.status', (_$, e) => {
+    if (!statusWorks) throw new Error('no status line')
+    status.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('ui.log', () => ({ value: undefined }))
+  const { edit, stop } = cycle($, on)
+  on('turn.complete', () => ({ text: '' }))
+  await edit('C:/proj/half.py')
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await edit('C:/proj/half.py')
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't2' })
+  expect(await stop()).toBe(undefined)
+  expect(status.some(s => s.includes('review of 1 changed file(s) held after your interrupt'))).toBe(true)
+  statusWorks = false
+  expect(await stop()).toBe(undefined) // the turn still ends normally
+  // (The kit skips a status hook that throws, so the log fallback is checked in the say() test.)
 })
 
 test('edits that finish at the same moment are all remembered', async ($, on) => {
@@ -777,7 +960,7 @@ test('a script a command only runs is left out; one it changed, or may have, is 
   await $.tool.call({ tool: 'Bash', command: RUN_AFTER_NOTES })
   expect(await stop()).toBe(undefined)
   expect(status.some(s => s.includes('only run .scripts/memory-map.py'))).toBe(true) // never silent
-  for (const [command, script] of [
+  for (const [command, script] of <[string, string][]>[
     [`${WRITES}python C:/tools/gen.py`, 'C:/tools/gen.py'], // changed while it ran, even to an older time
     [`${WRITES}python C:/tools/size.py`, 'C:/tools/size.py'],
     [`${WRITES}python C:/tools/text.py`, 'C:/tools/text.py'],
@@ -859,6 +1042,7 @@ test('a script only run is left out at every shell call site, the git-checked on
 
 test('the review state is written where the MCP server reads it, and a failed write changes nothing', async ($, on) => {
   disk(on, { [MAP]: 1 })
+  mock.clock(on) // the exit's one-second wait, held until the test moves the clock
   on('session.id', () => ({ value: 's-1' }))
   on('session.cwd', () => ({ value: 'C:/proj' }))
   on('session.end', () => ({ sessionId: 's-1' })) // the engine's own end step
@@ -920,6 +1104,7 @@ test('a session id that is not a plain name is made one for the status file name
 
 test('a session with nothing to report writes no status file, and one that has a file keeps it current', async ($, on) => {
   disk(on, {})
+  mock.clock(on)
   on('session.id', () => ({ value: 's-2' }))
   on('session.end', () => ({ sessionId: 's-2' }))
   let fileThere = false
@@ -930,7 +1115,7 @@ test('a session with nothing to report writes no status file, and one that has a
     return { value: undefined }
   })
   const { stop } = cycle($, on)
-  await $.prompt.submit({ text: 'what is 2 + 2?', wait: false, origin: { kind: 'user' } })
+  await $.prompt.submit({ text: 'what is 2 + 2?', wait: false, origin: { kind: 'composer' } })
   expect(await stop()).toBe(undefined)
   await $.session.end({ reason: 'exit' } as never)
   expect(writes).toEqual([])
@@ -938,6 +1123,55 @@ test('a session with nothing to report writes no status file, and one that has a
   fileThere = true
   await $.session.end({ reason: 'exit' } as never)
   expect(statusFrom(JSON.parse(writes.at(-1) ?? '{}'))?.phase).toBe('ended')
+})
+
+test('an exit waits at most a second for the status file', async ($, on) => {
+  disk(on, {})
+  const clock = mock.clock(on)
+  on('session.id', () => ({ value: 's-3' }))
+  on('session.end', () => ({ sessionId: 's-3' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.write', () => new Promise<never>(() => {})) // a write that never finishes
+  let ended = false
+  const exit = $.session.end({ reason: 'exit' } as never).then(() => { ended = true })
+  await clock.advance(999)
+  expect(ended).toBe(false)
+  await clock.advance(1)
+  await exit
+  expect(ended).toBe(true)
+})
+
+test('an exit whose clock fails does not wait for the status file', async ($, on) => {
+  disk(on, {})
+  on('clock.sleep', () => { throw new Error('no clock') })
+  on('session.id', () => ({ value: 's-4' }))
+  on('session.end', () => ({ sessionId: 's-4' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.write', () => new Promise<never>(() => {}))
+  // Waiting for the write would hang to the hook's ten-second budget; the exit must come well before.
+  const started = Date.now()
+  await $.session.end({ reason: 'exit' } as never)
+  expect(Date.now() - started < 3000).toBe(true)
+})
+
+test("the review's scanner lookup names the ones it could not check, and why", async () => {
+  const host = (home: string | undefined, exists: (p: string) => Promise<boolean>) => ({
+    run: async () => { throw new Error('not on PATH') },
+    read: async () => undefined,
+    exists,
+    home: async () => home,
+    pluginRoot: 'C:/mod',
+  }) as never
+  // A place that can't be checked is a problem with a reason, never "not installed".
+  const blocked = await findScanners(host('C:/Users/pat', async () => { throw new Error('access denied') }))
+  expect(blocked.found.size).toBe(0)
+  expect([...blocked.problems.values()].every(p => p.includes("can't be checked: access denied"))).toBe(true)
+  // With no home folder, the usual places were never searched: said so for each.
+  const homeless = await findScanners(host(undefined, async () => false))
+  expect(homeless.problems.get('bandit')).toBe('the home folder is not known, so only PATH was searched')
+  // A home folder, and nothing anywhere: simply not installed.
+  const none = await findScanners(host('C:/Users/pat', async () => false))
+  expect(none.problems.size).toBe(0)
 })
 
 test('status files with a bad time in them are not read', () => {
@@ -1044,7 +1278,7 @@ test('knows which code files a shell command writes', async () => {
     expect([name, shellWrites(`cp a.txt "${name}"`).includes(name)]).toEqual([name, true])
   }
   // Windows paths whose `\n` or `\r` is a folder's first letter, and `<>` writes, count as before.
-  for (const [c, name] of [
+  for (const [c, name] of <[string, string][]>[
     ['Copy-Item a.py src\\new.py', 'src\\new.py'], ['Copy-Item a.py .\\src\\new.py', '.\\src\\new.py'],
     ['Move-Item tmp.ts hooks\\register.ts', 'hooks\\register.ts'], ['cp a.py scripts\\release.py', 'scripts\\release.py'],
     ['Copy-Item "a.py" "lib\\nodes.py"', 'lib\\nodes.py'], ['Set-Content -Path scripts\\release.py -Value x', 'scripts\\release.py'],
@@ -1548,7 +1782,7 @@ describe('outside scanners', () => {
     const changed = new Map([['my app/a.py', 'Python'], ['.github/workflows/ci.yml', 'GitHub Actions']])
     const steps = scannerSteps(changed, new Map([['bandit', 'C:/Tools/bandit.exe']]))
     expect(steps.some(s => s.includes("'C:/Tools/bandit.exe' -q 'my app/a.py'"))).toBe(true) // quoted, spaces kept
-    expect(steps.at(-1)?.includes('Not installed here (or would not run), so skipped')).toBe(true)
+    expect(steps.at(-1)?.includes('Not installed here, so skipped')).toBe(true)
     expect(steps.at(-1)?.includes('semgrep, zizmor')).toBe(true)
     expect(scannerCommand('zizmor', 'zizmor', ['w.yml'])).toBe("'zizmor' --offline 'w.yml'")
     // Bash expands nothing in single quotes; a quote inside is closed, escaped and reopened.
@@ -1557,12 +1791,21 @@ describe('outside scanners', () => {
     const prompt = reviewPrompt(changed, steps)
     expect(flat(prompt).includes('What they report is a finding like any other')).toBe(true)
     // The commands come before the step that says to act on what they find.
-    expect(prompt.indexOf("'C:/Tools/bandit.exe'") < prompt.indexOf('3. Act on every finding')).toBe(true)
+    expect(flat(prompt).indexOf("'C:/Tools/bandit.exe'") < flat(prompt).indexOf('3. Act on every finding')).toBe(true)
     expect(reviewPrompt(changed).includes('Scanners for these files')).toBe(false)
     // With none installed, the prompt still names them as skipped and does not claim any are installed.
     const none = reviewPrompt(changed, scannerSteps(changed, new Map()))
     expect(none.includes('Not installed here')).toBe(true)
     expect(none.includes('installed on this machine')).toBe(false)
+    // One that is there but would not run, or could not be looked for, is named with why, never as
+    // "not installed"; a reason on several lines is put on one.
+    const failed = scannerSteps(changed, new Map([['bandit', 'bandit']]), new Map([['semgrep', 'C:/x/semgrep.exe would not run: spawn\nEPERM'], ['zizmor', 'looking for it failed: boom']]))
+    expect(failed.length).toBe(2) // bandit's command, then the line for the other two
+    expect(failed[1]?.includes('There but would not run, or could not be checked, so skipped')).toBe(true)
+    expect(failed[1]?.includes('semgrep (C:/x/semgrep.exe would not run: spawn EPERM); zizmor (looking for it failed: boom)')).toBe(true)
+    expect(failed.some(l => l.includes('Not installed here'))).toBe(false)
+    // A problem for a scanner these files don't need adds nothing.
+    expect(scannerSteps(new Map([['a.css', 'CSS']]), new Map(), new Map([['bandit', 'x']]))).toEqual([])
   })
 
   test("gitleaks' report becomes findings at the right place; an empty or broken report is handled", async () => {

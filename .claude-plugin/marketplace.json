@@ -1,5 +1,6 @@
 {
   "name": "review-guard",
   "owner": { "name": "baverrr" },
+  "description": "A local marketplace holding the review-guard plugin, so it shows in Claude's plugins list.",
   "plugins": [{ "name": "review-guard", "source": "./" }]
 }

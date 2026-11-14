@@ -4,11 +4,13 @@ The agent prompts in the `agents` folder are copies from the pr-review-toolkit p
 (claude-plugins-official), under the Apache License 2.0 in `LICENSE-pr-review-toolkit`.
 Changed here:
 
-- the `description` line of each file, shortened;
+- the `description` line of each file, shortened.
 - `code-reviewer.md` and `pr-test-analyzer.md` (2026-11-12): they report every issue and gap they find,
   low-confidence and minor ones included, instead of filtering to the top ones (the confidence-80 cutoff
   and the "not pedantic" line are replaced, and the outputs gain a place for lower findings).
+- `code-reviewer.md` (2026-11-13): it reads each changed file in full, and an issue that was already there
+  before the change is scored on its merits instead of in the "likely false positive" band.
 
 They are copies, so they do not update with the plugin. To refresh them, copy the plugin
-agent files again, shorten the descriptions, make the two changes above again, and regenerate
+agent files again, shorten the descriptions, make the changes above again, and regenerate
 `hooks/agents.ts` from them.

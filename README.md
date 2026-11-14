@@ -23,11 +23,11 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 - **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it, once per
   turn, with review agents (code review, hidden errors, test gaps). Claude's own scratch files are skipped.
-- **Leaves no finding behind.** Low and style warnings count like serious ones, and so do old bugs in the
-  files it changed. Claude fixes each real one, says why for any that isn't real, and leaves one unfixed
-  only for a real blocker (the fix would break something, no fixed version yet, it needs your call, or it
-  is in a file the turn didn't touch). Then it reruns the tests and scanners
-  and tells you the outcome of every finding.
+- **Leaves no finding behind.** Low and style warnings count like serious ones, logging nits too, and so do
+  old problems in the files it changed. Claude fixes each real one, says why for any that isn't real, and
+  leaves one unfixed only for a real blocker: the fix would break something, there is no fixed version of
+  the package yet, it needs your call, or it is in a file outside the review. Then it reruns the tests and
+  scanners and tells you the outcome of every finding.
 - **Adds a security check per language.** Python, TypeScript, Docker, shell, C# and others each get their own
   short list of things to look for.
 - **Brings its own reviewers.** It ships five review agents, so the review works even where the
@@ -136,10 +136,12 @@ new session.
 
 - The hooks are in `hooks/register.ts`, with the commit and push check in `hooks/outgoing.ts`; the scanning
   and command reading are pure functions in `hooks/scan.ts`.
-- The MCP server (`mcp/server.mjs`, set up in `.mcp.json`) runs the same check through `mcp/host.mjs`, from
-  a plain-JavaScript copy in `mcp/lib/`, since some Node builds can't run TypeScript. After changing
-  `hooks/scan.ts`, `scanners.ts`, `outgoing.ts` or `status.ts`, rebuild it with `node scripts/build-mcp.mjs`
-  (Node 22.13 or newer); the server's tools refuse a copy that doesn't match.
+- The MCP server (`mcp/server.mjs`) is set up under `mcpServers` in `.claude-plugin/plugin.json`, not in a
+  root `.mcp.json`: Claude would also load that one as a project server when run inside this folder, where
+  it fails. It runs the same check through `mcp/host.mjs`, from a plain-JavaScript copy in `mcp/lib/`,
+  since some Node builds can't run TypeScript. After changing `hooks/scan.ts`, `scanners.ts`, `outgoing.ts`
+  or `status.ts`, rebuild it with `node scripts/build-mcp.mjs` (Node 22.13 or newer);
+  the server's tools refuse a copy that doesn't match.
 - Each session writes its review state to `~/.claude/review-guard/status/` for `review_status`. Old files
   are not removed (the tool shows the last 24 hours).
 - The review agents are in `agents/`, with the same prompts in `hooks/agents.ts` for sessions that were
