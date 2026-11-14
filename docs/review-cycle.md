@@ -20,10 +20,20 @@ page says when that review counts as over, and what happens to the edits made wh
   from then on. Its edits to files under review are fixes; its edits to any other file still get their
   own review, and so do those of a helper it starts.
 - **Paths.** To tell whether a joined agent's edit is to a file under review, a path is matched
-  however it is spelled: `\` or `/`, Git Bash's `/c/...`, and on Windows any case. A relative path is
-  read against the session's folder, but only when that is surely its folder: not after a command
-  changed folder (`cd sub && ...`), and not for an agent with a folder of its own. A path that is still
-  relative then never counts as a file under review, which can only mean more review.
+  however it is spelled: on Windows `\` and `/` are the same and case is ignored, and Git Bash's
+  `/c/...` is drive C (a file it changes is listed as `C:/...`). In PowerShell and the edit tools
+  `/c/...` is a folder `c` on the current drive, so it is never taken for drive C. On Windows a path
+  with no drive (`/proj/x.py`) names a different file in each shell, so it never counts as a file under
+  review. A relative path is read against the session's folder only when that is surely its folder:
+  not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`), and
+  never again for an agent that has run such a command (a shell may keep the folder), was started in a
+  folder of its own, or was started or resumed by an agent on this list. The list is saved, so a reload
+  keeps it (the last 500 agents). Until the saved state is read back after a reload, no relative path is
+  read against the session's folder, and an agent that another agent starts meanwhile goes on the list.
+  A path that is still relative never counts as a file under review, which can only mean more review.
+- **Windows or not.** The mod takes the machine for Windows when `OS` is `Windows_NT`, or when
+  `USERPROFILE` has a drive letter and `HOME` is missing, a Windows path or Git Bash's `/c/...` (Linux and
+  WSL have a `HOME` like `/home/pat`, and may have a `USERPROFILE` passed in from Windows).
 
 ## Timing
 
@@ -52,7 +62,9 @@ A new request typed while the review's turn still runs shows the prompt did arri
 
 ## Where the state lives
 
-The review state is saved in the session, so a reload of the mod in the middle of a review keeps it
-(the counts of agent starts are kept in memory only, and start again after a reload). A session with
+The review state is saved in the session, so a reload of the mod keeps it, in the middle of a review or
+not. That includes the list of agents whose relative paths are not read against the session's folder
+(see Paths). The counts of agent starts and the list of files left out are kept in memory only, and
+start again after a reload. A session with
 something to report also writes it to `~/.claude/review-guard/status/` for the `review_status` tool. Old
 files there are not removed; the tool shows the last 24 hours.

@@ -1,11 +1,11 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  addedLines, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, CHANGES_FOLDER, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan.ts'
 import { findScanners } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
-import { afterHandOn, agentsListed, cycleFrom, recipient, reviewFailed, reviewHeldOpen, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
+import { afterHandOn, agentsListed, cycleFrom, isWindows, ownFolderOf, recipient, reviewFailed, reviewHeldOpen, keyOf, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -660,9 +660,9 @@ test('the agents at work when a review began, and what they changed, survive a r
   // A stored value is read with care: what is not text is dropped. With no review running, nothing
   // review-only stands and no file is lost; during one, a hold is dropped and no id is on both lists.
   expect(cycleFrom({ othersAtStart: ['a', 1, null], underReview: { 'u.py': 'Python' }, othersChanged: { 'x.py': 'Python', 'y.py': 3 }, joined: ['b'], promptPending: true })).toEqual(
-    { reviewing: false, held: false, changed: { 'u.py': 'Python', 'x.py': 'Python' }, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false })
+    { reviewing: false, held: false, changed: { 'u.py': 'Python', 'x.py': 'Python' }, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false, ownFolder: [] })
   expect(cycleFrom({ reviewing: true, held: true, othersAtStart: ['a', 'a'], joined: ['a', 'b', 'b', 2], promptPending: true })).toEqual(
-    { reviewing: true, held: false, changed: {}, underReview: {}, othersAtStart: ['a'], othersChanged: {}, joined: ['b'], promptPending: true })
+    { reviewing: true, held: false, changed: {}, underReview: {}, othersAtStart: ['a'], othersChanged: {}, joined: ['b'], promptPending: true, ownFolder: [] })
 })
 
 test('agents already at work when a review starts do not hold it open; any agent started during it does', async ($, on) => {
@@ -699,6 +699,7 @@ test('agents already at work when a review starts do not hold it open; any agent
 })
 
 test('an agent from before a review that the review starts again or messages becomes part of it', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' }) // Windows: `C:/...` is a full path only there
   const { out, edit, stop } = cycle($, on)
   on('agent.spawn', (_$, e) => ({ agentId: e.resume?.agentId ?? 'new1', model: 'm' }))
   on('session.send', () => ({ isDelivered: true }))
@@ -762,6 +763,7 @@ test('an agent from before a review that finished and is started again unseen be
 })
 
 test('a refused message, work handed on outside a review, and a reload are handled', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' }) // Windows: `C:/...` is a full path only there
   // A stored review from before a reload, with bg as other work: the first event after it still counts.
   seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: ['bg', 'tm'], othersChanged: {} })
   const { out, edit, stop } = cycle($, on)
@@ -1062,7 +1064,7 @@ test('a hook beneath that blocks while the review prompt is still on its way doe
 })
 
 test('a joined agent messaging one of the review\'s own agents does not make it joined', async ($, on) => {
-  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
   const { out, stop } = cycle($, on)
   on('session.send', () => ({ isDelivered: true }))
   out.agents = [{ id: 'r1', status: 'running' }]
@@ -1075,14 +1077,14 @@ test('a joined agent messaging one of the review\'s own agents does not make it 
 })
 
 test('two spellings of one file compare equal', () => {
-  const win = (p: string, folder?: string) => samePath(p, folder, true)
+  const win = (p: string, folder?: string) => samePath(p, folder, true, true)
   expect(win('C:\\proj\\App.py')).toBe('c:/proj/app.py')
   expect(win('/c/proj/app.py')).toBe('c:/proj/app.py') // Git Bash
   expect(win('app.py', 'C:\\proj')).toBe('c:/proj/app.py') // relative, against the session's folder
   expect(win('./src/../app.py', 'C:/proj/')).toBe('c:/proj/app.py')
   expect(win('app.py')).toBe('app.py') // no folder known: left as it is (so it can only fail to match)
-  expect(samePath('src/App.py', '/home/pat/proj', false)).toBe('/home/pat/proj/src/App.py') // Linux keeps case
-  expect(samePath('/c/x.py', undefined, false)).toBe('/c/x.py') // and has no drive letters
+  expect(samePath('src/App.py', '/home/pat/proj', false, false)).toBe('/home/pat/proj/src/App.py') // Linux keeps case
+  expect(samePath('/c/x.py', undefined, false, false)).toBe('/c/x.py') // and has no drive letters
   // `..` steps: one never cancels another, and nothing goes above the root.
   expect(win('a/../../b')).toBe('../b')
   expect(win('../../../a')).toBe('../../../a')
@@ -1090,7 +1092,17 @@ test('two spellings of one file compare equal', () => {
   expect(win('C:/x/../../proj/app.py')).toBe('c:/proj/app.py')
   expect(win('/c')).toBe('c:/') // a drive alone
   expect(win('app.py', '/')).toBe('/app.py') // a folder of `/` still joins
-  expect(samePath('app.py', '/', false)).toBe('/app.py')
+  expect(samePath('app.py', '/', false, false)).toBe('/app.py')
+  // Off Windows a `\` is part of a file name; from PowerShell, `/c/...` is a folder `c`, not drive C.
+  expect(samePath('a\\b.py', '/home/pat', false, false)).toBe('/home/pat/a\\b.py')
+  expect(samePath('a\\b.py', '/home/pat', false, false) === samePath('a/b.py', '/home/pat', false, false)).toBe(false)
+  expect(samePath('/c/proj/app.py', undefined, true, false)).toBe('/c/proj/app.py')
+  expect(samePath('C:\\proj\\App.py', undefined, true, false)).toBe('c:/proj/app.py') // still Windows
+  expect(samePath('app.py', '/c/proj', true, true)).toBe('/c/proj/app.py') // the session folder is native
+  expect(keyOf('/c/proj/app.py', true)).toBe('C:/proj/app.py') // Git Bash on Windows: stored by drive
+  expect(keyOf('/c/proj/app.py', false)).toBe('/c/proj/app.py')
+  expect(keyOf('/tmp/x.py', true)).toBe('/tmp/x.py')
+  expect(keyOf('/c', true)).toBe('C:')
 })
 
 test('how long a start has been under way is read on one clock only', () => {
@@ -1104,7 +1116,7 @@ test('how long a start has been under way is read on one clock only', () => {
 test('a joined agent fixing a file under review through a relative shell path is a fix', async ($, on) => {
   mock.env(on, { USERPROFILE: 'C:/Users/pat' })
   on('session.cwd', () => ({ value: 'C:/proj' }))
-  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
   const { out, stop } = cycle($, on)
   await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
   await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ own.py', agentId: 'bg' } as never)
@@ -1123,7 +1135,7 @@ for (const [name, under, setup, command, agent] of [
   test(`a relative path is never taken for a file under review when its folder is not sure: ${name}`, async ($, on) => {
     mock.env(on, { USERPROFILE: 'C:/Users/pat' })
     on('session.cwd', () => ({ value: 'C:/proj' }))
-    seed(on, { reviewing: true, held: false, changed: {}, underReview: { [under]: 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg', 'wt'], promptPending: false })
+    seed(on, { reviewing: true, held: false, changed: {}, underReview: { [under]: 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg', 'wt'], promptPending: false, ownFolder: [] })
     const { out, stop } = cycle($, on)
     on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
     // wt is started again in a folder of its own (a worktree).
@@ -1137,8 +1149,381 @@ for (const [name, under, setup, command, agent] of [
   })
 }
 
+for (const [name, ownFolder, steps] of [
+  ['after a cd in an earlier command (a shell may keep the folder)', [], async ($: Engine) => {
+    await $.tool.call({ tool: 'Bash', command: 'cd sub', agentId: 'bg' } as never)
+  }],
+  ['from an agent in a folder of its own, after a reload', ['bg'], async () => {}],
+  ['from a helper an agent in a folder of its own started (it runs in that folder)', ['wt'], async ($: Engine) => {
+    await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'wt' } as never)
+  }],
+] as const) {
+  test(`a relative path is never taken for a file under review: ${name}`, async ($, on) => {
+    mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+    on('session.cwd', () => ({ value: 'C:/proj' }))
+    seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg', 'wt'], promptPending: false, ownFolder: [...ownFolder] })
+    const { out, stop } = cycle($, on)
+    on('agent.spawn', () => ({ agentId: 'bg', model: 'm' }))
+    await steps($)
+    await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
+    out.agents = []
+    expect(await stop(true)).toBe(undefined)
+    expect((await stop())?.includes('app.py')).toBe(true) // not taken for a fix: reviewed
+  })
+}
+
+test('agents in a folder of their own saved before a reload are kept when the first read fails', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  let failing = true
+  on('state.get', ($, e, next) => {
+    if (e.plugin !== 'review-guard' || e.key !== 'cycle') return next(e)
+    if (failing) return { deny: 'not yet' }
+    return { value: { value: { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false, ownFolder: ['wt'] } as never, version: 0 } }
+  })
+  const { out, edit, stop } = cycle($, on)
+  let next = 'h'
+  on('agent.spawn', () => ({ agentId: next, model: 'm' }))
+  // While the saved state can't be read, this start changes the cycle (it marks h); then the read works.
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', cwd: 'C:/wt' } as never)
+  failing = false
+  out.agents = [{ id: 'wt', status: 'idle' }] // other work as the review starts: started again, it joins
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true) // a review starts
+  // wt, saved before the reload as in a folder of its own, is resumed (no cwd given) and joins the review.
+  next = 'wt'
+  await $.agent.spawn({ tool_use_id: 't2', prompt: 'p', description: 'd', resume: { agentId: 'wt' } } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'wt' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true) // not taken for a fix: reviewed
+})
+
+test('until the saved state is read back, no relative path is read against the session folder', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('state.get', ($, e, next) => (e.plugin === 'review-guard' && e.key === 'cycle' ? { deny: 'not yet' } : next(e)))
+  const { out, edit, stop } = cycle($, on)
+  // A review starts in this load, with bg already at work; the main conversation then messages bg: it joins.
+  out.agents = [{ id: 'bg', status: 'running' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  await $.session.send({ to: 'bg', text: 'fix the findings', origin: { kind: 'tool' } } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true) // the saved list may hold bg: not taken for a fix
+})
+
+test('a helper started before the saved state is read back counts as in a folder of its own', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  on('session.send', () => ({ isDelivered: true }))
+  let failing = true
+  on('state.get', ($, e, next) => (e.plugin === 'review-guard' && e.key === 'cycle' && failing ? { deny: 'not yet' } : next(e)))
+  const { out, edit, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'h', model: 'm' }))
+  out.agents = [{ id: 'bg', status: 'running' }]
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  await $.session.send({ to: 'bg', text: 'fix the findings', origin: { kind: 'tool' } } as never)
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'bg' } as never)
+  failing = false
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'h' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('an agent in a folder of its own stays so after a review ends, into the next one', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  const { out, edit, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true) // review 1
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', cwd: 'C:/wt' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined) // review 1 ends
+  out.agents = [{ id: 'wt', status: 'idle' }] // other work as review 2 starts: started again, it joins
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true) // review 2
+  await $.agent.spawn({ tool_use_id: 't2', prompt: 'p', description: 'd', resume: { agentId: 'wt' } } as never) // no cwd now
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'wt' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('on Windows started from Git Bash, OS decides: Windows rules hold', async ($, on) => {
+  mock.env(on, { OS: 'Windows_NT', HOME: '/c/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/App.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: 'c:\\proj\\app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect(await stop()).toBe(undefined) // a fix: the same file on Windows
+})
+
+test('a mark made before the saved state is read back does not end a saved review', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const logged: string[] = []
+  on('ui.log', (_$, e) => {
+    logged.push(e.text ?? '')
+    return { value: undefined }
+  })
+  let failing = true
+  const bad = ['x', 7, null]
+  on('state.get', ($, e, next) => {
+    if (e.plugin !== 'review-guard' || e.key !== 'cycle') return next(e)
+    if (failing) return { deny: 'not yet' }
+    return { value: { value: { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false, ownFolder: bad } as never, version: 0 } }
+  })
+  const { out, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', cwd: 'C:/wt' } as never) // marked, unread
+  failing = false
+  out.agents = []
+  expect(await stop(true)).toBe(undefined) // the saved review stands, and ends here with its fixes
+  expect(await stop()).toBe(undefined) // nothing put back in the queue
+  expect(logged.some(l => l.includes('was damaged'))).toBe(true) // a non-text entry in the saved list
+})
+
+test('an environment variable that cannot be read is logged once, by name', async ($, on) => {
+  const logged: string[] = []
+  on('ui.log', (_$, e) => {
+    logged.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('env.get', (_$, e) => (e.name === 'OS' ? { deny: 'blocked' } : { value: e.name === 'USERPROFILE' ? 'C:/Users/pat' : undefined }))
+  const { edit } = cycle($, on)
+  await edit('C:/proj/a.py')
+  await edit('C:/proj/b.py')
+  expect(logged.filter(l => l.includes('could not read OS')).length).toBe(1)
+})
+
+test('an agent marked before the saved state is read back stays marked once it is', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  let failing = true
+  on('state.get', ($, e, next) => {
+    if (e.plugin !== 'review-guard' || e.key !== 'cycle') return next(e)
+    if (failing) return { deny: 'not yet' }
+    return { value: { value: { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['wt'], promptPending: false, ownFolder: [] } as never, version: 0 } }
+  })
+  const { out, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', resume: { agentId: 'wt' }, cwd: 'C:/wt' } as never) // marked, unread
+  failing = false
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'wt' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true) // wt is still in a folder of its own: reviewed
+})
+
+test('a saved list cut to its cap is logged', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const logged: string[] = []
+  on('ui.log', (_$, e) => {
+    logged.push(e.text ?? '')
+    return { value: undefined }
+  })
+  seed(on, { reviewing: false, ownFolder: Array.from({ length: 501 }, (_, i) => `a${i}`) })
+  const { edit } = cycle($, on)
+  await edit('C:/proj/a.py') // only reads the saved state back
+  expect(logged.filter(l => l.includes('no longer remembered')).length).toBe(1)
+})
+
+test('an agent resumed from one in a folder of its own, or started before the saved list is read, is in one too', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  on('session.cwd', () => ({ value: 'C:/proj' }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['wt', 'new'], promptPending: false, ownFolder: ['wt'] })
+  const { out, stop } = cycle($, on)
+  on('agent.spawn', () => ({ agentId: 'new', model: 'm' }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', resume: { agentId: 'wt' } } as never) // goes on as `new`
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'new' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('the list of agents in a folder of their own keeps each once, the last marked or used, and at most 500', () => {
+  expect(ownFolderOf(['a', 'b', 'a'])).toEqual(['b', 'a'])
+  const many = Array.from({ length: 600 }, (_, i) => `a${i}`)
+  expect(ownFolderOf([...many, 'a0'])).toEqual([...many.slice(101), 'a0'])
+})
+
+test('a command that runs in another folder by an option counts as changing folder', () => {
+  for (const c of ['git -C sub add x.py', 'make -C sub', 'Start-Process python -WorkingDirectory sub', '[Environment]::CurrentDirectory = "sub"', 'npm --prefix sub run x', 'cd sub', 'Set-Location sub',
+    'env --chdir=sub sed -i s/a/b/ app.py', 'sudo -D sub sed -i x app.py', 'make --directory=sub', 'pnpm --dir sub build', 'make -Csub', 'git -Csub add x.py',
+    'python -c "import os; os.chdir(\'sub\')"', 'node -e "process.chdir(\'sub\')"']) {
+    expect(CHANGES_FOLDER.test(c)).toBe(true)
+  }
+  for (const c of ['sed -i s/a/b/ app.py', 'python -c "print(1)"', 'git commit -m "x"', 'abcd x',
+    'Copy-Item -Path a.py -Destination b.py', 'powershell -Command "Get-Date"', 'Remove-Item x.py -Confirm:$false']) {
+    expect(CHANGES_FOLDER.test(c)).toBe(false)
+  }
+})
+
+test('the agents in a folder of their own are saved, also outside a review', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const saved: unknown[] = []
+  on('state.set', ($, e, next) => {
+    saved.push((e as { value?: unknown }).value)
+    return next(e)
+  })
+  on('agent.spawn', () => ({ agentId: 'wt', model: 'm' }))
+  await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', cwd: 'C:/wt' } as never)
+  expect(cycleFrom(saved.at(-1)).ownFolder).toEqual(['wt'])
+  expect(cycleFrom(saved.at(-1)).reviewing).toBe(false)
+  expect(cycleFrom({ reviewing: false, ownFolder: ['wt', 'wt', 3] }).ownFolder).toEqual(['wt'])
+  expect(cycleFrom({ ownFolder: Array.from({ length: 600 }, (_, i) => `a${i}`) }).ownFolder).toEqual(Array.from({ length: 500 }, (_, i) => `a${i + 100}`))
+})
+
+test('on Windows a path with no drive is never taken for a file under review', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  // `/proj/app.py` from Git Bash is Git's own folder; `\proj\app.py` in PowerShell is the current drive's.
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { '/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'PowerShell', command: 'Set-Content -Path \\proj\\app.py -Value x', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('\\proj\\app.py')).toBe(true) // its own work, reviewed
+})
+
+test('Windows is told by OS, else by a drive-letter USERPROFILE with no Unix HOME', () => {
+  expect(isWindows({ os: 'Windows_NT' })).toBe(true)
+  expect(isWindows({ os: 'Windows_NT', userProfile: 'C:\\Users\\pat', home: '/c/Users/pat' })).toBe(true)
+  expect(isWindows({ userProfile: 'C:/Users/pat' })).toBe(true)
+  expect(isWindows({ userProfile: 'C:\\Users\\pat', home: 'C:\\Users\\pat' })).toBe(true)
+  expect(isWindows({ userProfile: 'C:\\Users\\pat', home: '/home/pat' })).toBe(false) // WSL or Linux with it passed in
+  expect(isWindows({ userProfile: '/mnt/c/Users/pat' })).toBe(false)
+  expect(isWindows({ userProfile: 'C:\\Users\\pat', home: '/c/Users/pat' })).toBe(true) // started from Git Bash
+  expect(isWindows({ os: 'Linux', userProfile: 'C:\\Users\\pat', home: '/home/pat' })).toBe(false)
+  expect(isWindows({ home: '/home/pat' })).toBe(false)
+  expect(isWindows({ userProfile: 'C:foo' })).toBe(false) // a drive-relative name is no profile folder
+})
+
+test('on Linux a USERPROFILE passed in does not make case count for nothing', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:\\Users\\pat', HOME: '/home/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { '/home/pat/proj/App.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: '/home/pat/proj/app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/home/pat/proj/App.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('/home/pat/proj/app.py')).toBe(true) // another file there: reviewed
+  expect(next?.includes('/home/pat/proj/App.py')).toBe(false) // the file under review itself: a fix
+})
+
+test('a session folder that cannot be read is logged once, until a read works again, and its relative paths are not matched', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const said: string[] = []
+  on('ui.log', (_$, e) => {
+    said.push(e.text ?? '')
+    return { value: undefined }
+  })
+  let folder: unknown = { deny: 'no folder' }
+  on('session.cwd', () => (typeof folder === 'object' && folder !== null ? folder as never : { value: folder as never }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  const sed = () => $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
+  const lines = () => said.filter(l => l.includes("could not read the session's folder"))
+  await sed()
+  await sed()
+  expect(lines().length).toBe(1) // said once
+  expect(lines()[0]).toContain('no folder') // with the reason
+  expect(lines()[0]).toContain('relative paths are not matched')
+  folder = 42 // not a folder: said as such, and never thrown on
+  await sed()
+  expect(lines().length).toBe(1) // still the same failure
+  folder = 'C:/proj' // a read works again, and that is logged too
+  await sed()
+  expect(said.some(l => l.includes("read the session's folder again"))).toBe(true)
+  folder = '  ' // and fails again: said again
+  await sed()
+  expect(lines().length).toBe(2)
+  expect(lines()[1]).toContain('empty')
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true) // a write with no sure folder is not taken for a fix: reviewed
+})
+
+test('a folder that is not text is logged with its kind and its paths are still reviewed', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const said: string[] = []
+  on('ui.log', (_$, e) => {
+    said.push(e.text ?? '')
+    return { value: undefined }
+  })
+  on('session.cwd', () => ({ value: {} as never }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ app.py', agentId: 'bg' } as never)
+  expect(said.some(l => l.includes("could not read the session's folder (the folder given was object)"))).toBe(true)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('a PowerShell path spelled /c/... is not taken for drive C', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'PowerShell', command: 'Set-Content -Path /c/proj/app.py -Value x', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('/c/proj/app.py')).toBe(true) // its own work, reviewed
+})
+
+test('a Git Bash path spelled /c/... is drive C: a fix to a file under review', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/app.py', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/other.py', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  const next = await stop()
+  expect(next?.includes('app.py')).toBe(false) // its fix
+  expect(next?.includes('C:/proj/other.py')).toBe(true) // its own work, stored by its drive
+})
+
+test('a key from PowerShell spelled /c/... is a folder c, so a change to drive C is not its fix', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { '/c/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/app.py', agentId: 'bg' } as never) // C:\proj\app.py
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('C:/proj/app.py')).toBe(true) // another file: reviewed
+})
+
+test('the edit tools on Windows read /c/... as a folder c, as Windows does', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: '/c/proj/app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('/c/proj/app.py')).toBe(true) // not drive C's app.py: reviewed
+})
+
+test('off Windows a \\ is part of a file name, so a\\b.py is not a/b.py', async ($, on) => {
+  on('session.cwd', () => ({ value: '/home/pat/proj' }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { '/home/pat/proj/a/b.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: '/home/pat/proj/a\\b.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop())?.includes('a\\b.py')).toBe(true) // another file: reviewed
+})
+
 test('a helper started by an agent that joined the review joins it too', async ($, on) => {
-  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false })
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' }) // Windows: `C:/...` is a full path only there
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/app.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
   const { out, stop } = cycle($, on)
   on('agent.spawn', () => ({ agentId: 'h1', model: 'm' }))
   await $.agent.spawn({ tool_use_id: 't', prompt: 'p', description: 'd', parentAgentId: 'bg' } as never)
@@ -1848,6 +2233,8 @@ test('knows scratch folders, and which scripts a command only runs and where', a
   const temp = [TEMP]
   expect(inScratch(`${TEMP.replace(/\//g, '\\')}\\claude\\a\\s.py`, temp, true, true)).toBe(true)
   expect(inScratch('/c/users/PAT/appdata/local/temp/CLAUDE/a.py', temp, true, true)).toBe(true) // Git Bash, any case on Windows
+  expect(inScratch('/c/users/pat/appdata/local/temp/claude/a.py', temp, true, false)).toBe(false) // PowerShell: a folder c
+  expect(inScratch('/tmp\\claude-1/a.py', [], false, true)).toBe(false) // off Windows a \ is part of a name
   expect(inScratch('/tmp/claude-1000/a.py', [], false, true)).toBe(true)
   expect(inScratch('/TMP/claude-1000/a.py', [], false, true)).toBe(false) // Linux names keep their case
   expect(inScratch('/tmp/claude-1/a.py', [], true, false)).toBe(false) // PowerShell: /tmp is C:\tmp
@@ -1861,6 +2248,12 @@ test('knows scratch folders, and which scripts a command only runs and where', a
   expect([...runOnlyScripts(RUN_AFTER_NOTES, WIN)]).toEqual([['.scripts/memory-map.py', MAP]])
   expect([...runOnlyScripts('cd ~/proj && python3 -I gen.py 2>&1 | tail -3', LINUX)]).toEqual([['gen.py', '/home/pat/proj/gen.py']])
   expect([...runOnlyScripts('node "C:/tools/b.mjs" out.html', WIN)]).toEqual([['C:/tools/b.mjs', 'C:/tools/b.mjs']])
+  // `/c/...` is drive C in Git Bash only: in PowerShell it is a folder `c` on the current drive.
+  expect([...runOnlyScripts('python /c/tools/gen.py', WIN).values()]).toEqual(['C:/tools/gen.py'])
+  expect([...runOnlyScripts('python /c/tools/gen.py', WIN, true).values()].includes('C:/tools/gen.py')).toBe(false)
+  // With a start folder known: a rooted path with no drive is not joined onto it, nor read as drive C.
+  expect([...runOnlyScripts('cd C:/proj && python /c/tools/gen.py', WIN, true).values()]).toEqual([])
+  expect([...runOnlyScripts('cd C:/proj && python /tools/gen.py', WIN).values()]).toEqual([])
   // A backslash anywhere can escape a quote the here-document split can't follow: no candidates, so reviewed.
   expect([...runOnlyScripts('node "C:\\tools\\b.mjs" out.html', WIN)]).toEqual([])
   // PowerShell's `~` is the profile folder, not HOME.

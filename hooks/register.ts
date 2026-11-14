@@ -20,6 +20,7 @@ import {
   scanValue,
   settle,
   shellWrites,
+  CHANGES_FOLDER,
 } from './scan.ts'
 import { scannerSteps } from './scanners.ts'
 import { type Config, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
@@ -48,14 +49,27 @@ import { type LeftOut, type StatusFile, statusDir, statusFileName } from './stat
 // to forget the review was running, so its own fixes were reviewed again. After a reload the first
 // hook reads the copy back. A failed copy loses nothing now; it only risks that after a reload.
 const CYCLE = { plugin: 'review-guard', key: 'cycle' } as const
-const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false }
+const EMPTY: Cycle = { reviewing: false, held: false, changed: {}, underReview: {}, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false, ownFolder: [] }
+
+const OWN_FOLDER_KEPT = 500 // agents remembered in `ownFolder`: the 500 marked last
+
+/** The strings in a stored list; anything else (or no list) gives none. */
+function texts(x: unknown): string[] {
+  return Array.isArray(x) ? x.filter((y): y is string => typeof y === 'string') : []
+}
+
+/** `ownFolder` as kept: each agent once, at its last place, and only the last `OWN_FOLDER_KEPT`. */
+export function ownFolderOf(ids: readonly string[]): string[] {
+  const last = [...new Set([...ids].reverse())].reverse()
+  return last.slice(-OWN_FOLDER_KEPT)
+}
 
 let cycle: Cycle = copyOf(EMPTY)
 let loaded: Promise<void> | undefined // reading the copy back, once per load of the module
 let saving: Promise<void> = Promise.resolve() // the copies, written one after another
 
 function copyOf(c: Cycle): Cycle {
-  return { reviewing: c.reviewing, held: c.held, changed: { ...c.changed }, underReview: { ...c.underReview }, othersAtStart: [...c.othersAtStart], othersChanged: { ...c.othersChanged }, joined: [...c.joined], promptPending: c.promptPending }
+  return { reviewing: c.reviewing, held: c.held, changed: { ...c.changed }, underReview: { ...c.underReview }, othersAtStart: [...c.othersAtStart], othersChanged: { ...c.othersChanged }, joined: [...c.joined], promptPending: c.promptPending, ownFolder: [...c.ownFolder] }
 }
 
 /** A stored value as a cycle, with anything missing or malformed (null, wrong types) read as empty. */
@@ -66,12 +80,13 @@ export function cycleFrom(value: unknown): Cycle {
     typeof x === 'object' && x !== null && !Array.isArray(x)
       ? Object.fromEntries(Object.entries(x).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
       : {}
-  const texts = (x: unknown): string[] => (Array.isArray(x) ? x.filter((y): y is string => typeof y === 'string') : [])
   // A copy from before 0.3.4 has no list of other agents: then every agent still out holds the review open.
   const ids = texts(v.othersAtStart)
   const c: Cycle = {
     reviewing: v.reviewing === true, held: v.held === true, changed: files(v.changed), underReview: files(v.underReview),
     othersAtStart: [...new Set(ids)], othersChanged: files(v.othersChanged), joined: [...new Set(texts(v.joined))], promptPending: v.promptPending === true,
+    // Kept outside a review too: an agent may join a later one. Only the newest are kept.
+    ownFolder: ownFolderOf(texts(v.ownFolder)),
   }
   // Put right what a stored copy may hold wrongly (written by hand, damaged, or by another version).
   if (!c.reviewing) {
@@ -104,11 +119,26 @@ function ensureLoaded($: EngineInterface): Promise<void> {
   loaded ??= $.state.get(CYCLE).then(
     ({ value }) => {
       const stored = cycleFrom(value)
+      // `ownFolder` is only ever added to, so both lists are kept: an agent marked before the reload stays
+      // marked, and one marked meanwhile (which alone does not count as a change, so a saved review stands).
+      const ownFolder = ownFolderOf([...stored.ownFolder, ...cycle.ownFolder])
       cycle = changedUnread
-        ? { ...cycle, changed: { ...stored.underReview, ...stored.othersChanged, ...stored.changed, ...cycle.changed }, underReview: { ...cycle.underReview } }
-        : stored
+        ? {
+            ...cycle,
+            changed: { ...stored.underReview, ...stored.othersChanged, ...stored.changed, ...cycle.changed },
+            underReview: { ...cycle.underReview },
+            ownFolder,
+          }
+        : { ...stored, ownFolder }
       readBack = true
-      if (readFailSaid) say($, 'review-guard: read back its review state after all; nothing waiting for review was lost')
+      const saved: unknown = typeof value === 'object' && value !== null ? (value as { ownFolder?: unknown }).ownFolder : undefined
+      const damaged = saved !== undefined && (!Array.isArray(saved) || saved.some(x => typeof x !== 'string'))
+      if (damaged) logLine($, "review-guard: its saved list of agents in a folder of their own was damaged, so earlier agents' relative paths may be read against the session's folder")
+      if (new Set([...stored.ownFolder, ...cycle.ownFolder]).size > ownFolder.length || texts(saved).length > OWN_FOLDER_KEPT) ownFolderCut($)
+      if (readFailSaid) {
+        readFailSaid = false
+        say($, 'review-guard: read back its review state after all; nothing waiting for review was lost')
+      }
     },
     err => {
       loaded = undefined
@@ -171,7 +201,7 @@ function writeStatus($: EngineInterface, ended = false): Promise<void> {
         statusFailed = undefined
         return
       }
-      const folder = await safely(() => $.session.cwd())
+      const folder = await sessionFolder($)
       const status: StatusFile = {
         v: 1,
         session,
@@ -240,27 +270,65 @@ function hookFailed($: EngineInterface, what: string, failure: unknown, advice: 
 
 /**
  * Puts a line on the status line. A failure to show it never stops anything: the line goes to the log
- * instead, so it still leaves a trace. (`ui.status` is typed to return nothing; a promise from it is
- * handled all the same.)
+ * instead, so it still leaves a trace. (`ui.status` and `ui.log` are typed to return nothing; a promise
+ * from either is handled all the same.)
  */
 export function say($: EngineInterface, text: string): void {
-  const toLog = () => {
-    try {
-      $.ui.log(text)
-    } catch { /* nowhere left to say it */ }
-  }
   try {
     const shown: unknown = $.ui.status(text)
-    if (typeof (shown as { then?: unknown } | undefined)?.then === 'function') (shown as PromiseLike<unknown>).then(undefined, toLog)
+    if (typeof (shown as { then?: unknown } | undefined)?.then === 'function') (shown as PromiseLike<unknown>).then(undefined, () => logLine($, text))
   } catch {
-    toLog()
+    logLine($, text)
   }
 }
 
-/** How paths are spelled here. Windows is told by USERPROFILE, which Windows always sets. */
+/**
+ * Puts a line in the log only, for what never means less review: the status line may hold a guard
+ * notice that must stay seen. A failure to log is dropped, as there is nowhere left to say it.
+ */
+export function logLine($: EngineInterface, text: string): void {
+  try {
+    const logged: unknown = $.ui.log(text)
+    if (typeof (logged as { then?: unknown } | undefined)?.then === 'function') (logged as PromiseLike<unknown>).then(undefined, () => undefined)
+  } catch { /* nowhere left to say it */ }
+}
+
+const envFailSaid = new Set<string>() // environment variables that could not be read, each logged once
+
+/**
+ * An environment variable read by `read` (the engine wants each name written out at its call), or
+ * undefined when unset or unreadable; a read that fails is logged once, by `name`.
+ */
+async function envValue($: EngineInterface, name: string, read: () => Promise<string | undefined>): Promise<string | undefined> {
+  try {
+    return await read()
+  } catch (err) {
+    if (!envFailSaid.has(name)) {
+      envFailSaid.add(name)
+      logLine($, `review-guard: could not read ${name} (${whyOf(err)}), so how paths are spelled here may be misread`)
+    }
+    return undefined
+  }
+}
+
+/** How paths are spelled here (see `isWindows`). A variable that can't be read is logged once. */
 async function pathsHere($: EngineInterface): Promise<Paths> {
-  const userProfile = await safely(() => $.env.get('USERPROFILE'))
-  return { windows: userProfile !== undefined, home: await safely(() => $.env.get('HOME')), userProfile }
+  const userProfile = await envValue($, 'USERPROFILE', () => $.env.get('USERPROFILE'))
+  const home = await envValue($, 'HOME', () => $.env.get('HOME'))
+  const os = await envValue($, 'OS', () => $.env.get('OS'))
+  return { windows: isWindows({ os, userProfile, home }), home, userProfile }
+}
+
+/**
+ * Whether these environment values are Windows'. OS is `Windows_NT` on Windows, always. Without it: a
+ * USERPROFILE with a drive letter, and a HOME that is missing, a Windows path, or Git Bash's `/c/...`.
+ * Linux and WSL normally have a HOME like `/home/pat`, and may have a USERPROFILE passed in from Windows.
+ */
+export function isWindows(env: { os?: string; userProfile?: string; home?: string }): boolean {
+  if (env.os === 'Windows_NT') return true
+  if (env.userProfile === undefined || !/^[a-zA-Z]:[\\/]/.test(env.userProfile)) return false
+  const home = env.home ?? ''
+  return !home.startsWith('/') || /^\/[a-zA-Z](?:\/|$)/.test(home)
 }
 
 /** The machine's temp folders (TEMP, TMP, TMPDIR). One that can't be read is left out. */
@@ -287,20 +355,49 @@ async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string
   await writeStatus($)
 }
 
+let folderFailSaid = false // a session folder that could not be read is logged once, until a read works again
+
 /**
- * A path spelled so that two spellings of one file compare equal: `/` for `\`, Git Bash's `/c/...` as
- * `C:/...` on Windows, a relative path (a shell command's own spelling, `sed -i x app.py`) resolved
- * against `folder` when one is given, `.` and `..` steps taken, and on Windows case ignored. The caller
- * gives no folder when it can't be sure which one a relative path is from (a command that changed folder
- * first, an agent working in a folder of its own): then a relative path stays relative and can only fail
- * to match a full one, which means more review, never less.
+ * The session's folder, or undefined. A failure to read it, or an empty answer, leaves relative paths
+ * unresolved (they then never count as a file under review: more review, never less). It is logged once,
+ * not put on the status line, which may hold a guard notice; a read that works again is logged too, so a
+ * later failure is logged again.
  */
-export function samePath(path: string, folder: string | undefined, windows: boolean): string {
-  let p = path.replace(/\\/g, '/')
-  if (windows) p = p.replace(/^\/([a-zA-Z])(?=\/|$)/, (_m, drive: string) => `${drive.toUpperCase()}:`)
+async function sessionFolder($: EngineInterface): Promise<string | undefined> {
+  try {
+    const folder: unknown = await $.session.cwd()
+    if (typeof folder === 'string' && folder.trim() !== '') {
+      if (folderFailSaid) logLine($, "review-guard: read the session's folder again; relative paths are matched again")
+      folderFailSaid = false
+      return folder
+    }
+    throw new Error(`the folder given was ${typeof folder === 'string' ? 'empty' : typeof folder}`)
+  } catch (err) {
+    if (!folderFailSaid) {
+      folderFailSaid = true
+      logLine($, `review-guard: could not read the session's folder (${whyOf(err)}), so relative paths are not matched to files under review`)
+    }
+    return undefined
+  }
+}
+
+/**
+ * A path spelled so that two spellings of one file compare equal: on Windows `/` for `\` and case ignored
+ * (elsewhere a `\` is part of a file name and stays), Git Bash's `/c/...` as `C:/...` when `gitBash` (the
+ * path came from Git Bash on Windows: in PowerShell `/c/...` is a folder `c` on the current drive), a
+ * relative path (a shell command's own spelling, `sed -i x app.py`) resolved against `folder` when one is
+ * given, and `.` and `..` steps taken. `gitBash` has no default: a stored key or a native path is read
+ * with it false. The caller gives no folder when it can't be sure which one a relative path is from (a
+ * command that changes folder, an agent in `ownFolder`, a session folder that could not be read, or a
+ * review state not yet read back): then a relative path stays relative and can only fail to match a
+ * full one, which means more review, never less.
+ */
+export function samePath(path: string, folder: string | undefined, windows: boolean, gitBash: boolean): string {
+  let p = windows ? path.replace(/\\/g, '/') : path
+  if (windows && gitBash) p = p.replace(/^\/([a-zA-Z])(?=\/|$)/, (_m, drive: string) => `${drive.toUpperCase()}:`)
   const absolute = (windows && /^[a-zA-Z]:(\/|$)/.test(p)) || p.startsWith('/')
   if (!absolute && folder) {
-    const base = samePath(folder, undefined, windows)
+    const base = samePath(folder, undefined, windows, false) // the session's folder is a native path
     if (base !== '') p = base.endsWith('/') ? `${base}${p}` : `${base}/${p}`
   }
   const rooted = (windows && /^[a-zA-Z]:(\/|$)/.test(p)) || p.startsWith('/')
@@ -319,12 +416,50 @@ export function samePath(path: string, folder: string | undefined, windows: bool
   return windows ? joined.toLowerCase() : joined
 }
 
+let ownFolderCutSaid = false // the list of agents in a folder of their own grew past its cap: logged once
+
+/** Says once, in the log, that the list of agents in a folder of their own was cut to its cap. */
+function ownFolderCut($: EngineInterface): void {
+  if (ownFolderCutSaid) return
+  ownFolderCutSaid = true
+  logLine($, `review-guard: more than ${OWN_FOLDER_KEPT} agents worked in a folder of their own; the oldest are no longer remembered`)
+}
+
+/**
+ * From now on, `id`'s relative paths are not read against the session's folder: saved, so a reload keeps
+ * it. Only the last `OWN_FOLDER_KEPT` agents marked are kept, so an agent marked again moves to the end;
+ * one dropped past the cap is logged once. Before the saved state is read back, the mark is kept in memory
+ * only and joined to the saved list when it is read, so a mark alone never ends a saved review.
+ */
+async function inOwnFolder($: EngineInterface, id: string): Promise<void> {
+  await ensureLoaded($)
+  if (cycle.ownFolder.at(-1) === id) return
+  const mark = (c: Cycle) => {
+    const before = c.ownFolder.filter(x => x !== id).length + 1
+    c.ownFolder = ownFolderOf([...c.ownFolder, id])
+    return before > c.ownFolder.length
+  }
+  const cut = readBack ? await updateCycle($, mark) : mark(cycle)
+  if (cut) ownFolderCut($)
+}
+
+/**
+ * How a changed file is stored: as it was spelled, except that Git Bash's `/c/...` on Windows
+ * (`gitBashOnWindows`) is stored as `C:/...`. A key still spelled `/c/...` then came from PowerShell or
+ * an edit tool, where it is a folder `c` on the current drive, or from a copy saved before 0.3.7; either
+ * way it never matches a drive C path, which means more review, never less.
+ */
+export function keyOf(path: string, gitBashOnWindows: boolean): string {
+  return gitBashOnWindows ? path.replace(/^\/([a-zA-Z])(?=\/|$)/, (_m, drive: string) => `${drive.toUpperCase()}:`) : path
+}
+
 /**
  * Code files were just changed: they wait for a review, and an interrupted task has picked up again.
  * Files in Claude's scratch folders (`inScratch`) are throwaway: they are left out, and an edit only to
  * them does not count as work picking up again. `posixTmp`: whether /tmp means the Unix temp folder
- * (not for the PowerShell tool). `keepScratch`: keep them too (a copy or move may have taken them into
- * the project). `agentId`: the agent that made the change, when not the main loop. During a review, an
+ * (not for the PowerShell tool); on Windows it is true only for Git Bash, whose `/c/...` is drive C (see
+ * `keyOf`). `keepScratch`: keep them too (a copy or move may have taken them into the project).
+ * `agentId`: the agent that made the change, when not the main loop. During a review, an
  * agent that is other work (`othersAtStart`) has its files wait for a review of their own instead of
  * counting as the review's fixes, and so does one that joined the review (`joined`) for any file not
  * under review. Returns the scratch files left out.
@@ -336,26 +471,32 @@ async function remember($: EngineInterface, changed: [string, string][], posixTm
   // spells them, so another spelling of a file under review still counts as that file.
   const { windows: onWindows } = await pathsHere($)
   // Relative paths are read against the session's folder only when that is surely where they are from:
-  // not after the command changed folder (`sameFolder` false), nor for an agent with a folder of its own.
-  // Read only when a joined agent's edit needs the comparison.
+  // not when the command changes folder (`sameFolder` false), nor for an agent in `ownFolder` (started in
+  // a folder of its own, by such an agent, or after an earlier `cd`), nor before the saved state is read
+  // back (the saved `ownFolder` is not known yet). Read only when a joined agent's edit needs it.
   await ensureLoaded($)
   const needed = agentId !== undefined && cycle.reviewing && cycle.joined.includes(agentId)
-  const folder = needed && sameFolder && !ownFolder.has(agentId) ? await safely(() => $.session.cwd()) : undefined
+  const folder = needed && sameFolder && readBack && !cycle.ownFolder.includes(agentId) ? await sessionFolder($) : undefined
   // Only full paths can match: a relative one (a stored key, or a path that could not be resolved) never
   // does, as the folder it was relative to may not be the one seen now.
-  const full = (x: string) => /^[a-z]:\//i.test(x) || x.startsWith('/')
-  const path0 = (path: string) => samePath(path, folder, onWindows)
+  // On Windows a path must have a drive: `/proj/x.py` is the current drive's root in PowerShell but under
+  // Git's install folder in Git Bash, so it is not sure which file it names.
+  const full = (x: string) => (onWindows ? /^[a-z]:\//i.test(x) : x.startsWith('/'))
+  // On Windows, `posixTmp` is true only for a path from Git Bash (not PowerShell, nor the edit tools).
+  // Stored keys are spelled by `keyOf`, so one still spelled `/c/...` is a folder `c`, not drive C.
+  const path0 = (path: string) => samePath(path, folder, onWindows, posixTmp)
   const underReview = (c: Cycle, path: string) => {
     const p = path0(path)
-    return full(p) && Object.keys(c.underReview).some(k => samePath(k, undefined, onWindows) === p)
+    return full(p) && Object.keys(c.underReview).some(k => samePath(k, undefined, onWindows, false) === p)
   }
+  const key = (path: string) => keyOf(path, onWindows && posixTmp)
   const queueFor = (c: Cycle, path: string) =>
     c.reviewing && agentId !== undefined && (c.othersAtStart.includes(agentId) || (c.joined.includes(agentId) && !underReview(c, path)))
       ? c.othersChanged
       : c.changed
   if (keepScratch) {
     await updateCycle($, c => {
-      for (const [path, lang] of changed) queueFor(c, path)[path] = lang
+      for (const [path, lang] of changed) queueFor(c, path)[key(path)] = lang
       c.held = false
     })
     return []
@@ -365,7 +506,7 @@ async function remember($: EngineInterface, changed: [string, string][], posixTm
   const files = changed.filter(([path]) => !scratch.includes(path))
   if (files.length === 0) return scratch
   await updateCycle($, c => {
-    for (const [path, lang] of files) queueFor(c, path)[path] = lang
+    for (const [path, lang] of files) queueFor(c, path)[key(path)] = lang
     c.held = false
   })
   return scratch
@@ -488,11 +629,6 @@ export function underWayFor(began: Began, engine: number | undefined, machine: n
   const onMachine = machine - began.machine
   return engine !== undefined && began.engine !== undefined ? Math.max(engine - began.engine, onMachine) : onMachine
 }
-// Agents started in a folder of their own (a worktree): their relative paths are not the session's.
-const ownFolder = new Set<string>()
-// A command that changes folder before writing: its relative paths are not the session's either.
-const CHANGES_FOLDER = /(?:^|[^\w$.-])(?:cd|chdir|pushd|popd|Set-Location|sl|Push-Location|Pop-Location)(?![\w-])/i
-
 // How many reviews this load has started, so a start that began before the running review is told apart.
 let reviewsStarted = 0
 /**
@@ -623,6 +759,15 @@ const mayStillRun = (result: { result?: unknown }) => {
 async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string): Promise<R> {
   try {
     if (result.deny === undefined) {
+      // A command that changes folder (`CHANGES_FOLDER`): its relative paths are not the session's. A shell
+      // may keep the new folder, so neither are those of the same agent's later commands: that agent goes
+      // into `ownFolder`. A word that is not really a command (in a message, say) only means more review.
+      // A failure is logged, not shown: the status line may hold the guard's notice (`said`).
+      if (agentId !== undefined && CHANGES_FOLDER.test(command)) {
+        await inOwnFolder($, agentId).catch(err => {
+          logLine($, `review-guard: could not record an agent that changed folder (${whyOf(err)}); its relative paths may be matched against the wrong folder`)
+        })
+      }
       const written = shellWrites(command)
       const compare = written.length > 0 && before.length > 0 && !mayStillRun(result)
       const onlyRun = compare ? await untouched($, before).catch(() => new Set<string>()) : new Set<string>()
@@ -940,7 +1085,8 @@ export const register: Register = on => {
 
   // During a review, who is other work follows the engine's own events: an agent started or started again
   // (`agent.spawn`, with the loop that did it), and a message one loop sends to an agent of this session
-  // (`session.send`, with the sender). A refused start or an undelivered message changes nothing.
+  // (`session.send`, with the sender). A refused start or an undelivered message changes nothing. Review
+  // or not, `agent.spawn` also records the agents that work in a folder of their own (`ownFolder`).
   on('agent.spawn', async ($, e, next) => {
     // Counted before the start, as the agent may show in the list while it happens, and under way until it
     // settles, so a check that reads the list in between keeps the review open.
@@ -963,14 +1109,25 @@ export const register: Register = on => {
       stuckEndSaid.delete(token)
     }
     if (result.deny === undefined && counted) agentStarts++
+    // For a resume, `next` settles with the id the run continues under.
+    const id = result.deny === undefined ? (result.agentId ?? e.resume?.agentId) : undefined
     try {
-      // For a resume, `next` settles with the id the run continues under.
-      const id = result.deny === undefined ? (result.agentId ?? e.resume?.agentId) : undefined
-      if (id && typeof (e as { cwd?: unknown }).cwd === 'string') ownFolder.add(id)
       if (id) await handOn($, e.parentAgentId, id, reviewsStarted !== reviewsBefore, e.resume === undefined)
     } catch (err) {
       hookFailed($, 'could not record an agent started during the review', err,
         'its work may be counted on the wrong side of the review')
+    }
+    try {
+      await ensureLoaded($) // a read that failed before the start is tried again: the saved list is needed
+      // In a folder of its own, review or not: started (or started again) with one, started by an agent on
+      // the list (by the engine, no `cwd` is the parent's folder; for an agent there after a `cd` this is
+      // only careful), resumed from one on the list, or started before the saved list could be read.
+      const listed = (x: string | undefined) => x !== undefined && cycle.ownFolder.includes(x)
+      const own = typeof (e as { cwd?: unknown }).cwd === 'string' || listed(e.parentAgentId) || listed(e.resume?.agentId)
+        || (!readBack && e.parentAgentId !== undefined)
+      if (id && own) await inOwnFolder($, id)
+    } catch (err) {
+      hookFailed($, 'could not record a started agent', err, "its relative paths may be read against the session's folder")
     }
     return result
   }).catch(($, e, next) => {

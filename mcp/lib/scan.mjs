@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 6fe9a1671793281f9f22dcd102b31bbad5b5db0beff4f1f5d4d7b1f9f69b86f7 built-sha256: 6382822c1a1f03a96c1a4ab455b74bda5c3423de27ea9fdc17d37995a1de6425
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: a07ec124b128fa3029ff43a4d68559565a0c3e083832729ff22ca9b8c77fd399 built-sha256: 4c651fbd563cb614887a4b571fee02cb3dd9eb01a7e12594651ef5ed5abd4d11
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -1058,34 +1058,53 @@ export function shellWrites(fullCommand        )           {
   return [...out]
 }
 
-/** How paths are spelled on this machine: Windows (drive letters, Git Bash `/c/`, any case) or not. */
+/** How paths are spelled on this machine: Windows (drive letters, Git Bash's `/c/` for its own paths, any case) or not. */
                                                                              
 
-// A path as one comparable string: forward slashes, no trailing slash, and on Windows Git Bash's `/c/` as
-// `C:/` and lower case (Linux file names are case-sensitive, so they keep theirs).
-function comparable(p        , windows         )         {
+// A path as one comparable string: no trailing slash, and on Windows forward slashes, Git Bash's `/c/` as
+// `C:/` (when `gitBash`: in PowerShell and the edit tools it is a folder `c`) and lower case. Elsewhere a
+// `\` is part of a file name and case counts, so they stay.
+function comparable(p        , windows         , gitBash         )         {
+  if (!windows) return p.trim().replace(/\/+$/, '')
   const s = p.trim().replace(/\\/g, '/').replace(/\/+$/, '')
-  return windows ? nativePath(s).toLowerCase() : s
+  return (gitBash ? nativePath(s) : s).toLowerCase()
 }
 
 /**
  * Whether a path is in one of Claude's own scratch folders: a `claude` or `claude-<number>` folder right inside
  * a temp folder (`tempDirs`, the machine's TEMP, TMP and TMPDIR, plus /tmp and /var/tmp when `posixTmp`:
- * the PowerShell tool reads /tmp as C:\tmp). That is where the session's scratchpad and task output live,
+ * on Windows that is Git Bash only, as PowerShell and the edit tools read /tmp as C:\tmp). That is where the session's scratchpad and task output live,
  * and code there is throwaway, so it is never sent for review. Anything else in a temp folder, such as a
  * repo cloned to /tmp, still is. A path with a `..`, and a temp folder that is not absolute or is a drive
  * root or `/`, never count.
  */
 export function inScratch(path        , tempDirs                   , windows         , posixTmp         )          {
-  const p = comparable(path, windows)
+  // On Windows `posixTmp` is true only for Git Bash, whose `/c/...` is drive C. The temp folders come
+  // from the environment as native paths, so their `/c/` is never read as a drive.
+  const p = comparable(path, windows, posixTmp)
   if (p.split('/').includes('..')) return false
-  const roots = [...tempDirs, ...(posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, windows))
+  const roots = [...tempDirs, ...(posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, windows, false))
   const claude = windows ? /^claude(?:-\d+)?\/./i : /^claude(?:-\d+)?\/./
   return roots.some(r => /^(?:[a-z]:)?\/[^/]/i.test(r) && p.startsWith(`${r}/`) && claude.test(p.slice(r.length + 1)))
 }
 
-// Words that move the shell to another folder, in Bash and PowerShell.
-const MOVES = /(?:^|[^\w$.-])(?:cd|chdir|pushd|popd|Set-Location|sl|Push-Location|Pop-Location)(?![\w-])/gi
+// Words that move the shell to another folder, in Bash and PowerShell (one source for both uses).
+const MOVES_SOURCE = String.raw`(?:^|[^\w$.-])(?:cd|chdir|pushd|popd|Set-Location|sl|Push-Location|Pop-Location)(?![\w-])`
+const MOVES = new RegExp(MOVES_SOURCE, 'gi')
+/**
+ * Whether a command may run something in another folder: a word above, a call that changes folder
+ * (`os.chdir(`, `process.chdir(`), or an option or setting that names one (`git -C`, `make -Csub`,
+ * `env --chdir`, `sudo -D`, `make --directory`, `pnpm --dir`, `-WorkingDirectory`, `CurrentDirectory`,
+ * `--cwd`, `--prefix`, `--work-tree`). Used to tell when a command's relative paths are not surely the
+ * session's; a false match only means more review.
+ */
+export const CHANGES_FOLDER                                     = {
+  test: command =>
+    new RegExp(String.raw`${MOVES_SOURCE}|\.chdir\s*\(|-WorkingDirectory\b|CurrentDirectory\b|--(?:cwd|prefix|work-tree|chdir|directory|dir)\b`, 'i').test(command)
+    // In their own case (`python -c` runs code), and joined to the folder only after the programs that
+    // take it so: PowerShell's `-Command`, `-Confirm` and `-Destination` change no folder.
+    || /(?:^|\s)-C\s|\b(?:git|make|tar)\b[^;&|\n]*\s-C\S|\bsudo\b[^;&|\n]*\s-D\s/.test(command),
+}
 
 /**
  * The command's parts split at `;`, `&&`, `||`, `|`, `&` and new lines outside quotes, each as its words
@@ -1167,8 +1186,9 @@ export function runOnlyScripts(command        , paths       , powershell = false
       e = paths.userProfile ? e.replace(/^[^\\/]+/, paths.userProfile) : ''
     }
     if (!e || /[$`%*?~]/.test(e)) return undefined
+    if (!paths.windows) return e // a `\` is part of a file name there
     const f = e.replace(/\\/g, '/')
-    return paths.windows ? nativePath(f) : f
+    return powershell ? f : nativePath(f) // in PowerShell `/c/...` is a folder `c`, not drive C
   }
   const absolute = (p        ) => (paths.windows ? /^[A-Za-z]:\// : /^\//).test(p)
   // The programs, after `sudo`, `env` and VAR=value.
@@ -1198,7 +1218,10 @@ export function runOnlyScripts(command        , paths       , powershell = false
     if (command.split(script).length - 1 !== n) continue
     const s = expand(script)
     if (s === undefined) continue
-    const place = absolute(s) ? s : base === undefined ? undefined : `${base}/${s.replace(/^(?:\.\/)+/, '')}`
+    // On Windows a path from the root with no drive (`/x/gen.py`, or PowerShell's `/c/...`) is not sure:
+    // it is the current drive's in PowerShell and under Git's install folder in Git Bash. It gets no place.
+    const rootless = paths.windows && /^[\\/]/.test(s)
+    const place = absolute(s) ? s : base === undefined || rootless ? undefined : `${base}/${s.replace(/^(?:\.\/)+/, '')}`
     if (place !== undefined) out.set(script, place)
   }
   return out
