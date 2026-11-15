@@ -1,11 +1,11 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  addedLines, CHANGES_FOLDER, rulesFor, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_EVERYTHING, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, CHANGES_FOLDER, rulesFor, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_BUGS, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan.ts'
 import { findScanners, homeFrom } from '../hooks/outgoing.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
-import { afterHandOn, agentsListed, cycleFrom, isWindows, ownFolderFrom, ownFolderOf, savedDamaged, recipient, reviewFailed, reviewHeldOpen, keyOf, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
+import { afterHandOn, agentsListed, blankedSafely, cycleFrom, isWindows, ownFolderFrom, ownFolderOf, savedDamaged, recipient, reviewFailed, reviewHeldOpen, keyOf, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
@@ -520,12 +520,17 @@ describe('review prompt', () => {
     expect(prompt.includes('Do not hand their work to general-purpose agents')).toBe(true)
   })
 
-  test('every finding is acted on, old and low ones included, and fixed unless one of four blockers applies', async () => {
+  test('every real bug is fixed, old and unsure ones included, unless one of four blockers applies; nits are left', async () => {
     const text = flat(reviewPrompt(new Map([['a.py', 'Python']])))
-    // The agents get a sentence to pass on that overrides their own cutoffs and asks for old issues too.
-    expect(text.includes(`prompt word for word: "${REPORT_EVERYTHING}"`)).toBe(true)
-    expect(REPORT_EVERYTHING.includes('overrides any confidence threshold')).toBe(true)
-    expect(REPORT_EVERYTHING.includes('and issues that were already in the changed files before this change')).toBe(true)
+    // The agents get a sentence to pass on that overrides their own cutoffs, asks for old bugs too, and
+    // leaves out nitpicks.
+    expect(text.includes(`prompt word for word: "${REPORT_BUGS}"`)).toBe(true)
+    expect(REPORT_BUGS.includes('overrides any confidence threshold')).toBe(true)
+    expect(REPORT_BUGS.includes('including bugs that were already in the changed files before this change')).toBe(true)
+    expect(REPORT_BUGS.includes('Name anything else (style, wording, naming, comments, missing tests, other nitpicks) as a nit in one line each, not as a bug')).toBe(true)
+    // The test and comment reviewers still have bugs to report, and the mod's own agents' rules are overridden.
+    expect(REPORT_BUGS.includes('a missing test or a wrong comment counts when it hides or would cause one')).toBe(true)
+    expect(REPORT_BUGS.includes('overrides any confidence threshold, filter or reporting rule')).toBe(true)
     expect(text.includes('tell it to read them in full, not only the diff')).toBe(true)
     // The list may hold files held or handed back from earlier turns, so it is not called "this turn's".
     expect(text.includes('file(s) not yet reviewed')).toBe(true)
@@ -534,13 +539,14 @@ describe('review prompt', () => {
     // "alone is never a reason" (which let a second excuse through) has not come back.
     expect(text.includes('large change')).toBe(false)
     expect(text.includes('alone is never a reason')).toBe(false)
+    // Nits are no longer fixed.
+    expect(text.includes('logging nits too')).toBe(false)
+    expect(text.includes('fixed like high ones')).toBe(false)
     for (const part of [
-      'Act on every finding, whatever its severity and however old it is',
-      'fix every one that holds up in a file listed above unless one of the four blockers below applies',
-      'Low, info and style ones from agents and scanners are fixed like high ones',
-      'logging nits too (wording, a duplicated or uneven log line, an off-by-one in a log count)',
-      'problems that were already in the old version of a listed file',
-      '"minor", "cosmetic", "style", "fine here", "pre-existing", "out of scope", "unlikely to trigger", "low confidence", "scored as a likely false positive" and "not in the changed lines" are never reasons',
+      'Fix the real bugs: code in a file listed above that gives a wrong result, crashes, hangs, loses or leaks data, or opens a security hole',
+      'including bugs that were already there before this change',
+      '"Low confidence", "pre-existing", "unlikely to trigger" and "not in the changed lines" are no reasons to leave a real bug',
+      'Do not fix style, wording, naming, comments, logging nits, refactors or missing tests unless one hides a real bug: name each in one line and leave it',
       'Fixed: say which file and line changed',
       'Does not hold up: show why in one line, with the code, path or output that proves it',
       'or that a security warning is about test-only code',
@@ -549,18 +555,18 @@ describe('review prompt', () => {
       'Name the blocker, offer a narrow suppression or a follow-up, and never count it as fixed',
       'Any other reason means fix it',
       'or changed code outside the changes under review, send them to code-reviewer once more',
-      'a finding still open is never counted as fixed',
+      'a bug still open is never counted as fixed',
       'the files this review itself edited, and each question a blocker left for the user',
       'If the listed files are only ones the user told you not to review',
       'If an agent or scanner fails or returns nothing, say which one and why',
       'Rerun the tests (if the project has none, say so) and the scanners',
       'Stop after three rounds and list what is still open',
-      'Tell the user every finding and its outcome',
+      'Tell the user every real bug and its outcome, then the other findings left alone in a short list',
       'Commit or push nothing as part of this review unless the user asked for that',
       'was itself this review, say so in one line and stop',
-    ]) expect(text.includes(part)).toBe(true)
+    ]) expect([part, text.includes(part)]).toEqual([part, true])
     // The steps come once each, in order.
-    const at = ['1. Run the', '2. Security review', '3. Act on every finding', '4. Rerun', '5. Tell the user'].map(s => text.indexOf(s))
+    const at = ['1. Run the', '2. Security review', '3. Fix the real bugs', '4. Rerun', '5. Tell the user'].map(s => text.indexOf(s))
     expect(at.every((n, i) => n >= 0 && (i === 0 || n > (at[i - 1] ?? -1)))).toBe(true)
     // No file is cut from the list: a file left off would get no findings.
     const many = new Map(Array.from({ length: 12 }, (_, i) => [`f${i}.py`, 'Python']))
@@ -2457,7 +2463,7 @@ test('a script a command only runs is left out; one it changed, or may have, is 
   ]) {
     await $.tool.call({ tool: 'Bash', command })
     const python = (await stop())?.split('\n').find(l => l.startsWith('- Python: ')) ?? ''
-    expect(python.slice('- Python: '.length).split(', ').includes(script)).toBe(true)
+    expect([command, python.slice('- Python: '.length).split(', ').includes(script)]).toEqual([command, true])
     await stop(true)
   }
   // In the background the command has not finished when the hook looks, so nothing is left out.
@@ -2496,6 +2502,55 @@ test('a scratch file a command copies or moves is kept: it may be going into the
   await stop(true)
   await $.tool.call({ tool: 'PowerShell', command: `Copy-Item ${TEMP}/claude/x/scratchpad/tool.ps1 C:/proj/` })
   expect((await stop())?.includes('tool.ps1')).toBe(true)
+})
+
+test('a command that only writes and runs scratch scripts writes nothing their text names, and says so', async ($, on) => {
+  const status = disk(on, {})
+  const files: string[] = []
+  on('session.id', () => ({ value: 's-1' }))
+  on('fs.write', (_$, e) => {
+    files.push(e.text)
+    return { value: undefined }
+  })
+  const { stop } = cycle($, on)
+  const S = `${TEMP}/claude/x/scratchpad`
+  // A probe written to scratch and run: its text names a project file, as a test case, that nothing here
+  // writes. Read as the command's own text, that line would be a write of /c/proj/other.py.
+  const probe = 'sed -i s/a/b/ /c/proj/other.py'
+  for (const command of [
+    `cat > ${S}/p.sh <<'EOF'\n${probe}\nEOF\nbash ${S}/p.sh`,
+    `S=${S}; cat > "$S/p.sh" <<'EOF'\n${probe}\nEOF\nbash "$S/p.sh" 2>&1 | head -50`, // a plain variable set first
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    expect([command, await stop()]).toEqual([command, undefined])
+    // Never silent: the status line and the status file name it.
+    expect([command, status.at(-1)?.includes('with a scratch script /c/proj/other.py')]).toEqual([command, true])
+    const saved = statusFrom(JSON.parse(files.at(-1) ?? '{}'))
+    expect([command, saved?.leftOut.some(l => l.path === '/c/proj/other.py' && l.why === 'scratch script')]).toEqual([command, true])
+  }
+  for (const command of [
+    `cat > ${S}/p.sh <<'EOF'\n${probe}\nEOF\ncp ${S}/p.sh /c/proj/p.sh`, // copied on: it may go into the project
+    `cat > ${S}/p.sh <<'EOF'\n${probe}\nEOF\nmv ${S}/* /c/proj/`, // moved on by a glob
+    `cd ${S} && cat > p.sh <<'EOF'\n${probe}\nEOF\nbash p.sh`, // relative: the cd may have failed
+    `cat > claude/x/p.sh <<'EOF'\n${probe}\nEOF\nbash claude/x/p.sh`, // relative, from nowhere known
+    `cat > "$TEMP/claude/x/p.sh" <<'EOF'\n${probe}\nEOF\nbash "$TEMP/claude/x/p.sh"`, // the shell may set TEMP otherwise
+    `X=a; cat > ${S}/$X/../../../../../../c/proj/p.sh <<'EOF'\n${probe}\nEOF`, // out of scratch by `..`
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    expect([command, (await stop())?.includes('other.py')]).toEqual([command, true])
+    expect(await stop(true)).toBe(undefined) // the review ends: nothing carries to the next case
+  }
+  // PowerShell has no here-document: nothing in its text is read as a scratch script.
+  await $.tool.call({ tool: 'PowerShell', command: `cat > ${S}/p.sh <<'EOF'\n${probe}\nEOF\nbash ${S}/p.sh` })
+  expect((await stop())?.includes('other.py')).toBe(true)
+})
+
+test('a scratch check that throws keeps every write, and says why in the log', () => {
+  const logged: string[] = []
+  const engine = { ui: { log: (text: string) => { logged.push(text) } } } as never
+  const all = ['/s/p.sh', 'a.py']
+  expect(blankedSafely(engine, "cat > /s/p.sh <<'EOF'\nsed -i x a.py\nEOF", () => { throw new Error('no') }, all)).toEqual(all)
+  expect(logged).toEqual(["review-guard: a scratch script's text was kept in the review: it could not be read (no)"])
 })
 
 test('what is left out goes after a guard notice on the status line, never over it', async ($, on) => {
@@ -2660,6 +2715,12 @@ test('status files with a bad time in them are not read', () => {
   expect(statusFrom(good) === undefined).toBe(false)
   expect(statusFrom({ ...good, leftOutSince: 'soon' })).toBe(undefined)
   expect(statusFrom({ ...good, leftOut: [{ path: 'a.py', why: 'scratch', at: 'later' }] })).toBe(undefined)
+  for (const why of ['scratch', 'only run', 'scratch script', 'a reason from a newer mod']) {
+    expect(statusFrom({ ...good, leftOut: [{ path: 'a.py', why, at: '2026-01-01T00:00:00Z' }] })?.leftOut[0]?.why).toBe(why)
+  }
+  for (const why of ['', 'x'.repeat(41), 3]) {
+    expect(statusFrom({ ...good, leftOut: [{ path: 'a.py', why, at: '2026-01-01T00:00:00Z' }] })).toBe(undefined)
+  }
 })
 
 test('a failed lookup never leaves a file out', async ($, on) => {
@@ -2703,6 +2764,12 @@ test('knows scratch folders, and which scripts a command only runs and where', a
   // With a start folder known: a rooted path with no drive is not joined onto it, nor read as drive C.
   expect([...runOnlyScripts('cd C:/proj && python /c/tools/gen.py', WIN, true).values()]).toEqual([])
   expect([...runOnlyScripts('cd C:/proj && python /tools/gen.py', WIN).values()]).toEqual([])
+  // `chdir` is no Bash builtin; in PowerShell it is Set-Location, as `sl` is.
+  expect([...runOnlyScripts('chdir C:/p; python gen.py', WIN)]).toEqual([])
+  for (const cd of ['chdir', 'Set-Location', 'sl', 'CD']) {
+    expect([cd, [...runOnlyScripts(`${cd} C:/p; python gen.py`, WIN, true)]]).toEqual([cd, [['gen.py', 'C:/p/gen.py']]])
+  }
+  expect([...runOnlyScripts('CD C:/p; python gen.py', WIN)]).toEqual([]) // Bash's cd is lower case
   // A backslash anywhere can escape a quote the here-document split can't follow: no candidates, so reviewed.
   expect([...runOnlyScripts('node "C:\\tools\\b.mjs" out.html', WIN)]).toEqual([])
   // PowerShell's `~` is the profile folder, not HOME.
@@ -2761,6 +2828,81 @@ test('knows which code files a shell command writes', async () => {
   expect(shellWrites(`python - <<'PY'\nbase = 'src/'\n${edits("base+'b.py'")}\nPY`)).toContain('b.py')
   expect(shellWrites(`cat > fix.pyw <<'EOF'\n${edits(`r'src/app.py'`)}\nEOF\npython fix.pyw`)).toContain('src/app.py') // .pyw too
   expect(shellWrites("sed -i s/a/b/ r'app.py'")).toEqual(['rapp.py']) // bash's own word
+  // A command that only writes and runs scratch scripts (`scratchFile` says which targets are scratch)
+  // writes nothing their text names. A stand-in for `scratchTargets`: a full path with no variable, `~` or
+  // backtick left (`inScratch` also refuses `..`).
+  const scratch = (t: string) => !/[$`~]/.test(t) && t.startsWith('/s/') && !t.split('/').includes('..')
+  const body = "\nsed -i x a.py && cp b.py c.py\nEOF\n"
+  expect(shellWrites(`cat > /s/p.sh <<'EOF'${body}bash /s/p.sh`)).toContain('a.py') // no scratch check given: as before
+  // Blanked: what is left is each target.
+  for (const [cmd, want] of [
+    [`cat > /s/p.sh <<'EOF'${body}bash /s/p.sh`, ['/s/p.sh']], // the target is still a write
+    [`cat > "/s/p.sh" <<'EOF'${body}bash -x "/s/p.sh" a.py 'x y' 2>&1 | tail -20`, ['/s/p.sh']], // flags, arguments, a tail
+    [`cat >> /s/p.py <<-'EOF'${body}python3 -I /s/p.py`, ['/s/p.py']], // appended to, `<<-`
+    [`cat <<"EOF" > /s/p.mjs${body}node --no-warnings /s/p.mjs && deno run --allow-read /s/p.mjs`, ['/s/p.mjs']],
+    [`cat.exe > /s/a.sh <<'EOF'${body}cat > /s/b.sh <<'EOF'${body}bash /s/a.sh; bash /s/b.sh`, ['/s/a.sh', '/s/b.sh']], // two scripts
+    [`S=/s\ncat > $S/p.sh <<'EOF'${body}bash $S/p.sh`, []], // (a variable target is no name)
+    [`S='/s'; cat > \${S}/p.sh <<'EOF'${body}bash "\${S}/p.sh"`, []], // on its line, read braced
+    [`S="/s" && T=/s/x\ncat > $T.sh <<'EOF'${body}`, []], // two, and the last value set is the one
+  ] as const) {
+    expect([cmd, shellWrites(cmd, scratch).sort()]).toEqual([cmd, [...want].sort()])
+  }
+  // Kept: the same as with no scratch check. Each case breaks one of the forms.
+  for (const cmd of [
+    `cat > /s/p.sh <<EOF${body}`, // unquoted: bash runs its $(...) as it writes
+    `cat > /proj/p.sh <<'EOF'${body}`, // not scratch
+    `cat > /s/p.sh > /proj/q.sh <<'EOF'${body}`, // a second target
+    `cat > "/s/a;b.sh" <<'EOF'${body}`, // a `;` in the name
+    `cat <<'EOF' | tee /s/p.sh${body}`, // piped on
+    `cat <<'EOF' 2>/s/e | bash${body}`, // a redirect of stderr only, and piped on
+    `{\ncat 2>/s/e <<'EOF'${body}} | bash`, // in a group
+    `(cat > /s/p.sh <<'EOF'${body})`, // in a subshell
+    `bash > /s/log <<'EOF'${body}`, // read by bash, which runs it
+    `cat /proj/a.sh - > /s/p.sh <<'EOF'${body}`, // cat reads a file too
+    `cat > /s/p.sh <<'EOF'; echo hi${body}`, // something after it on its line
+    `cat > /s/p.sh <<'A' 3<<'B'\nsed -i x a.py\nA\nx\nB\n`, // two here-documents on one line
+    `cat > /s/p.sh <<'EOF'\nsed -i x a.py\n`, // no end line: the split is a guess
+    `echo a\\ b; cat > /s/p.sh <<'EOF'${body}`, // a backslash in the command's own text
+    `cat > /s/x\u00a0/../../proj/fix.sh <<'EOF'${body}`, // a no-break space, which bash takes for part of the name
+    `cat > '/s/q'/../../proj/fix.sh <<'EOF'${body}`, // a name in parts
+    `cat > /s/p* <<'EOF'${body}`, // a glob
+    `cat <<'EOF' > /s/p.sh &> /proj/x.sh${body}`, // `&>`
+    `cat <<'EOF' > /s/p.sh 1<>/proj/x.sh${body}`, // `<>`
+    `cat > /s/p.sh <<'EOF'${body}bash <<'X'\nsed -i x a.py\nX\n`, // another here-document, run
+    `cat > /s/list <<'EOF'${body}python - <<'PY'\nopen('a.py', 'a')\nPY\n`,
+    // Variables
+    `cat > $S/p.sh <<'EOF'${body}S=/s`, // set after
+    `S=/s cat > $S/p.sh <<'EOF'${body}`, // set for cat alone
+    `S=/s | true\ncat > $S/p.sh <<'EOF'${body}`, // set in a pipe's subshell
+    `S=/s & cat > $S/p.sh <<'EOF'${body}`, // set in the background
+    `if [ -d /x ]; then S=/s; fi\ncat > $S/p.sh <<'EOF'${body}`, // set on one branch
+    `S=/s\nprintf -v S /proj\ncat > $S/p.sh <<'EOF'${body}`, // set again by a command
+    `UID=/s\ncat > $UID/p.sh <<'EOF'${body}`, // bash keeps its own value
+    `PATH=/proj/bin\ncat > /s/p.sh <<'EOF'${body}`, // `cat` may be another program
+    `S=$HOME/s\ncat > $S/p.sh <<'EOF'${body}`, // set to a variable's value
+    `cat > $X/p.sh <<'EOF'${body}`, // never set
+    `S=/s/x\ncat > \${S:+/proj}/fix.sh <<'EOF'${body}`, // not a plain read of S
+    `S=/s\ncat > '$S'/p.sh <<'EOF'${body}`, // a `$` in single quotes is no variable
+    // What runs
+    `cat > /s/list <<'EOF'${body}cat /s/list | while read f; do sed -i x "$f"; done`, // its text read as a list
+    `cat > /s/list <<'EOF'${body}xargs sed -i x < /s/list`,
+    `cat > /s/list <<'EOF'${body}bash -c 'cat /s/list' | sh`, // code given to bash -c
+    `cat > /s/list <<'EOF'${body}perl -pe1 /s/list | sh`, // code glued to a flag
+    `cat > /s/p.sh <<'EOF'${body}bash /s/p.sh | bash`, // its output run
+    `cat > /s/p.sh <<'EOF'${body}bash /s/p.sh > /proj/x.sh`, // its output written
+    `cat > /s/p.sh <<'EOF'${body}bash /proj/p.sh`, // a project script run
+    `cat > /s/p.sh <<'EOF'${body}cp /s/p.sh /proj/`, // copied on
+    `cat > /s/p.sh <<'EOF'${body}git apply /s/*.diff`,
+    `ln -s /proj/src /s/link\ncat > /s/link/x.sh <<'EOF'${body}`, // written through a link
+    `alias cat=bash\ncat > /s/p.sh <<'EOF'${body}`,
+    `cat() { bash; }\ncat > /s/p.sh <<'EOF'${body}`,
+    `source /proj/env.sh\ncat > /s/p.sh <<'EOF'${body}`,
+    `cat > /s/p.sh <<'EOF'${body}# a comment`,
+  ]) {
+    expect([cmd, shellWrites(cmd, scratch), shellWrites(cmd).includes('a.py')]).toEqual([cmd, shellWrites(cmd), true])
+  }
+  // A scratch check that throws throws on (`blankedSafely` keeps every write then).
+  expect(() => shellWrites(`cat > /s/p.sh <<'EOF'${body}`, () => { throw new Error('no') })).toThrow()
   // Notes written with `time` and `textwrap`, then a script only run: that script is not a write.
   for (const [mod, use] of [['textwrap', "textwrap.dedent('x')"], ['textwrap', "textwrap.indent('x', ' ')"], ['time', 'str(time.time())']]) {
     expect(shellWrites(`python - <<'PY'\nimport ${mod}\nopen('notes.md', 'w').write(${use})\nPY\npython gen.py`)).toEqual([])
@@ -3316,8 +3458,8 @@ describe('outside scanners', () => {
     expect(scannerCommand('semgrep', 'semgrep', ['a.py']).includes('--metrics=off')).toBe(true)
     const prompt = reviewPrompt(changed, steps)
     expect(flat(prompt).includes('What they report is a finding like any other')).toBe(true)
-    // The commands come before the step that says to act on what they find.
-    expect(flat(prompt).indexOf("'C:/Tools/bandit.exe'") < flat(prompt).indexOf('3. Act on every finding')).toBe(true)
+    // The commands come before the step that says to fix what they find.
+    expect(flat(prompt).indexOf("'C:/Tools/bandit.exe'") < flat(prompt).indexOf('3. Fix the real bugs')).toBe(true)
     expect(reviewPrompt(changed).includes('Scanners for these files')).toBe(false)
     // With none installed, the prompt still names them as skipped and does not claim any are installed.
     const none = reviewPrompt(changed, scannerSteps(changed, new Map()))

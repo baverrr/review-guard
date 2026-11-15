@@ -24,11 +24,11 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 
 - **Reviews code changes.** When a turn ends with code changed, Claude is sent back to review it with
   review agents (code review, hidden errors, test gaps), plus a short security check per language.
-- **Leaves no finding behind.** Low and style warnings count like serious ones, and so do old problems in
-  the files it changed. Claude fixes each real one, says why for any that isn't, and leaves one unfixed only
-  for a real blocker (the fix would break something, no fixed version yet, it needs your call, or it is an
-  old problem in a file outside the review). Then it reruns the tests and scanners and tells you the outcome
-  of every finding.
+- **Fixes real bugs, not nits.** Claude fixes every real bug the review finds (a wrong result, a crash, lost
+  or leaked data, a security hole), unsure and old ones in the changed files included. Style, wording and
+  missing tests are only listed. It says why for any bug that isn't one, and leaves one unfixed only for a
+  real blocker (the fix would break something, no fixed version yet, it needs your call, or it is an old
+  problem in a file outside the review). Then it reruns the tests and scanners and tells you the outcome.
 - **Brings its own reviewers.** It ships five review agents, so it works without the pr-review-toolkit plugin.
 - **Stops leaks to GitHub.** A commit, push or GitHub write that would send a key, a token, an IP or MAC
   address, or one of your personal terms is stopped, and Claude is told what and where, never the value.
@@ -106,7 +106,8 @@ config file has a mistake. The message gives the reason. Run git with `git -C <f
 
 **"It asks for a review I don't need."** Notes and other non-code files are never reviewed, nor are
 Claude's own scratch files (unless a command copies them into the project) or a script a command only runs
-and leaves unchanged. The status line names each file left out. To turn the mod off for a while, set
+and leaves unchanged. When a command only writes scripts into Claude's scratch folder and runs them, the
+files those scripts name are not reviewed either, by your choice. The status line names each file left out. To turn the mod off for a while, set
 `"review-guard@review-guard": false` under `enabledPlugins` in `~/.claude/settings.json`.
 
 **"It checked a commit or push I didn't make."** A command that writes a file holding a git command (a test,
@@ -142,5 +143,5 @@ mod's folder (Node 22.13 or newer). Then start a new session.
 MIT. See [LICENSE](LICENSE).
 
 The five agents in `agents/` are copies of the pr-review-toolkit plugin's agents by Anthropic, under the
-Apache License 2.0 (`licenses/`), changed so they report every finding (see `licenses/NOTICE.md`). Not
+Apache License 2.0 (`licenses/`), changed so they report every bug at any confidence (see `licenses/NOTICE.md`). Not
 affiliated with Anthropic.

@@ -418,16 +418,18 @@ async function tempDirs($: EngineInterface): Promise<string[]> {
  * Says on the status line which files were left out of the review and why, so no skip is silent, and
  * adds them to the status file. Never throws.
  */
-async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], said?: string): Promise<void> {
+async function sayLeftOut($: EngineInterface, scratch: string[], onlyRun: string[], said?: string, inScript: string[] = []): Promise<void> {
   const parts = [
     ...(scratch.length ? [`scratch ${scratch.map(p => p.replace(/^.*[\\/]/, '')).join(', ')}`] : []),
     ...(onlyRun.length ? [`only run ${onlyRun.join(', ')}`] : []),
+    // A script can name many files: the first five, then how many more (all of them go in the status file).
+    ...(inScript.length ? [`with a scratch script ${inScript.slice(0, 5).join(', ')}${inScript.length > 5 ? ` and ${inScript.length - 5} more` : ''}`] : []),
   ]
   if (parts.length === 0) return
   // After a line the guard just put there (a security notice), so that line is never hidden.
   say($, said ? `${said}. Not reviewed: ${parts.join('; ')}` : `review-guard: not reviewed (${parts.join('; ')})`)
   const at = new Date().toISOString()
-  leftOut.push(...scratch.map((path): LeftOut => ({ path, why: 'scratch', at })), ...onlyRun.map((path): LeftOut => ({ path, why: 'only run', at })))
+  leftOut.push(...scratch.map((path): LeftOut => ({ path, why: 'scratch', at })), ...onlyRun.map((path): LeftOut => ({ path, why: 'only run', at })), ...inScript.map((path): LeftOut => ({ path, why: 'scratch script', at })))
   leftOut.splice(0, Math.max(0, leftOut.length - LEFT_OUT_KEPT))
   await writeStatus($)
 }
@@ -921,12 +923,36 @@ const mayStillRun = (result: { result?: unknown }) => {
   return typeof r === 'object' && r !== null && STILL_RUNNING.some(k => Boolean((r as Record<string, unknown>)[k]))
 }
 
+/** `shellWrites(command, scratchFile)`, or `all` (every write, nothing blanked) if that throws; a throw is logged. */
+export function blankedSafely($: EngineInterface, command: string, scratchFile: (target: string) => boolean, all: string[]): string[] {
+  try {
+    return shellWrites(command, scratchFile)
+  } catch (err) {
+    logLine($, `review-guard: a scratch script's text was kept in the review: it could not be read (${whyOf(err)})`)
+    return all
+  }
+}
+
+/**
+ * For `shellWrites` in Bash: whether a redirect target, as the command spells it after its leading
+ * variables are filled in, is a file in Claude's scratch folders (`inScratch`). Only a full path with no
+ * variable, `~` or backtick left counts: where a relative name or `$TEMP` leads in the shell that ran it
+ * (a failed `cd`, a profile that sets TEMP) is not known here.
+ */
+async function scratchTargets($: EngineInterface): Promise<(target: string) => boolean> {
+  const { windows } = await pathsHere($)
+  const rules = rulesFor('bash', windows)
+  const temp = await tempDirs($)
+  return target => !/[$`~]/.test(target) && /^(?:[A-Za-z]:)?[\\/]/.test(target) && inScratch(target, temp, rules)
+}
+
 /**
  * Code is also changed from a shell (sed -i, a redirect, a script that writes files). Once a shell
  * command has run, the code files it wrote are remembered for the review, less the scripts it only ran
- * (`before` holds them as they were) and Claude's scratch files. A command that failed may still have
- * written, so it counts; one that was refused never ran. What is left out is named on the status line,
- * after `said` when the guard already put a line there. Never throws: it only remembers.
+ * (`before` holds them as they were), Claude's scratch files (kept when the command copies or moves), and
+ * the names in a Bash command that only writes and runs scratch scripts (`blankScratchBodies`). A command that failed may still have written, so it counts; one that was refused never ran.
+ * What is left out is named on the status line, after `said` when the guard already put a line there.
+ * Never throws: it only remembers.
  */
 async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string): Promise<R> {
   try {
@@ -936,7 +962,19 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
       // into `ownFolder`. A word that is not really a command (in a message, say) only means more review.
       // `inOwnFolder` never rejects, and logs a failed save rather than cover the guard's notice (`said`).
       if (agentId !== undefined && CHANGES_FOLDER.test(command)) await inOwnFolder($, agentId)
-      const written = shellWrites(command)
+      const writer: Writer = powershell ? 'powershell' : 'bash'
+      // A Bash command that only writes and runs scratch scripts writes nothing their text names
+      // (`blankScratchBodies`, whose forms leave no room for a copy). The names it drops are said.
+      const all = shellWrites(command)
+      // `scratchTargets` can't reject today (its reads are each caught); should that change, the text is kept.
+      const scratchFile = powershell || !command.includes('<<')
+        ? undefined
+        : await scratchTargets($).catch(err => {
+          logLine($, `review-guard: a scratch script's text was kept in the review: the scratch folders could not be read (${whyOf(err)})`)
+          return undefined
+        })
+      const written = scratchFile ? blankedSafely($, command, scratchFile, all) : all
+      const inScript = all.filter(path => !written.includes(path))
       const compare = written.length > 0 && before.length > 0 && !mayStillRun(result)
       const onlyRun = compare
         ? await untouched($, before).catch(err => {
@@ -946,8 +984,8 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
         : new Set<string>()
       const kept = written.filter(path => !onlyRun.has(path))
       // A scratch file named by a copy or move may be the source of a write into the project: keep it.
-      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), powershell ? 'powershell' : 'bash', COPIES.test(command), agentId, !CHANGES_FOLDER.test(command))
-      await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said)
+      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), writer, COPIES.test(command), agentId, !CHANGES_FOLDER.test(command))
+      await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said, inScript)
     }
   } catch (err) {
     // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.

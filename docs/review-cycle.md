@@ -31,6 +31,15 @@ page says when that review counts as over, and what happens to the edits made wh
   back). Not across a `..` step, which through a link may name another file: such a path is never taken
   for a file under review either. A known language is never replaced by `other code`. The check for
   Claude's scratch folders ignores only the drive letter's case too.
+- **Scratch scripts.** A Bash command that does nothing but write scripts into a scratch folder and run
+  them names no file of its own in their text, so those names are left out, said on the status line as
+  "with a scratch script" and kept in the status file. Every statement of such a command must be one of
+  three forms: `NAME=value` at its very start, `cat > <file> <<'TAG'` (a quoted tag, stdout only), or a
+  program such as `bash`, `node` or `python` running a scratch file with plain arguments and flags that
+  take no code, then at most `2>&1` and `| head -N` or `| tail -N`. Only a full path counts as scratch,
+  after the leading variables are filled in: not a relative path, `$TEMP` or any other variable. Anything
+  else in the command (a copy, a pipe into another program, another here-document, a glob, a function)
+  leaves its text in the review.
 - **Relative paths.** A relative path is read against the session's folder only when that is surely its
   folder: not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`),
   and never again for an agent that has run such a command (a shell may keep the folder), was started in

@@ -2,11 +2,14 @@
 // the MCP server's review_status tool (mcp/server.mjs), which runs in another process and can't see the
 // engine's state. Shared here so both sides agree on where it is and what it holds.
 
-/** Why a file was left out of the review. */
-export type LeftOutWhy = 'scratch' | 'only run'
+/** Why a file was left out of the review, as the hooks write it. */
+export type LeftOutWhy = 'scratch' | 'only run' | 'scratch script'
 
-/** One file left out of the review. */
-export type LeftOut = { path: string; why: LeftOutWhy; at: string }
+/**
+ * One file left out of the review. A reader takes any short reason (`why`), so a status file from a
+ * newer mod, with a reason this one doesn't know, is still read.
+ */
+export type LeftOut = { path: string; why: LeftOutWhy | (string & {}); at: string }
 
 /** Where the session's reviews stand. */
 export type Phase = 'idle' | 'reviewing' | 'held' | 'ended'
@@ -63,7 +66,7 @@ export function statusFrom(x: unknown): StatusFile | undefined {
   for (const l of s.leftOut) {
     if (typeof l !== 'object' || l === null) return undefined
     const { path, why, at } = l as Record<string, unknown>
-    if (!isText(path) || (why !== 'scratch' && why !== 'only run') || !isTime(at)) return undefined
+    if (!isText(path) || !isText(why) || why === '' || why.length > 40 || !isTime(at)) return undefined
     leftOut.push({ path, why, at })
   }
   return {

@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: b809784910c87678f298a5707393fc15afc05e2850868dff2faa75ab694b3ed0 built-sha256: 48e8baf633c7bf748b5fe41d385dbc985eb0457a4b31cf5551054ed094624c94
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 8454f8c2882d4243f9de006ae5966f9203c49dbab1179a69bac86629376757be built-sha256: a858d3b9a42b0a03a33e9bfece69464b9b039c03c997abf4096fdce1e58b33fa
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -890,7 +890,8 @@ const RUNS_NOTHING = new Set(['cat', 'mkdir', 'sleep', 'date', 'export', 'for', 
  * sends to ssh (`cat > "$S/x.sh" <<'EOF'` ... `ssh host 'bash -s' < "$S/x.sh"`), which runs it on
  * another machine. A body written to any other file stays: a later command may run it (`bash x`, `make`,
  * a git hook), and a write of code this command can't see is still a write of code. (That keeps code
- * writes visible to `shellWrites`; `gitAction` then also blanks bodies with `blankWrittenScripts`.)
+ * writes visible to `shellWrites`, but for a scratch script's text, `blankScratchBodies`; `gitAction` then
+ * also blanks bodies with `blankWrittenScripts`.)
  *
  * Kept narrow, as an allowlist: every command outside the bodies must be a read-only tool or one in
  * RUNS_NOTHING (`bash`, `python`, `xargs`, `eval`, `.`, `read` loops and anything unknown run something,
@@ -1054,7 +1055,8 @@ function programWords(cmd        , set           = [])           {
  * - `#` comments are read as bash reads them, and `timeout DURATION` and prefix words as `programWords` does.
  * - The caller does not use this when the command holds a `\`-newline (see `gitAction`).
  *
- * `shellWrites` does not use this: a heredoc written to `x.py` is a write of code even if nothing runs it.
+ * `shellWrites` does not use this: a heredoc written to `x.py` is a write of code even if nothing runs it
+ * (it only blanks the text of scratch scripts, `blankScratchBodies`).
  */
 function blankWrittenScripts(command        )         {
   const { outside, bodies, complete } = heredocs(command)
@@ -1132,21 +1134,108 @@ function blankWrittenScripts(command        )         {
   return lines.join('\n')
 }
 
+// The forms a scratch-script command may take, every statement (split at `;`, `&&` and line ends) one of
+// them: nothing else in it can then read a scratch file's text, run it as code, or change what a name
+// means. A word is plain (`[\w./:@%+,=-]`), with `$NAME` or `${NAME}` from a leading assignment, maybe in
+// double quotes as a whole. Quoted text holds no `$`, backtick, `\`, `;`, `&` or `|`, so a split never
+// lands inside it.
+const PLAIN_WORD = String.raw`"[^"\s$\x60\\;&|]*(?:\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)[^"\s$\x60\\;&|]*)*"|(?:[\w./:@%+,=-]|\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*))+`
+// `NAME=value` at the very start, before anything else runs.
+const ASSIGN = new RegExp(String.raw`^([A-Za-z_]\w*)=("[^"$\x60\\;&|\n]*"|'[^'\\;&|\n]*'|[\w./:@%+,=-]*)$`)
+// Names bash keeps its own value in, or that change what `cat` or a program is.
+const SPECIAL = /^(?:UID|EUID|PPID|SHELLOPTS|BASHOPTS|RANDOM|SRANDOM|SECONDS|LINENO|BASHPID|EPOCHSECONDS|EPOCHREALTIME|HISTCMD|GROUPS|FUNCNAME|PIPESTATUS|DIRSTACK|PATH|BASH_ENV|ENV|IFS|PS4|BASH\w*)$/
+// `cat > target <<'TAG'` or `cat <<'TAG' > target`: stdout only (`>` or `>>`), a quoted tag, nothing else.
+const CAT_TO = new RegExp(String.raw`^cat(?:\.exe)?\s+(?:>>?\s*(${PLAIN_WORD})\s+<<-?\s*(?:'[\w-]+'|"[\w-]+")|<<-?\s*(?:'[\w-]+'|"[\w-]+")\s+>>?\s*(${PLAIN_WORD}))$`)
+// A program running a scratch script with flags that take no code (long ones but --eval and --print, and
+// `-I -u -B -s -S -x`), plain arguments, then at most `2>&1` and `| head` or `| tail` with a count.
+const RUN = new RegExp(String.raw`^(?:bash|sh|zsh|dash|node|deno(?:\s+run)?|bun|tsx|python[\d.]*|py|ruby|perl|pwsh|powershell)(?:\.exe)?`
+  + String.raw`(?:\s+(?:--(?!eval\b|print\b)[a-z][\w-]*(?:=[\w./:@%+,-]+)?|-[IuBsSx]))*\s+(${PLAIN_WORD})`
+  + String.raw`(?:\s+(?:[\w./:=@%+,-]+|'[^'\\;&|\n]*'|"[^"$\x60\\;&|\n]*"))*(?:\s+2>&1)?(?:\s*\|\s*(?:head|tail)(?:\s+-n)?\s+-?\d+)?$`)
+
+/**
+ * `command` with the text of each scratch script it writes blanked, lines kept, when the whole command is
+ * nothing but scratch scripts written and run: every statement outside the here-documents is a leading
+ * `NAME=value` (`ASSIGN`, not a `SPECIAL` name), a `cat` that writes a quoted here-document to one file
+ * `scratchFile` takes for Claude's scratch (`CAT_TO`), or a program that runs a scratch file (`RUN`). Any
+ * other statement, here-document, redirect or spelling leaves the command as it is. A variable is filled
+ * in from the leading assignments only; one not set there leaves the command as it is too. The names in
+ * such a script are not this command's: when it runs, it is a scratch script, left out of review with
+ * what it edits (the user's choice, 2026-11-12, in the vault note `Claude/Habits and preferences.md`).
+ * The target itself is still a write.
+ */
+function blankScratchBodies(command        , scratchFile                             )         {
+  const { bodies, complete } = heredocs(command)
+  if (!complete || bodies.length === 0) return command
+  const lines = command.split('\n')
+  const opens = new Map(bodies.map(b => [b.line, b]))
+  if (opens.size !== bodies.length) return command // two here-documents on one line
+  const inBody = new Set        ()
+  for (const b of bodies) for (let k = b.from; k <= b.to; k++) inBody.add(k)
+  if (oddSpace(lines.filter((_l, i) => !inBody.has(i)).join('\n'))) return command
+  const vars = new Map                ()
+  // A word as the shell reads it, or undefined when a variable in it is not one of the leading ones.
+  const fill = (word        )                     => {
+    let sure = true
+    const text = word.replace(/^"(.*)"$/, '$1').replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/g, (_all, braced         , bare         ) => {
+      const v = vars.get(braced ?? bare ?? '')
+      if (v === undefined) sure = false
+      return v ?? ''
+    })
+    return sure ? text : undefined
+  }
+  const isScratch = (word                    ) => {
+    const t = word === undefined ? undefined : fill(word)
+    return t !== undefined && t !== '/dev/null' && scratchFile(t)
+  }
+  let leading = true
+  for (let i = 0; i < lines.length; i++) {
+    if (inBody.has(i)) continue
+    const statements = (lines[i] ?? '').split(/;|&&/).map(t => t.trim())
+    for (const [k, st] of statements.entries()) {
+      if (st === '') continue
+      const assign = ASSIGN.exec(st)
+      if (assign) {
+        const name = assign[1] ?? ''
+        if (!leading || SPECIAL.test(name)) return command
+        vars.set(name, unquote(assign[2] ?? ''))
+        continue
+      }
+      leading = false
+      const cat = CAT_TO.exec(st)
+      if (cat) {
+        // It reads the here-document opened on this line, as this line's last statement.
+        const b = opens.get(i)
+        if (!b || !b.quoted || b.piped || k !== statements.length - 1 || !isScratch(cat[1] ?? cat[2])) return command
+        continue
+      }
+      const run = RUN.exec(st)
+      if (run && !opens.has(i) && isScratch(run[1])) continue
+      return command
+    }
+    if (opens.has(i) && !CAT_TO.test(statements.at(-1) ?? '')) return command
+  }
+  for (const b of bodies) for (let k = b.from; k < b.to; k++) lines[k] = ''
+  return lines.join('\n')
+}
+
 /**
  * The code files a shell command writes, as the command names them. A redirect counts for its target
  * alone. When anything else in the command writes, every code file it names counts, which can include
  * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
  * safer mistake than a change nobody looked at. In Python code from a heredoc a string's prefix is not part
- * of a name (`r'app.py'` names `app.py` there), and every one-line string is read as a name. Three things
- * are left out: what ssh runs on another
- * machine (`localPart`), the text of data here-documents nothing here runs (`blankDataBodies`), and a
- * script run after here-documents that only write notes (`onlyRun`). The caller leaves out two more: the
- * scripts a command only ran, shown by their file being the same before and after (`runOnlyScripts`), and
- * Claude's scratch files (`inScratch`).
+ * of a name (`r'app.py'` names `app.py` there), and every one-line string is read as a name. Left out:
+ * what ssh runs on another machine (`localPart`), the text of data here-documents nothing here runs
+ * (`blankDataBodies`), a script run after here-documents that only write notes (`onlyRun`), and, when
+ * `scratchFile` is given (it gets each scratch-script target and run script, leading variables filled
+ * in), the text of scratch scripts in a command that only writes and runs them (`blankScratchBodies`; the
+ * target itself still counts). The caller leaves out two
+ * more: the scripts a command only ran, shown by their file being the same before and after
+ * (`runOnlyScripts`), and Claude's scratch files (`inScratch`).
  */
-export function shellWrites(fullCommand        )           {
+export function shellWrites(fullCommand        , scratchFile                              )           {
   // What ssh runs on another machine writes no file here, and a data heredoc's text runs nowhere here.
-  const command = blankDataBodies(fullCommand, localPart(fullCommand))
+  const local = blankDataBodies(fullCommand, localPart(fullCommand))
+  const command = scratchFile ? blankScratchBodies(local, scratchFile) : local
   // A wildcard, a variable or a sed pattern is not a file name: `src/*.ts`, `$DIR/a.py`, `hooks\/a.ts`.
   const notAName = (raw        ) => /[*?^$]|\\\//.test(raw)
   const out = new Set        ()
@@ -1370,6 +1459,57 @@ function commandParts(text        )                         {
 const DETACHES = /(?:^|[^\w-])(?:nohup|setsid|disown|Start-Process|Start-Job|saps|start)(?![\w-])/i
 
 /**
+ * A path as a shell names it, read for this machine: `~`, `$HOME` and `$USERPROFILE` filled in (in
+ * PowerShell `~` and `$HOME` are the profile folder; a missing one leaves the name unknown, never filled
+ * in from the other), and on Windows forward slashes, with Git Bash's `/c/...` as drive C (PowerShell's is
+ * a folder `c`, `rulesFor`). Undefined when it holds any other variable or a wildcard.
+ */
+function expandPath(p        , paths       , powershell         )                     {
+  const homeHere = powershell ? paths.userProfile : paths.home
+  let e = p
+  if (/^(?:~|\$HOME|\$\{HOME\})(?=$|[\\/])/.test(e)) e = homeHere ? e.replace(/^(?:~|\$HOME|\$\{HOME\})/, homeHere) : ''
+  else if (/^(?:\$USERPROFILE|\$\{USERPROFILE\}|\$env:USERPROFILE)(?=$|[\\/])/i.test(e)) {
+    e = paths.userProfile ? e.replace(/^[^\\/]+/, paths.userProfile) : ''
+  }
+  if (!e || /[$`%*?~]/.test(e)) return undefined
+  if (!paths.windows) return e // a `\` is part of a file name there
+  const f = e.replace(/\\/g, '/')
+  return powershell ? f : nativePath(f)
+}
+
+/** Whether an expanded path is a full one here: from a drive on Windows, from `/` elsewhere. */
+const absoluteHere = (p        , paths       ) => (paths.windows ? /^[A-Za-z]:\// : /^\//).test(p)
+
+/**
+ * The folder a shell command starts in: only `cd <full folder>` as its very first part, and nothing else in
+ * it that moves the shell (`source` and `.` run a file in this shell; in Bash `c\d` is cd, and `chdir`
+ * counts in PowerShell only). A cd that fails is not seen: `runOnlyScripts` uses this only to find the file
+ * of a script the command names as nothing but what runs, which no folder makes a write. Undefined
+ * otherwise, and for a command whose split is a guess or that detaches a part.
+ */
+export function startFolder(command        , paths       , powershell = false)                     {
+  const docs = heredocs(command)
+  if (!docs.complete) return undefined
+  const outside = docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' ')
+  const parts = commandParts(outside)
+  if (!parts || DETACHES.test(outside)) return undefined
+  const moves = [...outside.matchAll(MOVES)].length
+  const hidden = programsOf(parts).some(w => /^(?:source|\.)$/.test(w[0] ?? '') || (!powershell && (w[0] ?? '').includes('\\')))
+  const first = parts[0] ?? []
+  if (moves !== 1 || hidden || !(powershell ? /^(?:cd|Set-Location|sl|chdir)$/i : /^cd$/).test(first[0] ?? '') || first.length !== 2) return undefined
+  const dir = expandPath(first[1] ?? '', paths, powershell)
+  return dir && absoluteHere(dir, paths) ? dir.replace(/\/+$/, '') : undefined
+}
+
+// The programs of a command's parts, after `sudo`, `env` and VAR=value.
+const programsOf = (parts            ) =>
+  parts.map(argv => {
+    const words = [...argv]
+    while (words.length && (BEFORE_PROGRAM.has(words[0] ?? '') || /^[A-Za-z_]\w*=/.test(words[0] ?? ''))) words.shift()
+    return words
+  })
+
+/**
  * The scripts a command only runs, each with the file on disk it must be (`python -I gen.py` runs
  * `<folder>/gen.py`). A script counts only when the command, here-document bodies included, names it
  * nowhere but as what an interpreter runs (`sed -i x gen.py; python gen.py` names it twice, so it is out).
@@ -1389,37 +1529,10 @@ export function runOnlyScripts(command        , paths       , powershell = false
   const outside = docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' ')
   const parts = commandParts(outside)
   if (!parts || DETACHES.test(outside)) return out
-  // Home spellings: in Bash `~` and $HOME are HOME; in PowerShell they and $env:USERPROFILE are the
-  // profile folder. A missing one leaves the name unknown, never filled in from the other.
-  const homeHere = powershell ? paths.userProfile : paths.home
-  const expand = (p        )                     => {
-    let e = p
-    if (/^(?:~|\$HOME|\$\{HOME\})(?=$|[\\/])/.test(e)) e = homeHere ? e.replace(/^(?:~|\$HOME|\$\{HOME\})/, homeHere) : ''
-    else if (/^(?:\$USERPROFILE|\$\{USERPROFILE\}|\$env:USERPROFILE)(?=$|[\\/])/i.test(e)) {
-      e = paths.userProfile ? e.replace(/^[^\\/]+/, paths.userProfile) : ''
-    }
-    if (!e || /[$`%*?~]/.test(e)) return undefined
-    if (!paths.windows) return e // a `\` is part of a file name there
-    const f = e.replace(/\\/g, '/')
-    return powershell ? f : nativePath(f) // Git Bash's `/c/...` is drive C, PowerShell's a folder `c` (`rulesFor`)
-  }
-  const absolute = (p        ) => (paths.windows ? /^[A-Za-z]:\// : /^\//).test(p)
-  // The programs, after `sudo`, `env` and VAR=value.
-  const programs = parts.map(argv => {
-    const words = [...argv]
-    while (words.length && (BEFORE_PROGRAM.has(words[0] ?? '') || /^[A-Za-z_]\w*=/.test(words[0] ?? ''))) words.shift()
-    return words
-  })
-  // The folder the command starts in: only `cd <folder>` as its very first part, and nothing else that
-  // moves the shell. `source` and `.` run a file in this shell; in Bash `c\d` is cd.
-  let base                    
-  const moves = [...outside.matchAll(MOVES)].length
-  const hidden = programs.some(w => /^(?:source|\.)$/.test(w[0] ?? '') || (!powershell && (w[0] ?? '').includes('\\')))
-  const first = parts[0] ?? []
-  if (moves === 1 && !hidden && /^(?:cd|Set-Location|sl|chdir)$/i.test(first[0] ?? '') && first.length === 2) {
-    const dir = expand(first[1] ?? '')
-    if (dir && absolute(dir)) base = dir.replace(/\/+$/, '')
-  }
+  const expand = (p        ) => expandPath(p, paths, powershell)
+  const absolute = (p        ) => absoluteHere(p, paths)
+  const programs = programsOf(parts)
+  const base = startFolder(command, paths, powershell)
   const runs = new Map                ()
   for (const words of programs) {
     if (!INTERPRETER.test(commandName(words[0] ?? ''))) continue
@@ -1467,9 +1580,13 @@ const SECURITY                           = {
   CSS: 'nothing security-specific beyond the general review.',
 }
 
-/** What every review agent is told, so none drops a finding for being low, unsure or older than this change. */
-export const REPORT_EVERYTHING =
-  'Report every issue you find at every severity and confidence, low ones and nitpicks included, and issues that were already in the changed files before this change; this overrides any confidence threshold or filter in your own instructions.'
+/**
+ * What every review agent is told: every real bug, however unsure or old, and anything else as a one-line
+ * nit, so none drops a bug for a low score and the review fixes bugs, not nits. A missing test or a wrong
+ * comment is a bug only when it hides or would cause one, so the test and comment reviewers still report.
+ */
+export const REPORT_BUGS =
+  'Report every real bug you find (code that gives a wrong result, crashes, hangs, loses or leaks data, or opens a security hole; a missing test or a wrong comment counts when it hides or would cause one) at any confidence, including bugs that were already in the changed files before this change. Name anything else (style, wording, naming, comments, missing tests, other nitpicks) as a nit in one line each, not as a bug. This overrides any confidence threshold, filter or reporting rule in your own instructions.'
 
 /**
  * The text that sends the model into a review of the changed files not yet reviewed: this turn's,
@@ -1480,7 +1597,7 @@ export const REPORT_EVERYTHING =
 export function reviewPrompt(changed                             , scannerSteps                    = [])         {
   const byLang = new Map                  ()
   for (const [path, lang] of changed) byLang.set(lang, [...(byLang.get(lang) ?? []), path])
-  // Every file is listed: a file left off the list would get no findings, and every finding counts.
+  // Every file is listed: a file left off the list would get no review, and a bug in it would stay.
   const files = [...byLang].map(([lang, paths]) => `- ${lang}: ${paths.join(', ')}`)
   const security = [...byLang.keys()].map(lang => `- ${lang}: ${SECURITY[lang            ] ?? SECURITY['other code']}`)
   return [
@@ -1493,7 +1610,7 @@ export function reviewPrompt(changed                             , scannerSteps 
     '   this session lists it. Otherwise use review-guard:<name>: the same agents, which this mod loads into',
     '   every session. Do not hand their work to general-purpose agents. Give each agent the files listed',
     '   above and tell it to read them in full, not only the diff (the changes may already be committed).',
-    `   Put this sentence in each agent's prompt word for word: "${REPORT_EVERYTHING}"`,
+    `   Put this sentence in each agent's prompt word for word: "${REPORT_BUGS}"`,
     '2. Security review, for each language changed (also run the security-review skill on the pending changes',
     '   when it is listed, and any enabled security plugin\'s reviewer):',
     ...security,
@@ -1503,13 +1620,12 @@ export function reviewPrompt(changed                             , scannerSteps 
       ? ['   Scanners for these files: run each installed one below with the Bash tool (they are Bash commands),',
         '   in the background alongside the agents. What they report is a finding like any other.', ...scannerSteps]
       : []),
-    '3. Act on every finding, whatever its severity and however old it is, and fix every one that holds up',
-    '   in a file listed above unless one of the four blockers below applies. Low, info and style ones from',
-    '   agents and scanners are fixed like high ones, logging nits too (wording, a duplicated or uneven log',
-    '   line, an off-by-one in a log count), and so are problems that were already in the old version of a',
-    '   listed file (a possible null dereference, say). So "minor", "cosmetic", "style", "fine here",',
-    '   "pre-existing", "out of scope", "unlikely to trigger", "low confidence", "scored as a likely false',
-    '   positive" and "not in the changed lines" are never reasons. Each finding ends in exactly one of these:',
+    '3. Fix the real bugs: code in a file listed above that gives a wrong result, crashes, hangs, loses or',
+    '   leaks data, or opens a security hole, including bugs that were already there before this change',
+    '   (a possible null dereference, say). "Low confidence", "pre-existing", "unlikely to trigger" and "not',
+    '   in the changed lines" are no reasons to leave a real bug. Do not fix style, wording, naming,',
+    '   comments, logging nits, refactors or missing tests unless one hides a real bug: name each in one',
+    '   line and leave it. Each real bug ends in exactly one of these:',
     '   - Fixed: say which file and line changed.',
     '   - Does not hold up: show why in one line, with the code, path or output that proves it (for example',
     '     that the input cannot come from outside, or that a security warning is about test-only code).',
@@ -1522,12 +1638,13 @@ export function reviewPrompt(changed                             , scannerSteps 
     '   If an agent or scanner fails or returns nothing, say which one and why: that is not a clean result.',
     '   If the fixes were more than small local edits, or changed code outside the changes under review,',
     '   send them to code-reviewer once more.',
-    '4. Rerun the tests (if the project has none, say so) and the scanners after the fixes. Every hit must be',
-    '   fixed or already answered in step 3. Stop after three rounds and list what is still open; a finding',
-    '   still open is never counted as fixed.',
-    '5. Tell the user every finding and its outcome, with the test and scanner commands and their final',
-    '   results, the files this review itself edited, and each question a blocker left for the user. Commit',
-    '   or push nothing as part of this review unless the user asked for that.',
+    '4. Rerun the tests (if the project has none, say so) and the scanners after the fixes. Every real bug',
+    '   they find must be fixed or already answered in step 3. Stop after three rounds and list what is',
+    '   still open; a bug still open is never counted as fixed.',
+    '5. Tell the user every real bug and its outcome, then the other findings left alone in a short list,',
+    '   with the test and scanner commands and their final results, the files this review itself edited,',
+    '   and each question a blocker left for the user. Commit or push nothing as part of this review unless',
+    '   the user asked for that.',
     'If the listed files are only ones the user told you not to review, or this turn was itself this review,',
     'say so in one line and stop.',
   ].join('\n')

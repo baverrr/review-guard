@@ -393,7 +393,7 @@ test('review_status lists recent sessions, newest first, and says which files it
   const old = new Date(Date.now() - 48 * 3600_000).toISOString()
   const home = fakeHome({
     status: {
-      a: status('a', { phase: 'held', queued: ['src/app.py'], leftOut: [{ path: '.scripts/map.py', why: 'only run', at: old }], updated: new Date(Date.now() - 60_000).toISOString() }),
+      a: status('a', { phase: 'held', queued: ['src/app.py'], leftOut: [{ path: '.scripts/map.py', why: 'only run', at: old }, { path: 'src/db.py', why: 'scratch script', at: old }], updated: new Date(Date.now() - 60_000).toISOString() }),
       b: status('b', { phase: 'reviewing', underReview: ['b.py'], writeFailed: 'disk full' }),
       c: '{not json',
       d: status('d', { queued: 'a.py' }), // a field of the wrong type
@@ -407,6 +407,7 @@ test('review_status lists recent sessions, newest first, and says which files it
     assert.match(t, /Session a in \/proj, updated 1 min ago: reviews are held after an interrupt/)
     assert.match(t, /src\/app\.py/)
     assert.match(t, /\.scripts\/map\.py \(only run\)/)
+    assert.match(t, /src\/db\.py \(scratch script\)/)
     assert.match(t, /Session b .*a review is running/)
     assert.match(t, /under review now:\n {4}- b\.py/)
     assert.match(t, /last update before this one failed/)

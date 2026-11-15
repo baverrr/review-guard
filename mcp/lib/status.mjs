@@ -1,13 +1,16 @@
-// Generated from hooks/status.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 4e8a9a52d4dc68ef15404c666d96ff36ac318f6e723a80b4b6f4efa2e6320d7c built-sha256: 816308e5480cbd801ad2246895e36ae100e46046ba66e8be513f1cbe80b1f8f4
+// Generated from hooks/status.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: c1a85478f807035bfe5480464861f64356d22d43280a3e8be9ad6609964963bb built-sha256: fdcfc17a671f02906260eb21b2d9fb1cc0d215de72d8659d04ed3ad83a9468d3
 // The review status file: each session's review state, written by the hooks (register.ts) and read by
 // the MCP server's review_status tool (mcp/server.mjs), which runs in another process and can't see the
 // engine's state. Shared here so both sides agree on where it is and what it holds.
 
-/** Why a file was left out of the review. */
-                                               
+/** Why a file was left out of the review, as the hooks write it. */
+                                                                  
 
-/** One file left out of the review. */
-                                                                   
+/**
+ * One file left out of the review. A reader takes any short reason (`why`), so a status file from a
+ * newer mod, with a reason this one doesn't know, is still read.
+ */
+                                                                                   
 
 /** Where the session's reviews stand. */
                                                            
@@ -64,7 +67,7 @@ export function statusFrom(x         )                         {
   for (const l of s.leftOut) {
     if (typeof l !== 'object' || l === null) return undefined
     const { path, why, at } = l                           
-    if (!isText(path) || (why !== 'scratch' && why !== 'only run') || !isTime(at)) return undefined
+    if (!isText(path) || !isText(why) || why === '' || why.length > 40 || !isTime(at)) return undefined
     leftOut.push({ path, why, at })
   }
   return {
