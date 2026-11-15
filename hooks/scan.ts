@@ -444,7 +444,8 @@ function commitHeredoc(cmd: string): string | undefined {
 export function gitAction(command: string): GitAction | undefined {
   // What ssh runs elsewhere is blanked, and so is the text of a script written here only to be sent to
   // ssh (`cat > x.sh <<'EOF'` ... `ssh host 'bash -s' < x.sh`): its git commands run on the other machine.
-  // So is a quoted `cat` heredoc's text when nothing else in the command runs shell code (`blankWrittenScripts`).
+  // So is a quoted `cat` heredoc's text, or Python code read from a heredoc that can start no program, when
+  // nothing else in the command runs shell code (`blankWrittenScripts`).
   const joined = command.replace(/\\\n/g, ' ')
   // Bash keeps a `\`-newline as it is inside a quoted heredoc body, but `joined` joins it, so a body's end
   // could move: with one in the command, written bodies are not blanked.
@@ -572,14 +573,15 @@ const SHELL_WRITE_PS = /(?:^|[;&|({\n]\s*)(?:copy|cpi|move|mi|ren|rni|robocopy|x
 
 /**
  * A here-document body and, from its opener's line, the command that reads it (`python -I -`, `cat > n.md`).
- * `quoted` is `<<'EOF'`: bash then takes the body as it is, with no `$`, backtick or backslash expansion.
+ * `quoted` is `<<'EOF'` or `<<"EOF"`: bash then takes the body as it is, with no `$`, backtick or backslash
+ * expansion.
  */
 type Heredoc = {
   text: string; reader: string; piped: boolean; quoted: boolean
   /**
    * The opener's line, and the body's lines [from, to): indexes into `command.split('\n')` of the very
    * string given to `heredocs`, never into `outside` (which drops body lines). With no terminator, `to`
-   * is the end of the command, and `complete` is false.
+   * is the end of the command, and `heredocs` says `complete: false`.
    */
   line: number; from: number; to: number
 }
@@ -695,6 +697,8 @@ const SAFE_NAMES = new Set([
   'now', 'today', 'isoformat', 'strftime', 'toISOString', 'Date',
   // regular expressions, and UTF-8 output on Windows (`sys.stdout.reconfigure(encoding='utf-8')`)
   're', 'sub', 'match', 'search', 'findall', 'fullmatch', 'group', 'sys', 'stdout', 'reconfigure',
+  // the read-only calls of the other SAFE_MODULES
+  'time', 'sleep', 'textwrap', 'dedent', 'indent', 'fill', 'wrap',
 ])
 // A name the body calls (`name(`) or reaches (`.name`), or imports (`from os import truncate`).
 function usedNames(plain: string): string[] {
@@ -710,6 +714,97 @@ function loadedModules(text: string): string[] {
   // Node: `require('fs')`, and for ES imports the module, not the name it is bound to (`import fs from 'x'`).
   for (const m of text.matchAll(/\b(?:require\s*\(|from|import)\s*(?:"([^"\n]*)"|'([^'\n]*)')/g)) mods.push(m[1] ?? m[2] ?? '')
   return mods
+}
+
+// The words that are a Python string's prefix (`r`, `rb`, `f`, `Rt`, ...; `uu` is let in, harmless).
+const PY_PREFIX = /^(?:[rbuft]|[rb][rbft]|[ft][rbft])$/i
+// A whole word (a name, a keyword or a number), and a string's quotes: one or three of either kind.
+const PY_WORD = /\w+/y
+const PY_QUOTE = /"""|'''|"|'/y
+/**
+ * Python code with every string literal made `""` and every `#` comment dropped, read as Python reads
+ * them. Words are read whole, so only a whole word that is a string prefix (`r`, `b`, `u`, `rb`, ...)
+ * opens a string with the quote after it; after any other word (`if''`, `in''`) the quote opens one on
+ * its own. A `\` keeps the next character in the string (in a raw string too, as far as where it ends
+ * goes), and a one-quote string ends on its own line (a `\` before the line break goes on). Undefined
+ * when that reading is not sure: an f- or t-string (the code in its `{...}` runs), a string that never
+ * ends, or a one-quote string that runs past its line. Every quote outside a string opens one, so none is
+ * left over. A prefix word that Python would refuse (`uu`) is read as one: harmless.
+ */
+function pythonCode(text: string): string | undefined {
+  // Python reads a lone `\r` as a line break (ending a `#` comment), and an encoding line in the first two
+  // (`# coding: unicode_escape`) changes what code the text is: neither is read here.
+  if (/\r(?!\n)/.test(text) || /^(?:[^\n]*\n)?[ \t\f]*#[^\n]*coding[:=]/.test(text)) return undefined
+  let out = ''
+  for (let i = 0; i < text.length;) {
+    const c = text[i] ?? ''
+    if (c === '#') {
+      const end = text.indexOf('\n', i)
+      i = end < 0 ? text.length : end
+      continue
+    }
+    PY_WORD.lastIndex = i
+    const word = PY_WORD.exec(text)?.[0] ?? ''
+    PY_QUOTE.lastIndex = i + word.length
+    const quote = PY_QUOTE.exec(text)?.[0]
+    // Only the f/t prefixes change the reading (they are refused): an `r`, `b` or `u` string ends as any.
+    if (quote === undefined || (word && !PY_PREFIX.test(word))) {
+      out += word || c
+      i += word.length || 1
+      continue
+    }
+    if (/[ft]/i.test(word)) return undefined
+    let j = i + word.length + quote.length
+    while (!text.startsWith(quote, j)) {
+      if (j >= text.length || (quote.length === 1 && text[j] === '\n')) return undefined
+      j += text[j] === '\\' ? 2 : 1
+    }
+    out += '""'
+    i = j + quote.length
+  }
+  // Python reads names NFKC-folded (`ｅｘｅｃ` is `exec`), which the name lists here don't: ASCII only.
+  return /[^\x00-\x7f]/.test(out) ? undefined : out
+}
+
+/**
+ * For `blankWrittenScripts`: whether Python code read from a heredoc can start no program, so a git
+ * command in its text is only text (a test case, a note). Like `onlyRun`'s allowlist (every call and
+ * `.name` in SAFE_NAMES, every module in SAFE_MODULES, nothing in RISKY_CODE), read after `pythonCode`
+ * takes out the strings, with STARTS_PROGRAMS on top. Unlike it, the files the code opens are not checked
+ * (OPENS), and `replace` (`Path.replace` moves a file) is allowed: what it writes matters only to what runs
+ * later, and `blankWrittenScripts` then keeps its text (a module loaded, another script or Python run).
+ */
+function pythonRunsNothing(text: string): boolean {
+  const code = pythonCode(text)
+  // STARTS_PROGRAMS and SAFE_MODULES are a backup: SAFE_NAMES refuses every call they list, and any module
+  // loaded keeps the body anyway (`blankWrittenScripts`).
+  if (code === undefined || RISKY_CODE.test(code) || STARTS_PROGRAMS.test(code)) return false
+  if (loadedModules(code).some(m => !SAFE_MODULES.has(m))) return false
+  return usedNames(code).every(n => SAFE_NAMES.has(n) || n === 'replace')
+}
+
+// The SAFE_NAMES that reach the file system: open, write, make or move a file or folder, or a module for
+// that (`print(..., file=open(...))` writes with no `.write`).
+const PY_FILES = new Set(['open', 'Path', 'pathlib', 'write', 'write_text', 'mkdir', 'replace', 'writeFileSync', 'appendFileSync', 'mkdirSync', 'fs'])
+
+/** A Python string's text with its escapes read (`app\x2epy` is `app.py`); an unknown one is kept as it is. */
+function pythonUnescape(s: string): string {
+  const named: Record<string, string> = { n: '\n', t: '\t', r: '\r', '\\': '\\', "'": "'", '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', '0': '\0' }
+  return s.replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|[\s\S])/g, (all, e: string) => {
+    if (/^[xuU]/.test(e)) return String.fromCodePoint(parseInt(e.slice(1), 16))
+    if (/^[0-7]/.test(e)) return String.fromCodePoint(parseInt(e, 8))
+    return named[e] ?? all
+  })
+}
+
+/**
+ * Whether a heredoc's reader is Python taking it as its code: `python -`, `python3 -I`, a venv's python,
+ * and the `py` launcher too: it follows a script file's `#!` line (left out of SCRIPT_OF for that), but
+ * reads stdin as Python (checked on 2026-11-15: a `#!/usr/bin/env bash` body ran as Python).
+ */
+function readsPythonCode(reader: string): boolean {
+  const words = programWords(reader.replace(REDIRECT, ''))
+  return /^(?:python[\d.]*|py)$/.test(commandName(words[0] ?? '')) && ['', '-'].includes(runTarget(words) ?? 'x')
 }
 // The same file spelled two ways (`./gen.txt`, `gen.txt`, `GEN.TXT` on Windows) is one file.
 const sameFile = (name: string) => name.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').toLowerCase()
@@ -920,13 +1015,14 @@ function programWords(cmd: string, set: string[] = []): string[] {
 }
 
 /**
- * For `gitAction`: the command with the bodies of quoted here-documents read by `cat` alone blanked when
- * nothing else in the command runs shell code. Such a body is a file's text (or goes to the screen), and a
+ * For `gitAction`: the command with the bodies of quoted here-documents read by `cat` alone, or by Python
+ * as code that can start no program, blanked when nothing else in the command runs shell code. Such a body
+ * is a file's text (or goes to the screen, or is code that runs no other), and a
  * `git commit` in it commits nothing until a shell runs it (a Python test that calls `git(repo, 'commit')`
  * is not a commit). Kept narrow, as an allowlist:
  *
  * - Every other command must be READ_ONLY or in NOT_A_SHELL, or an interpreter in SCRIPT_OF running a
- *   script file of its language. Anything else may run the file, by name or redirect (`bash x.sh`,
+ *   script file of its language, or Python reading a heredoc as its code (see below). Anything else may run the file, by name or redirect (`bash x.sh`,
  *   `. x.sh`, `sh < x.sh`) or not (`make`, `npm test`, a hook run by `git commit`), so nothing is blanked
  *   then. A program spelled as a path is any file there (`./cat`), so only python or node may be (a venv's
  *   `.venv/Scripts/python.exe`), and not when a heredoc here writes a file of that name (`/tmp/t/python`).
@@ -945,7 +1041,15 @@ function programWords(cmd: string, set: string[] = []): string[] {
  * - A body is kept when it is unquoted (bash expands `$(...)` in it), read by anything but `cat` alone,
  *   piped on (`cat <<'EOF' | bash`), shares its opener line with another heredoc, or may start programs
  *   itself (STARTS_PROGRAMS), or holds a git commit or push command line while the command runs a script
- *   (`gitCommandText`).
+ *   (`gitCommandText`). A body Python reads as its code follows the next rule instead.
+ * - Python may also read a heredoc as its code (`python - <<'PY'`, a script editing a test file whose cases
+ *   name `git commit`). Every such body must be quoted, not piped on, and shown by `pythonRunsNothing` to
+ *   start no program, or nothing is blanked; and there must be one such body for each `python -` command
+ *   (a reader read another way than the heredoc parser reads it would leave its body unchecked). Such a
+ *   body is blanked when it is alone on its opener line and no script runs. Loading any module counts as
+ *   running one (a `json.py` written here would be it), and so does a file opened by one of several
+ *   Python bodies (a `sitecustomize.py` the next one loads). Running it alone does not set that: it starts
+ *   nothing, so it keeps no git text in other bodies.
  * - `#` comments are read as bash reads them, and `timeout DURATION` and prefix words as `programWords` does.
  * - The caller does not use this when the command holds a `\`-newline (see `gitAction`).
  *
@@ -969,6 +1073,7 @@ function blankWrittenScripts(command: string): string {
   const MACHINE = /\$\{?(?:TMP|TEMP|TMPDIR|HOME|USERPROFILE|LOCALAPPDATA|PWD)\b\}?/g
   if (plain.replace(MACHINE, '').includes('$')) return command
   let runsScript = false
+  let pythonReads = 0
   for (const cmd of plain.split(/&&|\|\||[;&|\n]/)) {
     const raw = cmd.replace(/<<-?\s*[\w-]+/g, '').replace(REDIRECT, '').trim().split(/\s+/).filter(Boolean)
     if (raw.some(w => w === 'exec' || w.startsWith('--pre') || /[{}]/.test(w))) return command
@@ -985,13 +1090,40 @@ function blankWrittenScripts(command: string): string {
     if (/[\\/]/.test(program) && (!script || written.has(base(program)))) return command
     if (READ_ONLY.test(name) || NOT_A_SHELL.test(name)) continue
     const target = script ? runTarget(words) : undefined
+    // Python reading a heredoc as its code (`python - <<'PY'`, `py -3 - <<'PY'`): that body is checked below.
+    const stdin = name === 'python' || name === 'py' ? runTarget(words) : undefined
+    if ((stdin === '' || stdin === '-') && /(?<!<)<<(?!<)/.test(cmd)) {
+      // Another stdin (`< other.py`, `0<x`, a `<<<` here-string) is what Python reads then, not the body.
+      if (cmd.replace(/(?<!<)<<-?\s*[\w-]+/g, '').includes('<')) return command
+      pythonReads++
+      continue
+    }
     if (!script || !target || !script.test(target)) return command
     runsScript = true
   }
+  // Each body Python runs must be one that can start no program, or nothing is blanked: it could run
+  // another body's text. Fewer such bodies than `python -` commands accepted above means one wasn't found
+  // (a backup of the `<<` check there). A piped one is refused as a backup too: what it pipes into is a
+  // command checked above.
+  const pythonBodies = bodies.filter(b => readsPythonCode(b.reader))
+  if (pythonBodies.length < pythonReads || pythonBodies.some(b => !b.quoted || b.piped || !pythonRunsNothing(b.text))) return command
+  const codes = pythonBodies.map(b => pythonCode(b.text) ?? '')
+  // A module it loads may be a file written here (`cat > json.py`, or by its own `open`), so loading one
+  // runs a script. So may a file one body writes, for another Python started here (a `sitecustomize.py`).
+  if (codes.some(c => loadedModules(c).length > 0)) runsScript = true
+  if (pythonBodies.length > 1 && codes.some(c => usedNames(c).some(n => PY_FILES.has(n)))) runsScript = true
   const perLine = new Map<number, number>()
   for (const b of bodies) perLine.set(b.line, (perLine.get(b.line) ?? 0) + 1)
   for (const b of bodies) {
-    if (!b.quoted || b.piped || perLine.get(b.line) !== 1 || STARTS_PROGRAMS.test(b.text)) continue
+    if (!b.quoted || b.piped || perLine.get(b.line) !== 1) continue
+    // A body Python runs is blanked like a data body once shown to start nothing (above): its git
+    // commands are strings. Kept whenever another script runs: the body may have written that script, or
+    // a module it loads (`json.py`), and its own text is all the check can see of what that runs.
+    if (pythonBodies.includes(b)) {
+      if (!runsScript) for (let k = b.from; k < b.to; k++) lines[k] = ''
+      continue
+    }
+    if (STARTS_PROGRAMS.test(b.text)) continue
     if (runsScript && gitCommandText(b.text)) continue
     if (!/^cat(?:\s+-\S*)*$/i.test(b.reader.replace(REDIRECT, '').trim())) continue
     for (let k = b.from; k < b.to; k++) lines[k] = ''
@@ -1003,7 +1135,9 @@ function blankWrittenScripts(command: string): string {
  * The code files a shell command writes, as the command names them. A redirect counts for its target
  * alone. When anything else in the command writes, every code file it names counts, which can include
  * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
- * safer mistake than a change nobody looked at. Three things are left out: what ssh runs on another
+ * safer mistake than a change nobody looked at. In Python code from a heredoc a string's prefix is not part
+ * of a name (`r'app.py'` names `app.py` there), and every one-line string is read as a name. Three things
+ * are left out: what ssh runs on another
  * machine (`localPart`), the text of data here-documents nothing here runs (`blankDataBodies`), and a
  * script run after here-documents that only write notes (`onlyRun`). The caller leaves out two more: the
  * scripts a command only ran, shown by their file being the same before and after (`runOnlyScripts`), and
@@ -1026,7 +1160,31 @@ export function shellWrites(fullCommand: string): string[] {
     const trusted = onlyRun(command)
     // Shell words, quotes kept together: "$DST/hooks/a.ts" is one word, not "$DST" and "/hooks/a.ts".
     const mentions = new Map<string, number>()
-    for (const raw of (trusted?.outside ?? command).match(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g) ?? []) {
+    const text = trusted?.outside ?? command
+    // The lines of bodies that are Python code (`python - <<'PY'`, `cat > fix.py <<'EOF'`): there
+    // `r'C:\a.py'` is a raw string naming `C:\a.py`, not bash's word `rC:\a.py`. Each one-line string in
+    // them counts as a name too, wherever it stands (`base + r'a.py'`, `{'k': 'src/a.py'}`). A target is
+    // seen only when spelled plainly (`cat > "fix.py"` is masked): then the prefix stays, an extra name
+    // only. When `trusted`, `text` is `outside`, which holds no body lines.
+    const pythonLines = new Set<number>()
+    if (!trusted) {
+      for (const b of heredocs(command).bodies) {
+        const writes = [...b.reader.matchAll(REDIRECT)].map(m => m[1] ?? '')
+        if (!readsPythonCode(b.reader) && !writes.some(t => /\.pyw?$/i.test(t))) continue
+        for (let k = b.from; k < b.to; k++) pythonLines.add(k)
+        for (const m of b.text.matchAll(/(?<![\w])([rRbBuUfF]{0,2})(["'])((?:\\.|(?!\2)[^\\\n])*)\2/g)) {
+          const name = /r/i.test(m[1] ?? '') ? m[3] ?? '' : pythonUnescape(m[3] ?? '')
+          if (name.length > 2 && !name.startsWith('-') && languageOf(name)) mentions.set(name, (mentions.get(name) ?? 0) + 1)
+        }
+      }
+    }
+    let line = 0
+    let seen = 0
+    for (const found of text.matchAll(/(?:"[^"]*"|'[^']*'|[^\s;|&<>()`,=[\]{}"'])+/g)) {
+      for (; seen < found.index; seen++) if (text[seen] === '\n') line++
+      // A short word glued to a quote there is a prefix or a keyword (`in'a.py'`), never part of the name.
+      const prefix = pythonLines.has(line) ? /^[A-Za-z]{1,2}(?=["'])/.exec(found[0])?.[0] ?? '' : ''
+      const raw = found[0].slice(prefix.length)
       if (notAName(raw)) continue
       // Each quoted part loses only its own quotes, as bash reads it: "pat's/app.py" is pat's/app.py.
       const whole = raw.replace(/"([^"]*)"|'([^']*)'/g, (_m, dq?: string, sq?: string) => dq ?? sq ?? '')

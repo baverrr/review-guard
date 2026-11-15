@@ -340,6 +340,81 @@ describe('git commands', () => {
     expect(apostrophe("echo it\\'s; git push origin main; echo 'done'")?.refs).toEqual(['main'])
   })
 
+  test('git commands in the strings and comments of Python code run from a heredoc are no commit, unless the code may run them', async () => {
+    const seen = (c: string) => [c, gitAction(c) !== undefined]
+    const hidden = (c: string) => expect(seen(c)).toEqual([c, false])
+    const counts = (c: string) => expect(seen(c)).toEqual([c, true])
+    const py = (code: string, opener = "python - <<'PY'", after = '') => `${opener}\n${code}\nPY${after}`
+    // A script editing a test file whose cases name git commands. It also covers `replace` and an `open` of a
+    // variable's path, which the allowlist takes here.
+    const edit = `p = 'tests/a.test.ts'\ns = open(p, encoding='utf-8', newline='').read()\na = """  for (const c of ['git -C sub add x.py', 'git commit -m "x"']) {\n    expect(f(c)).toBe(true)\n  }"""\nassert s.count(a) == 1\nopen(p, 'w', encoding='utf-8', newline='').write(s.replace(a, a + 'x'))`
+    for (const c of [
+      py(edit), py(edit, "python3 -I - <<'PY'"), py(edit, "py -3 - <<'PY'"), // the launcher reads stdin as Python py(edit, ".venv/Scripts/python.exe <<'PY'"), py(edit, "cd /c/proj && python -X utf8 - <<'PY'"),
+      py("print('git push origin main')", 'python - <<"PY"'),
+      py("# don't: git commit -am x\nprint(1)"), // a comment, with an apostrophe
+      py("s = 'it\\'s'\nprint(\"git push origin main\")"), // an escaped quote
+      py("p = r'C:\\new\\x'\nprint(p, b'git push origin main')"), // raw and bytes strings
+      py("x = '''\n'git commit -m x'\n'''\nprint(x)"), // a triple-quoted string over lines
+      py("print('exec git push origin main')"), // a risky name (`exec`) inside a string is only text
+      py("s = 'git push origin main'\nprint(s.replace('push', 'pull'))"), // `replace` is allowed here
+      py("p = 'n.md'\nopen(p, 'w').write('git commit -m x')"), // and so is opening a variable's path
+      py("x = 1\nif x: pass\nelif'git push origin main': print(1)"), // `elif` before a quote is a word, not an f-prefix
+      // With no other script run, a data body beside it is blanked.
+      py("print('git push origin main')", "python - <<'PY'", "\ncat > n.md <<'EOF'\ngit push origin main\nEOF"),
+    ]) hidden(c)
+    for (const c of [
+      py("import subprocess\nsubprocess.run('git push origin main', shell=True)"),
+      py("import os\nos.system('git push origin main')"),
+      py("__import__('os').system('git push origin main')"),
+      py("x = f\"{__import__('os').system('git push origin main')}\""), // an f-string's {...} runs
+      py("import helpers\nhelpers.run('git push origin main')"), // a module not on the list
+      py("run('git push origin main')"), // a name not on the list
+      py("print('git push origin main')", "python - <<PY"), // unquoted: bash expands it first
+      py("print('git push origin main')", "python - <<'PY' | bash"), // its output runs
+      py("x = 'git push origin main\nprint(x)"), // a one-quote string cut off by a line break: not read for sure
+      py("x = '\"\"\"'; exec('git push origin main'); y = '\"\"\"'"), // quotes in quotes are read as Python reads them
+      // Another script runs, which this one may have written: its git text is kept.
+      py("open('/tmp/t/r.py', 'w').write('git push origin main')", "python - <<'PY'", '\npython /tmp/t/r.py'),
+      // Python that may run code keeps every body, a data body's too.
+      `cat > n.md <<'EOF'\ngit push origin main\nEOF\n${py('import helpers')}`,
+      "cat > n.md <<'EOF'\ngit push origin main\nEOF\npython - <<<'import helpers'", // a here-string is no heredoc
+      "python - <<'PY'\nprint('git push origin main')", // no end line
+      "python - <<'PY'\nprint('hi')\nPY\ngit commit -m x", // a real commit outside the body is still seen
+      "cat > n.md <<'EOF'\ngit push origin main\nEOF\necho 'import helpers' | python -", // stdin from a pipe: not read here
+      // A quote right after a keyword opens a string (`if''`), and only a whole prefix word joins one (`t''`
+      // runs its {...} like an f-string): read wrong, the code after it would hide inside a string.
+      py("x = 0 if'' else 1;import os;os.system('git push origin main') #'"),
+      py("x = 'a' in'' ;import subprocess;subprocess.run(['git','commit','-am','x']) #'"),
+      py("x = 1 if'#'else 0;__import__('os').system('git push origin main')"),
+      py("x = t'';import os;os.system('git push') #'"),
+      py("x = 'a\nimport os\nos.system('git push origin main') #'"), // a one-quote string ends on its line
+      // What it writes, a script or module run after may load: its text is kept.
+      py("open('x.py', 'w').write('import subprocess\\nsubprocess.run([\"git\", \"push\"])')", "python3 - <<'PY'", '\npython3 x.py'),
+      py("open('json.py', 'w').write('import subprocess\\nsubprocess.run([\"git\",\"push\"])')", "python3 - <<'PY'", '\npython3 other.py'),
+      `cat > json.py <<'EOF'\nimport helpers\nhelpers.run('git push origin main')\nEOF\n${py('import json\nprint(1)')}`, // a module it loads
+      py("open('json.py', 'w').write('git push origin main')\nimport json"), // its own file, as a module
+      `${py("open('sitecustomize.py', 'w').write('git push origin main')")}\n${py('print(1)')}`, // the next Python's startup file
+      // Text Python reads another way than these rules: a lone `\r` ends a comment, an encoding line changes
+      // the code, and fullwidth letters fold to ASCII names.
+      py("# note\rexec(\"import os;os.system('git push origin main')\")\nprint(1)"),
+      py("# coding: unicode_escape\nx = 1 # \\nimport os\nprint('git push origin main')"),
+      py("#!/usr/bin/env python\n# -*- coding: utf-7 -*-\nprint('git push origin main')"),
+      py("ｅｘｅｃ('import os;os.system(\"git push origin main\")')"),
+      // Another stdin replaces the body as what Python reads.
+      `cat > other.py <<'EOF'\nimport helpers\nhelpers.run('git push origin main')\nEOF\npython - <<'PY' < other.py\nprint(1)\nPY`,
+      `cat > n.md <<'EOF'\ngit push origin main\nEOF\npython - <<'PY' <<<'import helpers'\nprint(1)\nPY`,
+      // A comment ends on its line; f-prefixes in any order and case are refused; and a value that is a risky name.
+      py("# note\nimport os\nos.system('git push origin main')"),
+      py("x = fr'{__import__(\"os\").system(\"git push origin main\")}'"),
+      py("x = Rf'{__import__(\"os\").system(\"git push origin main\")}'"),
+      py("list(map(breakpoint, ['git push origin main']))"),
+      // A Python spelled so it isn't read as one (`"python"`): its body is unchecked, so a data body is kept.
+      `"python" - <<'PY'\nimport helpers\nPY\ncat > n.md <<'EOF'\ngit push origin main\nEOF`,
+      // Unquoted, bash runs `$(...)` in it, which could run a data body.
+      `cat > /tmp/t/x.md <<'EOF'\ngit push origin main\nEOF\npython - <<PY\nprint("$(bash /tmp/t/x.md)")\nPY`,
+    ]) counts(c)
+  })
+
   test('knows a gh command that writes from one that reads', async () => {
     for (const c of ['gh pr create --title x', 'gh issue comment 3 --body hi', 'gh release create v1', 'gh api repos/o/r/issues -f title=x', 'gh api -X POST /gists']) {
       expect(ghWrites(c)).toBe(true)
@@ -2672,6 +2747,25 @@ test('knows which code files a shell command writes', async () => {
   expect(shellWrites("cat > hooks/scan.ts <<'EOF'\nconst a = 1\nEOF")).toEqual(['hooks/scan.ts'])
   expect(shellWrites('echo "x = 1" >> "my app/settings.py"')).toEqual(['my app/settings.py'])
   expect(shellWrites("python - <<'PY'\nimport pathlib\npathlib.Path('tests/a.test.ts').write_text('x')\nPY")).toEqual(['tests/a.test.ts'])
+  // In Python code a raw, bytes or unicode string's prefix is not part of the name; in bash it is.
+  const edits = (name: string) => `s = open(${name}).read()\nopen(${name}, 'w').write(s.replace('a', 'b'))`
+  expect(shellWrites(`python - <<'PY'\np = r'C:\\proj\\hooks\\register.ts'\n${edits('p')}\nPY`)).toEqual(['C:\\proj\\hooks\\register.ts'])
+  expect(shellWrites(`python3 -I - <<'PY'\n${edits(`Rb"src/app.py"`)}\nPY`)).toEqual(['src/app.py'])
+  expect(shellWrites(`py - <<'PY'\np = r'C:\\proj\\register.ts'\n${edits('p')}\nPY`)).toEqual(['C:\\proj\\register.ts']) // the launcher
+  expect(shellWrites(`cat > fix.py <<'EOF'\n${edits(`u'src/app.py'`)}\nEOF\npython fix.py`)).toEqual(['fix.py', 'src/app.py'])
+  expect(shellWrites(`python - <<'PY'\nopen(f'src/a.py', 'w').write('x')\nPY`)).toEqual(['src/a.py'])
+  expect(shellWrites(`python - <<'PY'\np = 0 or'src/a.py'\n${edits('p')}\nPY`)).toEqual(['src/a.py']) // a keyword glued on
+  expect(shellWrites(`python - <<'PY'\n${edits(`'src/app\\x2epy'`)}\nPY`)).toContain('src/app.py') // a string's escapes are read
+  expect(shellWrites(`python - <<'PY'\n${edits(`'C:\\\\proj\\\\a.py'`)}\nPY`)).toContain('C:\\proj\\a.py')
+  expect(shellWrites(`python - <<'PY'\nd = {'k':r'src/a.py'}\n${edits("d['k']")}\nPY`)).toContain('src/a.py') // a string anywhere
+  expect(shellWrites(`python - <<'PY'\nbase = 'src/'\n${edits("base+'b.py'")}\nPY`)).toContain('b.py')
+  expect(shellWrites(`cat > fix.pyw <<'EOF'\n${edits(`r'src/app.py'`)}\nEOF\npython fix.pyw`)).toContain('src/app.py') // .pyw too
+  expect(shellWrites("sed -i s/a/b/ r'app.py'")).toEqual(['rapp.py']) // bash's own word
+  // Notes written with `time` and `textwrap`, then a script only run: that script is not a write.
+  for (const [mod, use] of [['textwrap', "textwrap.dedent('x')"], ['textwrap', "textwrap.indent('x', ' ')"], ['time', 'str(time.time())']]) {
+    expect(shellWrites(`python - <<'PY'\nimport ${mod}\nopen('notes.md', 'w').write(${use})\nPY\npython gen.py`)).toEqual([])
+  }
+  expect(shellWrites(`bash <<'EOF'\nsed -i s/a/b/ r'app.py'\nEOF`)).toEqual(['rapp.py']) // a shell's body too
   expect(shellWrites('cp old.py new.py')).toEqual(['old.py', 'new.py'])
   expect(shellWrites('Get-Content a.ps1 | Out-File b.ps1')).toEqual(['a.ps1', 'b.ps1'])
   expect(shellWrites('npx prettier --write src/a.ts src/b.ts')).toEqual(['src/a.ts', 'src/b.ts'])

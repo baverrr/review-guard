@@ -111,7 +111,8 @@ and leaves unchanged. The status line names each file left out. To turn the mod 
 
 **"It checked a commit or push I didn't make."** A command that writes a file holding a git command (a test,
 a note) and also runs a script is checked, since the guard can't tell whether the script runs it. A test
-that only calls a helper like `git(repo, 'commit')` is not.
+that only calls a helper like `git(repo, 'commit')` is not, and neither is a `python - <<'PY'` script whose
+git commands are only text in its strings, as long as it imports nothing and starts no program.
 
 **"A real address was stopped in my home-lab notes repo."** Add that repository to `allowNetworkInfo`.
 
