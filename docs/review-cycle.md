@@ -20,13 +20,17 @@ page says when that review counts as over, and what happens to the edits made wh
   from then on. Its edits to files under review are fixes; its edits to any other file still get their
   own review, and so do those of a helper it starts.
 - **Paths.** To tell whether a joined agent's edit is to a file under review, a path is matched
-  however it is spelled. On Windows `\` and `/` are the same and case is ignored, and in Git Bash and the
+  however it is spelled. On Windows `\` and `/` are the same and the drive letter's case is ignored (other
+  case counts: a folder can be case-sensitive, and there `A.py` and `a.py` are two files), and in Git Bash and the
   edit tools `/c/...` is drive C (a file changed that way is listed as `C:/...`); in PowerShell `/c/...`
   is a folder `c` on the current drive, so it is never taken for drive C, and so is `\c\...` from any tool.
   On Windows a path with no drive
   (`/proj/x.py`) names a different file in each tool, so it never counts as a file under review. A file
-  changed under two full spellings is listed once in the same list, under the first (not across a `..`
-  step, which through a link may name another file).
+  changed under two full spellings is listed once, under the first, in each list and again when lists
+  are joined (when a review ends or is cut short, or a saved state with no review running is read
+  back). Not across a `..` step, which through a link may name another file: such a path is never taken
+  for a file under review either. A known language is never replaced by `other code`. The check for
+  Claude's scratch folders ignores only the drive letter's case too.
 - **Relative paths.** A relative path is read against the session's folder only when that is surely its
   folder: not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`),
   and never again for an agent that has run such a command (a shell may keep the folder), was started in

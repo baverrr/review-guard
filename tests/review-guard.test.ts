@@ -750,7 +750,7 @@ test('an agent from before a review that finished and is started again unseen be
   out.agents = [{ id: 'bg', status: 'running' }, { id: 'tm', status: 'running' }]
   await edit('C:/proj/app.py')
   // bg, joined: its fix to app.py (with another spelling) is the review's; its own file is not.
-  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\APP.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'c:\\proj\\app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/bgown.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   expect(await stop()).toBe(undefined)
   out.agents = [{ id: 'bg', status: 'completed' }, { id: 'tm', status: 'running' }]
@@ -1078,7 +1078,8 @@ test('a joined agent messaging one of the review\'s own agents does not make it 
 
 test('two spellings of one file compare equal', () => {
   const win = (p: string, folder?: string) => samePath(p, folder, 'windows-msys')
-  expect(win('C:\\proj\\App.py')).toBe('c:/proj/app.py')
+  expect(win('C:\\proj\\App.py')).toBe('c:/proj/App.py') // only the drive letter's case is folded
+  expect(win('C:/proj/App.py') === win('C:/proj/app.py')).toBe(false) // a case-sensitive folder: two files
   expect(win('/c/proj/app.py')).toBe('c:/proj/app.py') // Git Bash
   expect(win('app.py', 'C:\\proj')).toBe('c:/proj/app.py') // relative, against the session's folder
   expect(win('./src/../app.py', 'C:/proj/')).toBe('c:/proj/app.py')
@@ -1097,7 +1098,7 @@ test('two spellings of one file compare equal', () => {
   expect(samePath('a\\b.py', '/home/pat', 'posix')).toBe('/home/pat/a\\b.py')
   expect(samePath('a\\b.py', '/home/pat', 'posix') === samePath('a/b.py', '/home/pat', 'posix')).toBe(false)
   expect(samePath('/c/proj/app.py', undefined, 'windows')).toBe('/c/proj/app.py')
-  expect(samePath('C:\\proj\\App.py', undefined, 'windows')).toBe('c:/proj/app.py') // still Windows
+  expect(samePath('C:\\proj\\App.py', undefined, 'windows')).toBe('c:/proj/App.py') // still Windows
   expect(samePath('app.py', '/c/proj', 'windows-msys')).toBe('/c/proj/app.py') // the session folder is native
   expect(keyOf('/c/proj/app.py', 'windows-msys')).toBe('C:/proj/app.py') // Git Bash on Windows: stored by drive
   expect(keyOf('/c/proj/app.py', 'windows')).toBe('/c/proj/app.py')
@@ -1260,7 +1261,7 @@ test('on Windows started from Git Bash, OS decides: Windows rules hold', async (
   mock.env(on, { OS: 'Windows_NT', HOME: '/c/Users/pat' })
   seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/App.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
   const { out, stop } = cycle($, on)
-  await $.tool.call({ tool: 'Edit', file_path: 'c:\\proj\\app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'c:\\proj\\App.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   out.agents = []
   expect(await stop(true)).toBe(undefined)
   expect(await stop()).toBe(undefined) // a fix: the same file on Windows
@@ -1342,12 +1343,12 @@ test('a file changed under two spellings is queued once', async ($, on) => {
   mock.env(on, { USERPROFILE: 'C:/Users/pat' })
   const { stop } = cycle($, on)
   await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\App.py', old_string: 'a', new_string: 'b' } as never)
-  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/app.py' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/App.py' } as never)
   await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/other.py', old_string: 'a', new_string: 'b' } as never)
   const prompt = (await stop()) ?? ''
   expect(prompt).toContain('2 file(s)')
   expect(prompt).toContain('C:\\proj\\App.py') // the first spelling is kept
-  expect(prompt).not.toContain('C:/proj/app.py')
+  expect(prompt).not.toContain('C:/proj/App.py')
 })
 
 test('a saved state that was damaged is said', async ($, on) => {
@@ -1466,11 +1467,11 @@ test('two relative spellings are never merged: their folders may differ', async 
   expect((await stop()) ?? '').toContain('2 file(s)')
 })
 
-test('SystemRoot alone tells Windows to the hooks: case is ignored', async ($, on) => {
+test('SystemRoot alone tells Windows to the hooks: slashes and the drive letter are ignored', async ($, on) => {
   mock.env(on, { SystemRoot: 'C:\\Windows' })
   seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/App.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
   const { out, stop } = cycle($, on)
-  await $.tool.call({ tool: 'Edit', file_path: 'c:/proj/app.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: 'c:\\proj\\App.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
   out.agents = []
   expect(await stop(true)).toBe(undefined)
   expect(await stop()).toBe(undefined) // a fix to the file under review
@@ -1541,6 +1542,140 @@ test('a damaged saved list keeps every relative path from being read against the
   out.agents = []
   expect(await stop(true)).toBe(undefined)
   expect((await stop())?.includes('app.py')).toBe(true)
+})
+
+test('a review cut short lists each file once, whatever spelling its fix used', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const { edit, stop } = cycle($, on)
+  on('turn.complete', () => ({ text: '' }))
+  await edit('C:/proj/App.py')
+  expect((await stop())?.includes('App.py')).toBe(true) // the review starts
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/a/b/ /c/proj/App.py' }) // its fix, another spelling
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await edit('C:/proj/next.py')
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toContain('2 file(s)')
+  expect(prompt).toContain('C:/proj/App.py')
+})
+
+test('a review that ends lists each file other work changed once', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/x.py': 'Python' }, othersAtStart: [], othersChanged: { 'C:/proj/B.py': 'Python', 'c:\\proj\\B.py': 'Python' }, joined: [], promptPending: false, ownFolder: [] })
+  const { edit, out, stop } = cycle($, on)
+  await edit('C:/proj/x.py') // a fix (and how paths read here is known from now on)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined) // the review ends
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toContain('1 file(s)')
+  expect(prompt).toContain('C:/proj/B.py')
+})
+
+test('a saved copy joined at load lists each file once', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: false, held: false, changed: { 'c:\\proj\\A.py': 'Python' }, underReview: { 'C:/proj/A.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: [], promptPending: false, ownFolder: [] })
+  const { edit, stop } = cycle($, on)
+  await edit('C:/proj/z.py')
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toContain('2 file(s)')
+  expect(prompt).toContain('C:/proj/A.py') // the first list's spelling
+})
+
+test('on Windows two names that differ only in case stay two files: a folder can be case-sensitive', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/A.py': 'Python' }, othersAtStart: [], othersChanged: { 'C:/proj/b.py': 'Python', 'C:/proj/B.py': 'Python' }, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, edit, stop } = cycle($, on)
+  await edit('C:/proj/x.py')
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/a.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never) // not A.py's fix
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toContain('C:/proj/a.py') // its own work, reviewed
+  expect(prompt).toContain('C:/proj/b.py')
+  expect(prompt).toContain('C:/proj/B.py')
+})
+
+test('a known language is never replaced by other code when lists are joined', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  seed(on, { reviewing: false, changed: { [String.raw`c:\proj\n.ipynb`]: 'other code' }, underReview: { 'C:/proj/n.ipynb': 'Python' } })
+  const { stop } = cycle($, on)
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toMatch(/code changed in 1 file\(s\)/)
+  expect(prompt).toContain('- Python: C:/proj/n.ipynb')
+  expect(prompt).not.toContain('other code')
+})
+
+test('a file named __proto__ is kept when lists are joined', async ($, on) => {
+  // Written as an own property, which this runtime does for a plain assignment too; Node's would not.
+  seed(on, { reviewing: false, changed: { ['__proto__']: 'Python' }, underReview: { 'u.py': 'Python' } })
+  const { stop } = cycle($, on)
+  expect((await stop()) ?? '').toContain('__proto__')
+})
+
+test('a saved copy joined first thing after a reload lists each file once', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  // No edit first: the read itself must know how paths read here.
+  seed(on, { reviewing: false, changed: { 'C:/proj/B.py': 'Python', [String.raw`c:\proj\B.py`]: 'Python' } })
+  const { stop } = cycle($, on)
+  expect((await stop()) ?? '').toMatch(/code changed in 1 file\(s\)/)
+})
+
+test('a review cut short keeps its fixes to other files and what other work changed', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  const { out, edit, stop } = cycle($, on)
+  on('turn.complete', () => ({ text: '' }))
+  out.agents = [{ id: 'bg', status: 'running' }] // other work, there as the review starts
+  await edit('C:/proj/app.py')
+  expect((await stop())?.includes('app.py')).toBe(true)
+  await edit('C:/proj/other.py') // the review's own fix to another file
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/proj/o.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await edit('C:/proj/next.py')
+  out.agents = []
+  const prompt = (await stop()) ?? ''
+  for (const f of ['app.py', 'other.py', 'o.py', 'next.py']) expect(prompt).toContain(`C:/proj/${f}`)
+})
+
+test('a late read keeps other work saved before the reload, each file once', async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+  let failing = true
+  on('state.get', ($, e, next) => {
+    if (e.plugin !== 'review-guard' || e.key !== 'cycle') return next(e)
+    if (failing) return { deny: 'not yet' }
+    return { value: { value: { reviewing: true, held: false, changed: {}, underReview: { 'C:/proj/A.py': 'Python' }, othersAtStart: ['bg'], othersChanged: { 'C:/proj/o.py': 'Python' }, joined: [], promptPending: false, ownFolder: [] } as never, version: 0 } }
+  })
+  const { edit, stop } = cycle($, on)
+  on('turn.complete', () => ({ text: '' }))
+  await edit(String.raw`c:\proj\A.py`) // changed before the saved copy could be read
+  failing = false
+  await $.turn.complete({ reason: 'aborted', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await edit('C:/proj/next.py')
+  const prompt = (await stop()) ?? ''
+  expect(prompt).toContain('C:/proj/o.py')
+  expect(prompt).toMatch(/code changed in 3 file\(s\)/) // A.py once, o.py, next.py
+})
+
+test('a stored key can not be read with a tool spelling: the compiler refuses it', () => {
+  const k = keyOf('/c/x.py', 'windows')
+  // @ts-expect-error a FileKey is read only through keyPath (the validator reports this line if the guard breaks)
+  expect(samePath(k, undefined, 'windows-msys')).toBe('c:/x.py')
+})
+
+test('a joined agent editing through a .. step is never taken for a fix: through a link it may be another file', async ($, on) => {
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/pat' : undefined }))
+  seed(on, { reviewing: true, held: false, changed: {}, underReview: { '/proj/b.py': 'Python' }, othersAtStart: [], othersChanged: {}, joined: ['bg'], promptPending: false, ownFolder: [] })
+  const { out, stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/link/../b.py', old_string: 'a', new_string: 'b', agentId: 'bg' } as never)
+  out.agents = []
+  expect(await stop(true)).toBe(undefined)
+  expect((await stop()) ?? '').toContain('/proj/link/../b.py') // its own work, reviewed
+})
+
+test('a . step is always the same file: listed once', async ($, on) => {
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/pat' : undefined }))
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/./b.py', old_string: 'a', new_string: 'b' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/b.py', old_string: 'a', new_string: 'b' } as never)
+  expect((await stop()) ?? '').toMatch(/code changed in 1 file\(s\)/)
 })
 
 test('a saved list cut to its cap is logged', async ($, on) => {
@@ -2466,10 +2601,12 @@ test('a failed lookup never leaves a file out', async ($, on) => {
 test('knows scratch folders, and which scripts a command only runs and where', async () => {
   const temp = [TEMP]
   expect(inScratch(`${TEMP.replace(/\//g, '\\')}\\claude\\a\\s.py`, temp, { spelling: 'windows-msys', posixTmp: true })).toBe(true)
-  expect(inScratch('/c/users/PAT/appdata/local/temp/CLAUDE/a.py', temp, { spelling: 'windows-msys', posixTmp: true })).toBe(true) // Git Bash, any case on Windows
+  expect(inScratch('/c/Users/pat/AppData/Local/Temp/claude/a.py', temp, { spelling: 'windows-msys', posixTmp: true })).toBe(true) // Git Bash
+  expect(inScratch('c:/Users/pat/AppData/Local/Temp/claude/a.py', temp, { spelling: 'windows', posixTmp: false })).toBe(true) // the drive letter's case only
+  expect(inScratch('/c/users/PAT/appdata/local/temp/CLAUDE/a.py', temp, { spelling: 'windows-msys', posixTmp: true })).toBe(false) // other case counts: a folder can be case-sensitive
   expect(inScratch('/c/users/pat/appdata/local/temp/claude/a.py', temp, { spelling: 'windows', posixTmp: false })).toBe(false) // PowerShell: a folder c
   // The edit tools on Windows: `/c/...` is drive C, but `/tmp` is `\tmp` on the current drive.
-  expect(inScratch('/c/users/pat/appdata/local/temp/claude/a.py', temp, rulesFor('edit', true))).toBe(true)
+  expect(inScratch('/c/Users/pat/AppData/Local/Temp/claude/a.py', temp, rulesFor('edit', true))).toBe(true)
   expect(inScratch('/tmp/claude/x/b.py', temp, rulesFor('edit', true))).toBe(false)
   expect(inScratch('/tmp\\claude-1/a.py', [], { spelling: 'posix', posixTmp: true })).toBe(false) // off Windows a \ is part of a name
   expect(inScratch('/tmp/claude-1000/a.py', [], { spelling: 'posix', posixTmp: true })).toBe(true)

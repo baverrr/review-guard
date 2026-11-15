@@ -21,8 +21,10 @@ import {
   settle,
   shellWrites,
   CHANGES_FOLDER,
+  type FileKey,
   nativePath,
   nativeSpelling,
+  type NotFileKey,
   rulesFor,
   windowsSpelling,
   type Spelling,
@@ -137,7 +139,7 @@ export function cycleFrom(value: unknown): Cycle {
   // Put right what a stored copy may hold wrongly (written by hand, damaged, or by another version).
   if (!c.reviewing) {
     // No review is running: nothing review-only stands, and no file it held is lost.
-    c.changed = { ...c.underReview, ...c.othersChanged, ...c.changed }
+    c.changed = joinFiles(c.underReview, c.othersChanged, c.changed)
     c.underReview = {}
     c.othersAtStart = []
     c.othersChanged = {}
@@ -162,11 +164,12 @@ let changedUnread = false // the cycle was changed in memory while the stored co
  * queued again: more review, never less.
  */
 function ensureLoaded($: EngineInterface): Promise<void> {
-  loaded ??= $.state.get(CYCLE).then(
+  // How paths read here first (`pathsHere` never rejects): the read joins lists, which needs `keySpelling`.
+  loaded ??= pathsHere($).then(() => $.state.get(CYCLE)).then(
     ({ value }) => {
       const stored = cycleFrom(value)
       cycle = changedUnread
-        ? { ...cycle, changed: { ...stored.underReview, ...stored.othersChanged, ...stored.changed, ...cycle.changed }, underReview: { ...cycle.underReview } }
+        ? { ...cycle, changed: joinFiles(stored.underReview, stored.othersChanged, stored.changed, cycle.changed), underReview: { ...cycle.underReview } }
         : stored
       // Marks are never taken back (only the oldest past the cap drop off), so both lists are joined: an
       // agent marked before the reload stays marked, and so does one marked meanwhile (a mark alone is no
@@ -378,7 +381,9 @@ async function pathsHere($: EngineInterface): Promise<Paths> {
   const home = await envValue($, 'HOME', () => $.env.get('HOME'))
   const os = await envValue($, 'OS', () => $.env.get('OS'))
   const systemRoot = await envValue($, 'SystemRoot', () => $.env.get('SystemRoot'))
-  return { windows: isWindows({ os, systemRoot, userProfile, home }), home, userProfile }
+  const windows = isWindows({ os, systemRoot, userProfile, home })
+  keySpelling = nativeSpelling(windows)
+  return { windows, home, userProfile }
 }
 
 /** The environment values `isWindows` decides by. */
@@ -455,19 +460,23 @@ async function sessionFolder($: EngineInterface): Promise<string | undefined> {
 
 /**
  * A path spelled so that two spellings of one file compare equal, read by `spelling` (see `Spelling`): on
- * Windows `/` for `\` and case ignored (elsewhere a `\` is part of a file name and stays), `/c/...` as
+ * Windows `/` for `\` and the drive letter's case ignored (elsewhere a `\` is part of a file name). Other
+ * case counts everywhere: a Windows folder can be case-sensitive (made so, or by WSL), and there `A.py`
+ * and `a.py` are two files, so treating them as one could hide one from review. `/c/...` as
  * `C:/...` in `windows-msys` only, a relative path (a shell command's own spelling, `sed -i x app.py`)
- * resolved against `folder` when one is given, and `.` and `..` steps taken. A stored key or a native
- * path (the session's folder, say) is read as `nativeSpelling`, so its `/c/` is never taken for drive C.
+ * resolved against `folder` when one is given, and `.` and `..` steps taken. A stored key (through
+ * `keyPath` only: see `FileKey`) or a native path (the session's folder, say) is read as `nativeSpelling`,
+ * so its `/c/` is never taken for drive C.
  * Only a forward-slash `/c/` is a drive: `\c\...` is a folder `c` on the current drive, as Windows reads
  * it. The caller gives no folder when it can't be sure which one a relative path is from (a command that
  * changes folder, an agent in `ownFolder`, a session folder that
  * could not be read, or a review state not yet read back): then a relative path stays relative and can
  * only fail to match a full one, which means more review, never less.
  */
-export function samePath(path: string, folder: string | undefined, spelling: Spelling): string {
+export function samePath<P extends string>(path: NotFileKey<P>, folder: string | undefined, spelling: Spelling): string {
   const windows = windowsSpelling(spelling)
-  let p = spelling === 'windows-msys' ? nativePath(path) : path
+  const raw: string = path
+  let p = spelling === 'windows-msys' ? nativePath(raw) : raw
   if (windows) p = p.replace(/\\/g, '/')
   const absolute = (windows && /^[a-zA-Z]:(\/|$)/.test(p)) || p.startsWith('/')
   if (!absolute && folder) {
@@ -487,7 +496,7 @@ export function samePath(path: string, folder: string | undefined, spelling: Spe
     parts.push(part)
   }
   const joined = rooted && parts.length === 1 ? `${parts[0]}/` : parts.join('/')
-  return windows ? joined.toLowerCase() : joined
+  return windows ? joined.replace(/^[A-Z](?=:)/, d => d.toLowerCase()) : joined // only the drive letter's case
 }
 
 let ownFolderCutSaid = false // the list of agents in a folder of their own grew past its cap: logged once
@@ -526,8 +535,84 @@ async function inOwnFolder($: EngineInterface, id: string): Promise<void> {
  * (0.3.7 kept the edit tools' `/c/` as written; earlier versions Git Bash's too). Either way it never
  * matches a drive C path, which means more review, never less.
  */
-export function keyOf(path: string, spelling: Spelling): string {
-  return spelling === 'windows-msys' ? nativePath(path) : path
+export function keyOf<P extends string>(path: NotFileKey<P>, spelling: Spelling): FileKey {
+  const raw: string = path
+  return (spelling === 'windows-msys' ? nativePath(raw) : raw) as FileKey
+}
+
+// How stored keys read on this machine: `pathsHere` sets it, and `ensureLoaded` waits for that before it
+// reads the saved state, so every join of lists reads keys this machine's way. (`posix` before then
+// merges the fewest spellings: more review, never less.)
+let keySpelling: Spelling = 'posix'
+
+/** Whether a path has a `..` step, which through a link may lead to another file than its text says. */
+function hasUpStep(x: string): boolean {
+  return x.split(/[\\/]/).includes('..')
+}
+
+/**
+ * Whether a path, as `samePath` spells it, is full: on Windows one with a drive (`/proj/x.py` is the
+ * current drive's root in PowerShell but under Git's install folder in Git Bash, so it is not sure which
+ * file it names), elsewhere one from `/`. Only a full path is compared with another spelling.
+ */
+function isFull(p: string, windows: boolean): boolean {
+  return windows ? /^[a-z]:\//i.test(p) : p.startsWith('/')
+}
+
+/**
+ * The keys of a list of changed files, as `FileKey`s (`joinFiles` casts the same way). Every list holds
+ * only keys made by `keyOf`, or read back from a saved copy (see `keyOf` for old spellings).
+ */
+function keysOf(files: Record<string, string>): FileKey[] {
+  return Object.keys(files) as FileKey[]
+}
+
+/** A stored key as `samePath` spells it, read as this machine reads native paths (`keySpelling`). */
+function keyPath(k: FileKey): string {
+  return samePath(k as string, undefined, keySpelling) // the one place a key is read as a path
+}
+
+/**
+ * The same-file match for `k`: its spelling as `keyPath` gives it, when `k` is a full path with no `..`
+ * step (a relative path's folder is not known, and through a link `a/../b.py` may be another file than
+ * `b.py`; a `.` step is always the same file). Undefined otherwise: then only `k` itself is the same file.
+ * Under `posix` a `\` is part of a name, so splitting on it only refuses more.
+ */
+function matchOf(k: FileKey): string | undefined {
+  if (hasUpStep(k)) return undefined
+  const p = keyPath(k)
+  return isFull(p, windowsSpelling(keySpelling)) ? p : undefined
+}
+
+/**
+ * Puts `k` into `files` with this language, under the key the same file already has there (`matchOf`:
+ * slashes, the drive letter's case; a Git Bash `/c/` was already made `C:/` by `keyOf`). A known language
+ * is never replaced by `other code`. Written as an own property, so even a file named `__proto__` is
+ * kept in any JS runtime (in Node a plain assignment would set the prototype instead). `index`: the
+ * matches already in `files`, kept up to date, so a join is not quadratic; it must have been built along
+ * with `files` from empty (as `joinFiles` does), or it would miss keys already there.
+ */
+function addFile(files: Record<string, string>, k: FileKey, lang: string, index?: Map<string, FileKey>): void {
+  const match = matchOf(k)
+  let at: FileKey = k
+  if (!Object.hasOwn(files, k) && match !== undefined) {
+    at = (index ? index.get(match) : keysOf(files).find(x => matchOf(x) === match)) ?? k
+  }
+  const had = Object.hasOwn(files, at) ? files[at] : undefined
+  const keep = had !== undefined && had !== 'other code' && lang === 'other code'
+  Object.defineProperty(files, at, { value: keep ? had : lang, enumerable: true, writable: true, configurable: true })
+  if (index && match !== undefined && !index.has(match)) index.set(match, at)
+}
+
+/**
+ * Lists of changed files joined into one, each file once under its first spelling (see `addFile`). Keys
+ * are read as `keySpelling`, which `ensureLoaded` makes sure of before any join.
+ */
+function joinFiles(...lists: Record<string, string>[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  const index = new Map<string, FileKey>()
+  for (const files of lists) for (const [k, lang] of Object.entries(files)) addFile(out, k as FileKey, lang, index)
+  return out
 }
 
 /**
@@ -536,7 +621,8 @@ export function keyOf(path: string, spelling: Spelling): string {
  * them does not count as work picking up again. `writer`: the tool that named the paths, which decides how
  * they are read (`rulesFor`). `keepScratch`: keep them too (a copy or move may have taken them into the
  * project). A file already queued in the same list under another full spelling keeps that entry, so it
- * is listed once there (not across `changed` and `othersChanged`, nor for a relative or `..` path).
+ * is listed once there (`addFile`); a file in two lists, `changed` and `othersChanged` during a review
+ * say, is listed once when they are joined (`joinFiles`).
  * `agentId`: the agent that made the change, when not the main loop. During a review, an
  * agent that is other work (`othersAtStart`) has its files wait for a review of their own instead of
  * counting as the review's fixes, and so does one that joined the review (`joined`) for any file not
@@ -549,9 +635,6 @@ async function remember($: EngineInterface, changed: [string, string][], writer:
   // spells them, so another spelling of a file under review still counts as that file.
   const { windows: onWindows } = await pathsHere($)
   const rules = rulesFor(writer, onWindows)
-  // How a stored key is read: `keyOf` already turned a `windows-msys` `/c/` into `C:/`, so any `/c/` left
-  // is a folder `c`.
-  const stored = nativeSpelling(onWindows)
   // Relative paths are read against the session's folder only when that is surely where they are from:
   // not when the command changes folder (`sameFolder` false), nor for an agent in `ownFolder` (started in
   // a folder of its own, by such an agent, or after an earlier `cd`), nor before the saved state is read
@@ -564,23 +647,18 @@ async function remember($: EngineInterface, changed: [string, string][], writer:
   // does, as the folder it was relative to may not be the one seen now.
   // On Windows a path must have a drive: `/proj/x.py` is the current drive's root in PowerShell but under
   // Git's install folder in Git Bash, so it is not sure which file it names (from any tool).
-  const full = (x: string) => (onWindows ? /^[a-z]:\//i.test(x) : x.startsWith('/'))
+  const full = (x: string) => isFull(x, onWindows)
   const path0 = (path: string) => samePath(path, folder, rules.spelling)
+  // Not across a `..` step (in the path or the key): through a link it may be another file, which would
+  // then be taken for the review's fix and dropped. On Windows `..` is taken by its text, but refusing it
+  // there too only means more review.
   const underReview = (c: Cycle, path: string) => {
+    if (hasUpStep(path)) return false
     const p = path0(path)
-    return full(p) && Object.keys(c.underReview).some(k => samePath(k, undefined, stored) === p)
+    return full(p) && keysOf(c.underReview).some(k => !hasUpStep(k) && keyPath(k) === p)
   }
-  // Into `map` under its stored key, or under the key the same file already has there in another
-  // spelling (slashes, case on Windows, `/c/`), with this language. Not across a `.` or `..` step: through
-  // a link, `a/../b.py` may be another file than `b.py`, and merging the two would leave one unreviewed.
-  const plainSteps = (x: string) => !x.split(/[\\/]/).some(part => part === '.' || part === '..')
-  const put = (map: Record<string, string>, path: string, lang: string) => {
-    const k = keyOf(path, rules.spelling)
-    const same = samePath(k, undefined, stored)
-    const mergeable = full(same) && plainSteps(k)
-    const had = k in map || !mergeable ? undefined : Object.keys(map).find(x => plainSteps(x) && samePath(x, undefined, stored) === same)
-    map[had ?? k] = lang
-  }
+  // Into `map` under its stored key (`keyOf`), or the key the same file already has there (`addFile`).
+  const put = (map: Record<string, string>, path: string, lang: string) => addFile(map, keyOf(path, rules.spelling), lang)
   const queueFor = (c: Cycle, path: string) =>
     c.reviewing && agentId !== undefined && (c.othersAtStart.includes(agentId) || (c.joined.includes(agentId) && !underReview(c, path)))
       ? c.othersChanged
@@ -884,9 +962,9 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
  * agents changed meanwhile are queued either way.
  */
 function endReview(c: Cycle, fixes: 'drop' | 'requeue'): void {
-  if (fixes === 'drop') c.changed = {}
-  else for (const [path, lang] of Object.entries(c.underReview)) c.changed[path] ??= lang
-  Object.assign(c.changed, c.othersChanged)
+  // Each file once, under the first list's spelling (`joinFiles`): the files it covered first, so their
+  // spelling is kept, and other work last.
+  c.changed = fixes === 'drop' ? joinFiles(c.othersChanged) : joinFiles(c.underReview, c.changed, c.othersChanged)
   c.reviewing = false
   c.underReview = {}
   c.othersAtStart = []

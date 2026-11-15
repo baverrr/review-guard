@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 90beccb4eac440f65f66c896f40aa39baab7b6f924108b731e9e14e39b61dd94 built-sha256: 9d3db8677c5ed7ce0b01fca7aeaceeee005c8bcb5022c14fb7690380a577194b
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: c767cad106707febb93df54b6edf75808e5491e400f04bb074b062f7a754ad2a built-sha256: e8a1629a38d19c530c9463d57cd391fe1169b57d8e14331447128bbcc271e9c3
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -256,10 +256,11 @@ function unquote(s        )         {
 
 /**
  * Git Bash paths (/c/Users/..., or a bare /c) as native Windows reads them (C:/Users/..., C:/). The one
- * place that turns `/c/` into a drive: `comparable`, `samePath` and `keyOf` all use it.
+ * place that turns `/c/` into a drive: `comparable`, `samePath`, `keyOf`, `resolveDir`, the run-only
+ * script check and the MCP server's built copy all use it.
  */
-export function nativePath(p        )         {
-  const m = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(p)
+export function nativePath                  (p               )         {
+  const m = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(p          )
   return m ? `${(m[1] ?? '').toUpperCase()}:/${m[2] ?? ''}` : p
 }
 
@@ -1077,6 +1078,18 @@ export function shellWrites(fullCommand        )           {
  */
                                                            
 
+                                         
+/**
+ * A changed file as review-guard stores it (`keyOf` in register.ts): a path already in the machine's
+ * native spelling. Compared only through `keyPath`, never read with a tool's spelling: a PowerShell key
+ * `/c/x` would then turn into drive C's `C:/x` and could hide a file from review. The compiler stops a
+ * value typed `FileKey` reaching `nativePath`, `samePath` or `keyOf`; a key taken with `Object.keys` is a
+ * plain string (as is one widened to `string` any other way), so keys are compared through `keyPath`.
+ */
+                                                                
+/** Any string but a `FileKey`, which becomes `never`: a type error, so keys go through `keyPath`. */
+                                                                        
+
 /** How a native path (a stored key, a temp folder, the session's folder) is read here: never `/c/` as a drive. */
 export const nativeSpelling = (windows         )           => (windows ? 'windows' : 'posix')
 
@@ -1102,13 +1115,15 @@ export function rulesFor(writer        , windows         )            {
 }
 
 // A path as one comparable string: no trailing slash, and on Windows forward slashes, `/c/` as `C:/` (in
-// `windows-msys` only, by `nativePath`) and lower case. Elsewhere a `\` is part of a file name and case
-// counts, so they stay.
+// `windows-msys` only, by `nativePath`) and the drive letter in lower case. Other case counts (a folder can
+// be case-sensitive, and a file taken for scratch is left out of review), and elsewhere a `\` is part of
+// a file name.
 function comparable(p        , spelling          )         {
   if (spelling === 'posix') return p.trim().replace(/\/+$/, '')
   // `/c/` before `\` is folded: `\c\...` is a folder `c` on the current drive, as Windows reads it.
   const t = p.trim()
-  return (spelling === 'windows-msys' ? nativePath(t) : t).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const s = (spelling === 'windows-msys' ? nativePath(t) : t).replace(/\\/g, '/').replace(/\/+$/, '')
+  return s.replace(/^[A-Z](?=:)/, d => d.toLowerCase())
 }
 
 /**
@@ -1125,8 +1140,7 @@ export function inScratch(path        , tempDirs                   , rules      
   if (p.split('/').includes('..')) return false
   // The temp folders come from the environment as native paths, so their `/c/` is never read as a drive.
   const roots = [...tempDirs, ...(rules.posixTmp ? ['/tmp', '/var/tmp'] : [])].map(d => comparable(d, nativeSpelling(windows)))
-  const claude = windows ? /^claude(?:-\d+)?\/./i : /^claude(?:-\d+)?\/./
-  return roots.some(r => /^(?:[a-z]:)?\/[^/]/i.test(r) && p.startsWith(`${r}/`) && claude.test(p.slice(r.length + 1)))
+  return roots.some(r => /^(?:[a-z]:)?\/[^/]/i.test(r) && p.startsWith(`${r}/`) && /^claude(?:-\d+)?\/./.test(p.slice(r.length + 1)))
 }
 
 // Words that move the shell to another folder, in Bash and PowerShell (one source for both uses).
