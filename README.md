@@ -2,8 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A mod for Claude Code. After Claude changes code it sends Claude back to review the change, and before any
-commit or push to GitHub it checks what would go out for keys, IP and MAC addresses and your personal details.
+A mod for Claude Code that reviews the code Claude writes and guards what it sends to GitHub. After Claude
+changes code, it sends Claude back to review the change with review agents, a security check for each
+language and the scanners you have installed, fix the real bugs found, and slow down on files that keep
+coming back for review. Before any commit, push or GitHub write, it stops keys, tokens, IP and MAC addresses
+and your personal details from going out.
 
 <p align="center">
   <img src="docs/images/demo.gif" alt="Claude is asked to commit a notes file; review-guard stops the commit because the file holds an IP and a MAC address, and Claude explains the choices" width="860">
@@ -29,6 +32,9 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
   missing tests are only listed. It says why for any bug that isn't one, and leaves one unfixed only for a
   real blocker (the fix would break something, no fixed version yet, it needs your call, or it is an old
   problem in a file outside the review). Then it reruns the tests and scanners and tells you the outcome.
+- **Notices when fixes keep making bugs.** When the same files of a project keep coming back for review
+  (4 reviews in 24 hours by default), the review asks Claude to stop adding features to them, write tests
+  that pin them down, and ask you whether their design needs another look.
 - **Brings its own reviewers.** It ships five review agents, so it works without the pr-review-toolkit plugin.
 - **Stops leaks to GitHub.** A commit, push or GitHub write that would send a key, a token, an IP or MAC
   address, or one of your personal terms is stopped, and Claude is told what and where, never the value.
@@ -83,7 +89,8 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
    {
      "personal": ["Your Name", "you@example.com", "yourusername"],
      "allowNetworkInfo": ["owner/notes-repo"],
-     "allowValues": []
+     "allowValues": [],
+     "churn": { "reviews": 4, "hours": 24 }
    }
    ```
 
@@ -95,8 +102,10 @@ commit or push to GitHub it checks what would go out for keys, IP and MAC addres
 | `personal` | Text that must never reach GitHub (matched without regard to case) |
 | `allowNetworkInfo` | Repositories, as `owner/repo`, where IP and MAC addresses are fine |
 | `allowValues` | Exact values that are false alarms |
+| `churn` | When files count as coming back too often: `{ "reviews": 4, "hours": 24 }` (the default), or `false` to turn it off. `reviews` is 2 to 200, `hours` above 0 |
 
-Claude cannot edit this file; the mod stops it from trying. A typo in it stops commits until it is fixed.
+Claude cannot edit this file; the mod stops it from trying. A typo in it stops commits until it is fixed,
+except in `churn`, which then uses the default and says so in the log.
 </details>
 
 ## Help

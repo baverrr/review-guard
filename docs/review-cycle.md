@@ -90,3 +90,18 @@ not. That includes the list of agents whose relative paths are not read against 
 start again after a reload. A session with
 something to report also writes it to `~/.claude/review-guard/status/` for the `review_status` tool. Old
 files there are not removed; the tool shows the last 24 hours.
+
+## Files that keep coming back
+
+Each project folder keeps a list of its recent reviews in `~/.claude/review-guard/history/`, one file per
+folder, shared by every session there. A review is added only once its prompt has reached Claude: a
+prompt that never arrived is not counted, and the review asked for again in its place is counted once.
+Only reviews inside the window of the `churn` rule are kept (at most 200). A file is counted under one
+spelling: slashes and the drive letter's case are evened out and a relative path is read against the
+session's folder, but other case still counts, and a path with a `..` step is kept as it was written.
+When a file under review has been in the rule's number of reviews within its hours, the review prompt gets
+a paragraph: no new features in those files this turn, tests that pin them down, and a question for the
+user about their design. The check never holds a review back for long: if it fails, or takes over five
+seconds (two for recording a review), the review goes on without it, and the log says why. A history file
+that is not valid JSON, or of another version, is logged and started again. Two sessions writing at the
+same moment may lose one entry, which only means a churning file is noticed a review later.

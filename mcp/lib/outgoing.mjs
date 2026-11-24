@@ -1,4 +1,4 @@
-// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 86130747551fe21369aa547763ab1c97cf74bf6d526a47acee7a88e994b28301 built-sha256: 2ce5bb038390714d0c677c414f0f23eca3583d35101693ea169de6cde20d3d81
+// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: e55ce173b8800d8e1fdc85e907de03c97624b52caa548a1f79eaa6665c5769e8 built-sha256: 29f49c8f65115c0aee7a94ee46d713f639a7a0b79b52fc941dbd8a8bf95d47fc
 // review-guard's check of what leaves this machine: what a git commit or push would send, and the
 // user's config of personal terms. It runs git and gitleaks through `Host`, so the hooks (through the
 // engine's `$`) and the MCP server (through Node) run the same code.
@@ -57,8 +57,45 @@ export function homeFrom(paths                                                 )
   return value?.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
 }
 
-/** The user's config: personal terms to look for, repos where IPs and MACs may go, values let through. */
-                                                                                                                                                    
+/**
+ * When a project's files count as churning: a file in `reviews` or more reviews within `hours` hours. Then
+ * the review asks Claude to steady those files (tests, a design check) before adding more to them.
+ */
+                                                                            
+export const DEFAULT_CHURN            = Object.freeze({ reviews: 4, hours: 24 })
+/** Reviews a project's history keeps at most (churn.ts), so also the most `reviews` can be. */
+export const CHURN_HISTORY_KEPT = 200
+
+/**
+ * The user's config: personal terms to look for, repos where IPs and MACs may go, values let through, and
+ * the churn rule (`false`: off). `churnProblem`: why the "churn" value was not used (the default rule was);
+ * a bad churn value never stops a commit, as it has nothing to do with what goes out.
+ */
+                      
+                                      
+                                              
+                                         
+                                   
+                                
+ 
+
+/**
+ * The config's "churn" value as a rule: missing or `true` gives the default, `false` turns it off, and an
+ * object's missing "reviews" or "hours" takes the default's. Anything else throws.
+ */
+export function churnRule(v         )                    {
+  if (v === undefined || v === true) return DEFAULT_CHURN
+  if (v === false) return false
+  const bad = `review-guard.json: "churn" must be true, false or { "reviews": a whole number from 2 to ${CHURN_HISTORY_KEPT}, "hours": a number above 0 }`
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new Error(bad)
+  const { reviews, hours, ...rest } = v                           
+  if (Object.keys(rest).length > 0) throw new Error(`${bad}; it has a key it does not know: ${Object.keys(rest).join(', ')}`)
+  const r = reviews === undefined ? DEFAULT_CHURN.reviews : reviews
+  const h = hours === undefined ? DEFAULT_CHURN.hours : hours
+  if (typeof r !== 'number' || !Number.isInteger(r) || r < 2 || r > CHURN_HISTORY_KEPT) throw new Error(bad)
+  if (typeof h !== 'number' || !Number.isFinite(h) || h <= 0) throw new Error(bad)
+  return { reviews: r, hours: h }
+}
 
 const CONFIG_NAME = '.claude/review-guard.json'
 
@@ -170,16 +207,18 @@ async function configPath(host      )                              {
   return home ? `${home}/${CONFIG_NAME}` : undefined
 }
 
-const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues']         
+const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues', 'churn']         
 
 /**
  * The user's config. With no file there, the secret checks still run and `note` says what was skipped.
  * A file that is there but can't be read, or is wrong (bad JSON, a misspelt key, a value that is not a
  * list of text, an `allowNetworkInfo` entry that is not owner/repo), throws, so a hook stops the command
  * and an MCP tool reports an error: a typo or a locked file must not quietly turn the personal checks off.
+ * A bad "churn" value is the one exception: it has nothing to do with what goes out, so it only gives the
+ * default rule and `churnProblem`, which the churn check logs.
  */
 export async function loadConfig(host      )                                             {
-  const empty         = { personal: [], allowNetworkInfo: [], allowValues: [] }
+  const empty         = { personal: [], allowNetworkInfo: [], allowValues: [], churn: DEFAULT_CHURN }
   const note = 'personal details were NOT checked (no ~/.claude/review-guard.json; ~ is USERPROFILE on Windows and HOME elsewhere, or the other when that one is not set)'
   const path = await configPath(host)
   if (!path) return { config: empty, note: 'personal details were NOT checked (the home folder is not known)' }
@@ -204,7 +243,7 @@ export async function loadConfig(host      )                                    
   const fields = raw                           
   const unknown = Object.keys(fields).filter(k => !(CONFIG_KEYS                     ).includes(k))
   if (unknown.length > 0) throw new Error(`review-guard.json has a key it does not know: ${unknown.join(', ')}`)
-  const list = (key                              )           => {
+  const list = (key                                                 )           => {
     const v = fields[key]
     if (v === undefined) return []
     if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) throw new Error(`review-guard.json: "${key}" must be a list of text values`)
@@ -214,7 +253,19 @@ export async function loadConfig(host      )                                    
   // An entry the guard can't read as a GitHub repo would be ignored without a word: say so instead.
   const bad = allowNetworkInfo.filter(r => githubRepo(r) === undefined)
   if (bad.length > 0) throw new Error(`review-guard.json: ${bad.length} "allowNetworkInfo" entr${bad.length === 1 ? 'y is' : 'ies are'} not owner/repo or a GitHub URL`)
-  return { config: { personal: list('personal'), allowNetworkInfo, allowValues: list('allowValues') } }
+  let churn                    = DEFAULT_CHURN
+  let churnProblem                    
+  try {
+    churn = churnRule(fields.churn)
+  } catch (err) {
+    churnProblem = err instanceof Error ? err.message : String(err)
+  }
+  return {
+    config: {
+      personal: list('personal'), allowNetworkInfo, allowValues: list('allowValues'), churn,
+      ...(churnProblem !== undefined ? { churnProblem } : {}),
+    },
+  }
 }
 
 // What git must not do while the check reads a repository, each of which the repository's own config can

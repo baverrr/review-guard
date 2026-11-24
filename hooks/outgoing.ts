@@ -56,8 +56,45 @@ export function homeFrom(paths: Pick<Paths, 'windows' | 'home' | 'userProfile'>)
   return value?.trim().replace(/\\/g, '/').replace(/(?<=.)\/+$/, '')
 }
 
-/** The user's config: personal terms to look for, repos where IPs and MACs may go, values let through. */
-export type Config = { readonly personal: readonly string[]; readonly allowNetworkInfo: readonly string[]; readonly allowValues: readonly string[] }
+/**
+ * When a project's files count as churning: a file in `reviews` or more reviews within `hours` hours. Then
+ * the review asks Claude to steady those files (tests, a design check) before adding more to them.
+ */
+export type ChurnRule = { readonly reviews: number; readonly hours: number }
+export const DEFAULT_CHURN: ChurnRule = Object.freeze({ reviews: 4, hours: 24 })
+/** Reviews a project's history keeps at most (churn.ts), so also the most `reviews` can be. */
+export const CHURN_HISTORY_KEPT = 200
+
+/**
+ * The user's config: personal terms to look for, repos where IPs and MACs may go, values let through, and
+ * the churn rule (`false`: off). `churnProblem`: why the "churn" value was not used (the default rule was);
+ * a bad churn value never stops a commit, as it has nothing to do with what goes out.
+ */
+export type Config = {
+  readonly personal: readonly string[]
+  readonly allowNetworkInfo: readonly string[]
+  readonly allowValues: readonly string[]
+  readonly churn: ChurnRule | false
+  readonly churnProblem?: string
+}
+
+/**
+ * The config's "churn" value as a rule: missing or `true` gives the default, `false` turns it off, and an
+ * object's missing "reviews" or "hours" takes the default's. Anything else throws.
+ */
+export function churnRule(v: unknown): ChurnRule | false {
+  if (v === undefined || v === true) return DEFAULT_CHURN
+  if (v === false) return false
+  const bad = `review-guard.json: "churn" must be true, false or { "reviews": a whole number from 2 to ${CHURN_HISTORY_KEPT}, "hours": a number above 0 }`
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new Error(bad)
+  const { reviews, hours, ...rest } = v as Record<string, unknown>
+  if (Object.keys(rest).length > 0) throw new Error(`${bad}; it has a key it does not know: ${Object.keys(rest).join(', ')}`)
+  const r = reviews === undefined ? DEFAULT_CHURN.reviews : reviews
+  const h = hours === undefined ? DEFAULT_CHURN.hours : hours
+  if (typeof r !== 'number' || !Number.isInteger(r) || r < 2 || r > CHURN_HISTORY_KEPT) throw new Error(bad)
+  if (typeof h !== 'number' || !Number.isFinite(h) || h <= 0) throw new Error(bad)
+  return { reviews: r, hours: h }
+}
 
 const CONFIG_NAME = '.claude/review-guard.json'
 
@@ -169,16 +206,18 @@ async function configPath(host: Host): Promise<string | undefined> {
   return home ? `${home}/${CONFIG_NAME}` : undefined
 }
 
-const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues'] as const
+const CONFIG_KEYS = ['personal', 'allowNetworkInfo', 'allowValues', 'churn'] as const
 
 /**
  * The user's config. With no file there, the secret checks still run and `note` says what was skipped.
  * A file that is there but can't be read, or is wrong (bad JSON, a misspelt key, a value that is not a
  * list of text, an `allowNetworkInfo` entry that is not owner/repo), throws, so a hook stops the command
  * and an MCP tool reports an error: a typo or a locked file must not quietly turn the personal checks off.
+ * A bad "churn" value is the one exception: it has nothing to do with what goes out, so it only gives the
+ * default rule and `churnProblem`, which the churn check logs.
  */
 export async function loadConfig(host: Host): Promise<{ config: Config; note?: string }> {
-  const empty: Config = { personal: [], allowNetworkInfo: [], allowValues: [] }
+  const empty: Config = { personal: [], allowNetworkInfo: [], allowValues: [], churn: DEFAULT_CHURN }
   const note = 'personal details were NOT checked (no ~/.claude/review-guard.json; ~ is USERPROFILE on Windows and HOME elsewhere, or the other when that one is not set)'
   const path = await configPath(host)
   if (!path) return { config: empty, note: 'personal details were NOT checked (the home folder is not known)' }
@@ -203,7 +242,7 @@ export async function loadConfig(host: Host): Promise<{ config: Config; note?: s
   const fields = raw as Record<string, unknown>
   const unknown = Object.keys(fields).filter(k => !(CONFIG_KEYS as readonly string[]).includes(k))
   if (unknown.length > 0) throw new Error(`review-guard.json has a key it does not know: ${unknown.join(', ')}`)
-  const list = (key: (typeof CONFIG_KEYS)[number]): string[] => {
+  const list = (key: 'personal' | 'allowNetworkInfo' | 'allowValues'): string[] => {
     const v = fields[key]
     if (v === undefined) return []
     if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) throw new Error(`review-guard.json: "${key}" must be a list of text values`)
@@ -213,7 +252,19 @@ export async function loadConfig(host: Host): Promise<{ config: Config; note?: s
   // An entry the guard can't read as a GitHub repo would be ignored without a word: say so instead.
   const bad = allowNetworkInfo.filter(r => githubRepo(r) === undefined)
   if (bad.length > 0) throw new Error(`review-guard.json: ${bad.length} "allowNetworkInfo" entr${bad.length === 1 ? 'y is' : 'ies are'} not owner/repo or a GitHub URL`)
-  return { config: { personal: list('personal'), allowNetworkInfo, allowValues: list('allowValues') } }
+  let churn: ChurnRule | false = DEFAULT_CHURN
+  let churnProblem: string | undefined
+  try {
+    churn = churnRule(fields.churn)
+  } catch (err) {
+    churnProblem = err instanceof Error ? err.message : String(err)
+  }
+  return {
+    config: {
+      personal: list('personal'), allowNetworkInfo, allowValues: list('allowValues'), churn,
+      ...(churnProblem !== undefined ? { churnProblem } : {}),
+    },
+  }
 }
 
 // What git must not do while the check reads a repository, each of which the repository's own config can

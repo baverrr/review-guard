@@ -31,7 +31,8 @@ import {
   type Writer,
 } from './scan.ts'
 import { scannerSteps } from './scanners.ts'
-import { type Config, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
+import { type ChurnRule, type Config, DEFAULT_CHURN, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
+import { churned, churnNote, historyDir, historyFileName, historyFrom, withReview } from './churn.ts'
 import { type LeftOut, type StatusFile, statusDir, statusFileName } from './status.ts'
 
 // review-guard:
@@ -45,11 +46,13 @@ import { type LeftOut, type StatusFile, statusDir, statusFileName } from './stat
 //    is installed, what a commit or push sends also goes through it. The check itself is in
 //    outgoing.ts, shared with the MCP server (mcp/server.mjs).
 // 3. Writes each session's review state to ~/.claude/review-guard/status/ (status.ts) for the MCP
-//    server's review_status tool.
+//    server's review_status tool, and each project's recent reviews to ~/.claude/review-guard/history/
+//    (churn.ts): files that keep coming back for review get a note in the review prompt.
 //
 // The person's own details live in ~/.claude/review-guard.json (read by loadConfig in outgoing.ts),
 // never in this code:
-//   { "personal": ["name", "email", ...], "allowNetworkInfo": ["owner/repo"], "allowValues": [] }
+//   { "personal": ["name", "email", ...], "allowNetworkInfo": ["owner/repo"], "allowValues": [],
+//     "churn": { "reviews": 4, "hours": 24 } }
 
 // The review cycle. The module keeps it in memory, where changes cannot clash (the module runs one
 // thing at a time), and copies each change to the session's state, which outlives a reload: the
@@ -684,7 +687,7 @@ async function remember($: EngineInterface, changed: [string, string][], writer:
 }
 
 /** What the end of a turn asks for: a review, a word that one is held, or nothing. */
-type StopAsk = { kind: 'review'; prompt: string } | { kind: 'held'; files: number } | undefined
+type StopAsk = { kind: 'review'; prompt: string; files: string[] } | { kind: 'held'; files: number } | undefined
 
 // An agent that is done for good. `idle` is not: a teammate waits for its next message that way.
 const FINISHED = new Set(['completed', 'failed', 'killed'])
@@ -1052,13 +1055,17 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
   let keptOpenByStart = false
   let endedPastStuck = false
   let promptLost = false
+  let delivered = false // the running review's prompt is now known to have reached Claude
   const ask = await updateCycle($, (c): StopAsk => {
     // The running review's prompt was handed out at an earlier stop: this stop shows whether it arrived.
     if (c.reviewing && c.promptPending && !hookActive) {
       promptLost = true
       endReview(c, 'requeue')
     }
-    if (c.reviewing && hookActive) c.promptPending = false
+    if (c.reviewing && hookActive) {
+      if (c.promptPending) delivered = true
+      c.promptPending = false
+    }
     if (c.reviewing) {
       // The review is over at the first stop with none of its agents still out. Until then the reviewers'
       // reports come back as turns of this review. Its own fixes are not sent for another review.
@@ -1097,8 +1104,11 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
     c.othersAtStart = listed.filter(a => !a.finished && a.id !== '').map(a => a.id)
     c.othersChanged = {}
     c.joined = []
-    return { kind: 'review', prompt }
+    return { kind: 'review', prompt, files: [...changed.keys()] }
   })
+  // The project's history counts a review only once its prompt arrived (see `churnPending`).
+  if (delivered) await recordChurn($)
+  if (promptLost) clearChurn()
   const sayLost = (askedAgain: boolean) => {
     if (!promptLost) return
     say($, askedAgain
@@ -1125,6 +1135,7 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
   // The dispatch ended while the queue was being moved: put the files back, as no review was asked for.
   const thisReview = reviewsStarted
   const putBack = async () => {
+    clearChurn() // no review was asked for, so none is recorded
     sayLost(false)
     // Only if the review still running is this one: another may have ended it (and put its files back).
     let skipped = false
@@ -1171,7 +1182,136 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
     if (signal.aborted) return putBack()
   }
   sayLost(ask?.kind === 'review')
+  if (ask?.kind === 'review') {
+    // The churn check never holds the turn's end up for long: past five seconds, or once the dispatch is
+    // over, the review goes without it. A clock that fails leaves only the check's own time.
+    const note = await Promise.race([
+      churnCheck($, ask.files),
+      $.clock.sleep(5000, { signal }).then(() => '', () => (signal.aborted ? '' : new Promise<string>(() => {}))),
+    ])
+    if (signal.aborted) return putBack()
+    return { ...ask, prompt: ask.prompt + note }
+  }
   return ask
+}
+
+// The review whose prompt went out last, waiting to be recorded in its project's history until the prompt
+// is known to have reached Claude (`recordChurn`), so a lost prompt, whose files come back, is never
+// counted twice. In memory only: a reload before then leaves that review out, which only means a churning
+// file is noticed a review later.
+let churnPending: { path: string; folder: string; files: string[]; at: Date; rule: ChurnRule } | undefined
+// Moves on whenever `churnPending` is cleared. A churn check runs on after the turn's end stops waiting
+// for it (past five seconds, or an abort), so it sets `churnPending` only if nothing cleared it since it
+// began: a review put back, a lost prompt, or a newer review's check.
+let churnEpoch = 0
+
+/** Clears the pending review, so that no churn check still running sets it again. */
+function clearChurn(): void {
+  churnPending = undefined
+  churnEpoch++
+}
+
+const churnSaid = new Set<string>() // each churn problem is logged once per load of the module
+
+/** Logs a churn problem once per load of the module. Never on the status line: it may hold a guard notice. */
+function churnLog($: EngineInterface, text: string): void {
+  if (churnSaid.has(text)) return
+  churnSaid.add(text)
+  logLine($, text)
+}
+
+/**
+ * A changed file as the history keeps it: as `samePath` spells it, relative paths read against the
+ * session's folder, so one file under two spellings counts once. A path with a `..` step is kept as stored.
+ * (A wrong merge here could only change a churn note, never what is reviewed.)
+ */
+function churnPath(k: string, folder: string): string {
+  return hasUpStep(k) ? k : samePath(k, folder, keySpelling)
+}
+
+/**
+ * The project's review history (churn.ts), or why it can't be used: a read that fails throws (to the
+ * caller's catch, which leaves the file alone). Text that is not JSON, or JSON of the wrong shape (another
+ * version's `v` included), counts as damaged: it is logged and the history starts again.
+ */
+async function readHistory($: EngineInterface, path: string, folder: string) {
+  let raw: unknown
+  if (await $.fs.exists(path)) {
+    const text = await $.fs.read(path)
+    try {
+      raw = JSON.parse(text.replace(/^﻿/, ''))
+    } catch {
+      raw = null
+    }
+  }
+  const read = historyFrom(raw, folder)
+  if (read.damaged) churnLog($, "review-guard: this project's review history was damaged, so the churn check started it again")
+  if (read.dropped > 0) churnLog($, `review-guard: ${read.dropped} damaged entr${read.dropped === 1 ? 'y was' : 'ies were'} dropped from this project's review history`)
+  return read.history
+}
+
+/**
+ * Whether some of `files` churn under the user's rule, judged on the project's history plus this review,
+ * and if so the paragraph to add to the review prompt (otherwise ''). The review itself is recorded only
+ * once its prompt has reached Claude (`churnPending`, `recordChurn`). Never throws: the review goes out
+ * either way, and a problem is logged once (`churnLog`).
+ */
+async function churnCheck($: EngineInterface, files: readonly string[]): Promise<string> {
+  clearChurn()
+  const epoch = churnEpoch
+  try {
+    const { config } = await loadConfig(hostOf($)).catch((err: unknown) => {
+      // A broken config stops commits (said there); here the review gets the default rule.
+      churnLog($, `review-guard: ${whyOf(err)}; the churn check uses its default rule`)
+      return { config: { churn: DEFAULT_CHURN, churnProblem: undefined } }
+    })
+    if (config.churnProblem !== undefined) churnLog($, `review-guard: ${config.churnProblem}; the churn check uses its default rule`)
+    const rule = config.churn
+    if (rule === false) return ''
+    const home = await homeDir($)
+    const folder = await sessionFolder($)
+    if (!home || !folder) throw new Error(!home ? 'the home folder is not known' : "the session's folder is not known")
+    const path = `${historyDir(home)}/${historyFileName(folder)}`
+    const now = new Date()
+    const paths = files.map(k => churnPath(k, folder))
+    const history = withReview(await readHistory($, path, folder), paths, now, now, rule)
+    if (epoch === churnEpoch) churnPending = { path, folder, files: paths, at: now, rule }
+    const found = churned(history, paths, rule, now)
+    if (found.length === 0) return ''
+    // In the log, not on the status line (it may hold a guard notice): the prompt has Claude tell the user.
+    logLine($, `review-guard: ${found.length} file(s) keep coming back for review in this project (${found.map(f => f.path).join(', ')}); the review asks Claude to steady them first`)
+    return `\n${churnNote(found, rule)}`
+  } catch (err) {
+    churnLog($, `review-guard: the churn check could not run (${whyOf(err)}); the review goes ahead without it`)
+    return ''
+  }
+}
+
+/**
+ * The pending review's prompt reached Claude: adds it to its project's history, read afresh (another
+ * session may have added to it meanwhile). Never throws; a failure is logged once.
+ */
+async function recordChurn($: EngineInterface): Promise<void> {
+  const pending = churnPending
+  clearChurn()
+  if (!pending) return
+  const record = async () => {
+    try {
+      const history = withReview(await readHistory($, pending.path, pending.folder), pending.files, pending.at, new Date(), pending.rule)
+      await $.fs.write(pending.path, `${JSON.stringify(history, null, 2)}\n`)
+    } catch (err) {
+      churnLog($, `review-guard: could not record a review in this project's history (${whyOf(err)}); churning files may be noticed later`)
+    }
+  }
+  // Never holds a turn's end or a prompt up for long: past two seconds it goes on without waiting (the
+  // write may still land). A clock that fails leaves only the write's own time.
+  await Promise.race([
+    record(),
+    $.clock.sleep(2000).then(
+      () => churnLog($, "review-guard: recording a review in this project's history took over two seconds; it was not waited for"),
+      () => new Promise<void>(() => {}),
+    ),
+  ])
 }
 
 export const register: Register = on => {
@@ -1223,13 +1363,17 @@ export const register: Register = on => {
       // without the review prompt has already put its files back (turn.complete), so a review still
       // waiting here is one whose turn still runs (typed mid-turn: it arrived) or one with no turn yet.
       let requeued = false
+      let delivered = false // typed while the review's turn still runs: its prompt arrived
       await updateCycle($, c => {
         if (!c.reviewing) return
         // What the review's own agents wrote (scratch files, fixes) is not new work. But a review whose
         // prompt never reached Claude had no agents and no fixes: its files go back in the queue.
         requeued = c.promptPending && e.turnId === undefined
+        delivered = c.promptPending && !requeued
         endReview(c, requeued ? 'requeue' : 'drop')
       })
+      if (delivered) await recordChurn($)
+      if (requeued) clearChurn()
       if (requeued) say($, 'review-guard: the review asked for at the last stop had not started; its files are queued again with this request')
     }
     return next(e)
@@ -1392,7 +1536,10 @@ export const register: Register = on => {
     if (e.stop_hook_active) {
       try {
         await ensureLoaded($)
-        if (cycle.promptPending) await updateCycle($, c => { c.promptPending = false })
+        if (cycle.promptPending) {
+          await updateCycle($, c => { c.promptPending = false })
+          await recordChurn($) // the project's history counts a review only once its prompt arrived
+        }
       } catch (err) {
         hookFailed($, 'could not note that the review prompt arrived', err, 'the review may be asked for again')
       }
@@ -1410,6 +1557,7 @@ export const register: Register = on => {
               endReview(c, 'requeue')
             }
           })
+          if (lost) clearChurn()
           if (lost) say($, 'review-guard: the review prompt did not reach Claude (the turn ended another way), so its files are queued again')
         } catch (err) {
           reviewFailed($, err)

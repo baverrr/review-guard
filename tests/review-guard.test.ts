@@ -3,7 +3,8 @@ import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
   addedLines, CHANGES_FOLDER, rulesFor, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_BUGS, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
 } from '../hooks/scan.ts'
-import { findScanners, homeFrom } from '../hooks/outgoing.ts'
+import { churnRule, findScanners, homeFrom } from '../hooks/outgoing.ts'
+import { churned, churnNote, historyFileName, historyFrom, withReview } from '../hooks/churn.ts'
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
 import { afterHandOn, agentsListed, blankedSafely, cycleFrom, isWindows, ownFolderFrom, ownFolderOf, savedDamaged, recipient, reviewFailed, reviewHeldOpen, keyOf, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
@@ -2586,7 +2587,8 @@ test('the review state is written where the MCP server reads it, and a failed wr
   let failWrites = false
   on('fs.write', (_$, e) => {
     if (failWrites) throw new Error('disk full')
-    writes.push({ path: e.path, text: e.text })
+    // Only the status files: a project's review history (churn) is written here too.
+    if (e.path.replace(/\\/g, '/').includes('/review-guard/status/')) writes.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
   const { edit, stop } = cycle($, on)
@@ -3713,3 +3715,229 @@ describe('the git guard', () => {
   })
 })
 
+
+describe('churn', () => {
+  const RULE = { reviews: 3, hours: 24 }
+  const NOW = new Date('2026-11-24T12:00:00Z')
+  const hoursAgo = (h: number) => new Date(NOW.getTime() - h * 3_600_000)
+  const throws = (v: unknown) => {
+    try {
+      churnRule(v)
+      return 'ok'
+    } catch {
+      return 'threw'
+    }
+  }
+
+  test('the "churn" config value: default, off, a rule, and a bad value never stops a commit', async ($, on) => {
+    expect(churnRule(undefined)).toEqual({ reviews: 4, hours: 24 })
+    expect(churnRule(true)).toEqual({ reviews: 4, hours: 24 })
+    expect(churnRule(false)).toBe(false)
+    expect(churnRule({ reviews: 5 })).toEqual({ reviews: 5, hours: 24 })
+    expect(churnRule({ hours: 2.5 })).toEqual({ reviews: 4, hours: 2.5 })
+    for (const bad of [null, 'x', [], { reviews: 1 }, { reviews: 2.5 }, { reviews: 201 }, { hours: 0 }, { hours: -1 }, { other: 1 }]) {
+      expect([bad, throws(bad)]).toEqual([bad, 'threw'])
+    }
+    // In the config file a bad churn value gives the default rule and a problem, and the commit check runs.
+    const seen = world(on, { '--cached': { stdout: added('app.py', 'x = 1') } },
+      JSON.stringify({ personal: PERSONAL, churn: { reviews: 1 } }))
+    expect((await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })).deny).toBe(undefined)
+    expect(seen.ran).toBe(true)
+  })
+
+  test('the history file name stays in its folder, keeps folders apart, and stays short', () => {
+    expect(historyFileName('C:\\proj\\')).toBe(historyFileName('c:/proj'))
+    expect(historyFileName('C:/proj')).not.toBe(historyFileName('C:/Proj'))
+    expect(historyFileName('/a/b')).not.toBe(historyFileName('/a%002fb'))
+    for (const f of ['C:/proj', '/home/pat/../x', `C:/${'deep/'.repeat(80)}proj`]) {
+      const name = historyFileName(f)
+      expect([f, /^[\w%~-]+\.json$/.test(name) && name.length <= 130]).toEqual([f, true])
+    }
+    const deep = (n: number) => `C:/${'deep/'.repeat(80)}proj${n}`
+    expect(historyFileName(deep(1))).not.toBe(historyFileName(deep(2)))
+  })
+
+  test('a history is read back sorted, with bad entries dropped and a wrong shape restarted', () => {
+    const good = { at: hoursAgo(1).toISOString(), files: ['C:/proj/a.py', 'C:/proj/a.py'] }
+    const older = { at: hoursAgo(5).toISOString(), files: ['C:/proj/b.py'] }
+    const read = historyFrom({ v: 1, folder: 'C:/proj', reviews: [good, { at: 'never', files: [] }, { at: good.at, files: [1] }, older] }, 'C:/proj')
+    expect(read.damaged).toBe(false)
+    expect(read.dropped).toBe(2)
+    expect(read.history.reviews).toEqual([older, { ...good, files: ['C:/proj/a.py'] }])
+    expect(historyFrom(undefined, 'C:/proj')).toEqual({ history: { v: 1, folder: 'C:/proj', reviews: [] }, damaged: false, dropped: 0 })
+    for (const bad of [null, [], 'x', { v: 2, reviews: [] }, { v: 1 }]) expect(historyFrom(bad, 'C:/proj').damaged).toBe(true)
+  })
+
+  test('a review is added, and only reviews in the window before now are kept, the newest 200 at most', () => {
+    const start = historyFrom(undefined, 'C:/proj').history
+    const h = { ...start, reviews: [hoursAgo(30), hoursAgo(10), hoursAgo(-2)].map(at => ({ at: at.toISOString(), files: ['x'] })) }
+    const next = withReview(h, ['a', 'a'], NOW, NOW, RULE)
+    // Older than 24 hours, and dated after now (a clock moved back), are dropped.
+    expect(next.reviews).toEqual([{ at: hoursAgo(10).toISOString(), files: ['x'] }, { at: NOW.toISOString(), files: ['a'] }])
+    let many = start
+    for (let i = 0; i < 250; i++) many = withReview(many, [`f${i}`], new Date(NOW.getTime() - (250 - i) * 1000), NOW, RULE)
+    expect(many.reviews.length).toBe(200)
+    expect(many.reviews.at(-1)?.files).toEqual(['f249'])
+  })
+
+  test('a file of this review churns at the rule\'s count of reviews in the window, most-reviewed first', () => {
+    const review = (h: number, files: string[]) => ({ at: hoursAgo(h).toISOString(), files })
+    const history = {
+      v: 1 as const, folder: 'C:/proj', reviews: [
+        review(30, ['a', 'b', 'c']), // outside the window
+        review(-1, ['b']), // dated after now
+        review(20, ['a', 'b', 'c', 'd']), review(10, ['a', 'b', 'c', 'd']), review(5, ['a', 'c', 'd']), review(0, ['a', 'b', 'c']),
+      ],
+    }
+    // a: 4, b: 3 (the one at -1 h does not count); c: 4 and d: 3 are not in this review.
+    expect(churned(history, ['b', 'a', 'a', 'x'], RULE, NOW)).toEqual([{ path: 'a', reviews: 4 }, { path: 'b', reviews: 3 }])
+    expect(churned(history, ['b'], { reviews: 4, hours: 24 }, NOW)).toEqual([])
+    expect(churned(history, ['c'], { reviews: 2, hours: 6 }, NOW)).toEqual([{ path: 'c', reviews: 2 }])
+  })
+
+  test('the prompt note names each churning file and asks for tests and a design check, no new features', () => {
+    const text = flat(churnNote([{ path: 'C:/proj/a.py', reviews: 5 }], RULE))
+    expect(text.includes('C:/proj/a.py (5 reviews)')).toBe(true)
+    expect(text.includes('3 or more reviews in the last 24 hours')).toBe(true)
+    expect(text.includes('Add no new features to these files')).toBe(true)
+    expect(text.includes('ask whether their design needs another look')).toBe(true)
+  })
+
+  /**
+   * A Windows session in C:/proj whose history files live in `files`; `written` lists each write to one,
+   * `logged` each log line. `config`: the config file's text (none: no file). `readFails`: history reads fail.
+   */
+  function project(on: On, opts: { config?: string; readFails?: boolean } = {}, files: Record<string, string> = {}) {
+    const written: string[] = []
+    const logged: string[] = []
+    const norm = (p: string) => p.replace(/\\/g, '/')
+    const inHistory = (p: string) => norm(p).includes('/.claude/review-guard/history/')
+    const isConfig = (p: string) => norm(p).endsWith('/.claude/review-guard.json')
+    mock.env(on, { USERPROFILE: 'C:/Users/pat' })
+    on('session.cwd', () => ({ value: 'C:/proj' }))
+    on('session.id', () => ({ value: 's-1' }))
+    on('ui.log', (_$, e) => {
+      logged.push(String(e.text))
+      return { value: undefined }
+    })
+    on('ui.status', () => ({ value: undefined }))
+    on('fs.exists', (_$, e, next) => {
+      if (isConfig(e.path)) return { value: opts.config !== undefined }
+      return inHistory(e.path) ? { value: norm(e.path) in files } : next(e)
+    })
+    on('fs.read', (_$, e, next) => {
+      if (isConfig(e.path) && opts.config !== undefined) return { value: opts.config }
+      if (!inHistory(e.path)) return next(e)
+      if (opts.readFails) throw new Error('EBUSY: locked')
+      const text = files[norm(e.path)]
+      if (text === undefined) throw new Error('ENOENT')
+      return { value: text }
+    })
+    on('fs.write', (_$, e, next) => {
+      if (!inHistory(e.path)) return next(e)
+      files[norm(e.path)] = e.text
+      written.push(norm(e.path))
+      return { value: undefined }
+    })
+    const reviews = () => Object.values(files).flatMap(t => historyFrom(JSON.parse(t), 'C:/proj').history.reviews)
+    return { files, written, logged, reviews }
+  }
+
+  test('a review is recorded once its prompt has arrived, under one spelling per file', async ($, on) => {
+    const { reviews, logged } = project(on)
+    const { edit, stop } = cycle($, on)
+    await edit('c:\\proj\\app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    expect(reviews()).toEqual([]) // asked for, not yet known to have arrived
+    expect(await stop(true)).toBe(undefined) // the review's own turn ends: it arrived
+    expect([reviews().map(r => r.files), logged.filter(l => /churn|history/.test(l))]).toEqual([[['c:/proj/app.py']], []])
+    // The same file under another spelling counts as the same file.
+    await edit('C:/proj/app.py')
+    await stop()
+    await stop(true)
+    expect(reviews().map(r => r.files)).toEqual([['c:/proj/app.py'], ['c:/proj/app.py']])
+  })
+
+  test('a review prompt that never arrived is not counted, and its files are counted once when asked again', async ($, on) => {
+    const { reviews } = project(on)
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    // The next stop is no continuation: the prompt was lost, and the review is asked for again.
+    expect((await stop())?.includes('app.py')).toBe(true)
+    expect(reviews()).toEqual([])
+    await stop(true)
+    expect(reviews().length).toBe(1)
+  })
+
+  test('a history that cannot be read is left alone, said once in the log, and the review goes out all the same', async ($, on) => {
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const { files, written, logged } = project(on, { readFails: true }, { [path]: '{"v":1,"reviews":[]}' })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect(written).toEqual([])
+    expect(files[path]).toBe('{"v":1,"reviews":[]}')
+    expect(logged.filter(l => l.includes('churn check could not run')).length).toBe(1)
+  })
+
+  test('with churn off in the config, no history is written', async ($, on) => {
+    const { written } = project(on, { config: '{"churn": false}' })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect(written).toEqual([])
+  })
+
+  test('a file that keeps coming back gets the churn note in its review prompt, and only then', async ($, on) => {
+    const { reviews, logged } = project(on, { config: '{"churn": {"reviews": 3, "hours": 1}}' })
+    const { edit, stop } = cycle($, on)
+    for (let i = 1; i <= 2; i++) {
+      await edit('C:/proj/app.py')
+      const prompt = await stop()
+      expect([i, prompt?.includes('app.py'), prompt?.includes('keep coming back')]).toEqual([i, true, false])
+      await stop(true)
+    }
+    // The third review in the hour: the note names the file, and says what to do.
+    await edit('C:/proj/app.py')
+    await edit('C:/proj/other.py')
+    const third = flat((await stop()) ?? '')
+    expect(third.includes('keep coming back')).toBe(true)
+    expect(third.includes('c:/proj/app.py (3 reviews)')).toBe(true)
+    expect(third.includes('other.py (')).toBe(false)
+    expect(third.includes('Add no new features to these files')).toBe(true)
+    expect(logged.some(l => l.includes('1 file(s) keep coming back'))).toBe(true)
+    await stop(true)
+    expect(reviews().length).toBe(3)
+  })
+
+  test('a history file that is not JSON is logged once and started again, and the review goes out', async ($, on) => {
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const { files, logged } = project(on, {}, { [path]: 'not json' })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect(historyFrom(JSON.parse(files[path] ?? ''), 'C:/proj').history.reviews.map(r => r.files)).toEqual([['c:/proj/app.py']])
+    expect(logged.filter(l => l.includes('history was damaged')).length).toBe(1)
+  })
+
+  test('a review exactly at the edge of the window still counts; empty input gives nothing', () => {
+    const history = { v: 1 as const, folder: 'C:/proj', reviews: [hoursAgo(24), hoursAgo(1), NOW].map(at => ({ at: at.toISOString(), files: ['a'] })) }
+    expect(churned(history, ['a'], RULE, NOW)).toEqual([{ path: 'a', reviews: 3 }])
+    expect(churned(history, [], RULE, NOW)).toEqual([])
+    expect(churned({ ...history, reviews: [] }, ['a'], RULE, NOW)).toEqual([])
+  })
+
+  test('a bad churn value is logged and the default rule used', async ($, on) => {
+    const { reviews, logged } = project(on, { config: '{"churn": {"reviews": 1}}' })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    await stop()
+    await stop(true)
+    expect(reviews().length).toBe(1)
+    expect(logged.some(l => l.includes('"churn" must be') && l.includes('default rule'))).toBe(true)
+  })
+})
