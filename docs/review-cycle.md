@@ -40,6 +40,42 @@ page says when that review counts as over, and what happens to the edits made wh
   after the leading variables are filled in: not a relative path, `$TEMP` or any other variable. Anything
   else in the command (a copy, a pipe into another program, another here-document, a glob, a function)
   leaves its text in the review.
+- **A cd into the scratch folder.** A command that starts with `cd` into Claude's scratch folder, by a full
+  path or by a temp-folder variable at its start (`$TEMP`, `$TMP`, `$TMPDIR`, `$LOCALAPPDATA`, or
+  `$env:TEMP` in PowerShell, filled in with the values the hooks read; `~`, `$HOME` and `$USERPROFILE`
+  are filled in as everywhere), writes its bare file names there (`body.html`, not `sub/a.py`, `D:a.ts` or
+  `..`), so they are left out as scratch and named on the status line. Trusting those variables was the
+  user's choice: a shell profile (or Git Bash's own, for `TMPDIR`) could set them otherwise. Only when:
+  the folder is already there before the command runs, and is Claude's scratch folder both as written and
+  with every link followed (so the cd can't fail, and a write after a `;` lands there too); the cd's word
+  is one the shell expands as written (no `$` or `~` in single quotes, no `~` in double quotes, no
+  unquoted variable holding a space); the cd is not piped on (`cd X | ...`, `cd X || ...`); nothing after
+  it changes folder (another cd in any spelling, `os.chdir`, `git -C`, `--prefix`, `patch -d`, a program
+  named by a variable); the command sets none of those variables itself, and is not run in the
+  background. Scratch names are still kept when the command copies or moves (`cp`, `mv`). The start
+  folder is read as under "Scripts only run". (The rule for scratch scripts above is unchanged: there a
+  variable is not filled in.)
+- **Scripts only run.** A script a command names only as what an interpreter runs (`python gen.py`,
+  `node --test a.mjs` with exactly one file) and that is the same before and after the command is not
+  reviewed. A command substitution (`$(...)` or backticks) runs in a subshell and does not stop this; a
+  script also named inside one, a `cd` inside one, or one in a script's or folder's name still does. A
+  relative name is placed only when the command starts with `cd <full folder>` (with no substitution in
+  it) and nothing else moves the shell (another cd in any spelling, `"c"d` too, `source`, `.`, `eval`,
+  `iex`, an alias). A command is read this way only where its words split as the shell splits them: no
+  backslash outside quotes, no `\"` inside double quotes, no `$'...'`, no `#` comment, and in PowerShell no
+  backtick and no `$(...)` (which runs in the same session there).
+- **Python fed in by a here-document.** When that code can start no program, uses no `Path`, `PurePath`,
+  `PosixPath`, `WindowsPath` or `pathlib`, uses `open` only as a call, and every `open(` takes a string,
+  or a name set once to a string on a line of its own and used for nothing else, only the files those
+  calls open count (read or written). Its other strings (a test case naming `app.py`) are text. This
+  holds only when every file it opens is a code file, which is then reviewed with its text, and nothing
+  else in the command can run anything: every other command is a read-only program named bare, with no
+  variable set for it (`cd`, `cat`, `grep`, ...; not `rg --pre`), there is no other here-document, substitution, group, `exec`, background job or input redirect, and its
+  own output goes to no file. So a script that edits files and then runs the tests in the same command is
+  read as before, every name in it counting. So is a body that writes a Python file and imports anything
+  (`python -` looks in the current folder first). The body must be quoted (`<<'PY'`) and not piped on. A
+  string with an escape not read here (`\N{...}`) proves nothing. Such a script is then treated like an
+  edit made with the Write tool: a later command that runs a file it wrote is judged on its own.
 - **Relative paths.** A relative path is read against the session's folder only when that is surely its
   folder: not when the command changes folder (`cd sub && ...`, `git -C sub ...`, `env --chdir sub ...`),
   and never again for an agent that has run such a command (a shell may keep the folder), was started in

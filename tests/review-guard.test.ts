@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import {
-  addedLines, CHANGES_FOLDER, rulesFor, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_BUGS, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites,
+  addedLines, CHANGES_FOLDER, rulesFor, ghWrites, inScratch, isNewRequest, gitAction, githubRepo, languageOf, localPart, networkAllowed, type Paths, report, REPORT_BUGS, resolveDir, reviewPrompt, runOnlyScripts, scanDiff, scanLine, scanValue, settle, shellWrites, startFolder,
 } from '../hooks/scan.ts'
 import { churnRule, findScanners, homeFrom } from '../hooks/outgoing.ts'
 import { churned, churnNote, historyFileName, historyFrom, withReview } from '../hooks/churn.ts'
@@ -2372,8 +2372,8 @@ type FileState = { mtimeMs: number; size: number; text: string }
  * fields changed after it: the command changed it. A path in `links` is a symbolic link. Any other path is
  * missing. Returns the status lines shown.
  */
-function disk(on: On, files: Record<string, number>, changes: Record<string, Partial<FileState>> = {}, links: string[] = []) {
-  mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP })
+function disk(on: On, files: Record<string, number>, changes: Record<string, Partial<FileState>> = {}, links: string[] = [], dirs: string[] = []) {
+  mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP, LOCALAPPDATA: 'C:/Users/pat/AppData/Local' })
   // A file is "after" once it has been looked at: its first stat (and read) are the snapshot before.
   const looked = new Set<string>()
   // On Linux the engine reads a Windows path as relative and puts its own folder first: drop that part.
@@ -2387,6 +2387,9 @@ function disk(on: On, files: Record<string, number>, changes: Record<string, Par
   }
   on('fs.stat', (_$, e) => {
     const path = norm(e.path)
+    // A folder, as the engine answers (`dir`), with where it really is when asked.
+    if (dirs.includes(path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: path } }
+    if (path === TEMP) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: TEMP } }
     const s = state(path, !looked.has(path))
     if (s === undefined) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
     return { value: { kind: 'file' as const, size: s.size, mtimeMs: s.mtimeMs, isLink: links.includes(path) } }
@@ -2562,6 +2565,124 @@ test('what is left out goes after a guard notice on the status line, never over 
   const last = status.at(-1) ?? ''
   expect(last.includes('sent over SSH') && last.includes('was NOT checked here')).toBe(true)
   expect(last.includes('Not reviewed: only run .scripts/memory-map.py')).toBe(true)
+})
+
+test("this session's own commands: the review lists what they edited, not what they ran or only named", async ($, on) => {
+  const R = 'C:/Users/pat/proj'
+  const T = 1_700_000_000_000
+  disk(
+    on,
+    { [`${R}/hooks/a.ts`]: T, [`${R}/tests/m.node.mjs`]: T, [`${R}/scripts/build.mjs`]: T, [`${R}/tests/t.test.ts`]: T },
+    { [`${R}/hooks/a.ts`]: { size: 11 }, [`${R}/tests/t.test.ts`]: { size: 12 } },
+  )
+  const { stop } = cycle($, on)
+  // A sed on one file, with a command substitution, then tests run on two others.
+  await $.tool.call({ tool: 'Bash', command: `cd "${R}" && n=$(grep -n "x" hooks/a.ts | cut -d: -f1) && sed -i "\${n}s/a/b/" hooks/a.ts && claude plugin test . 2>&1 | grep -E "^\\(fail\\)|pass$"; node --test tests/m.node.mjs 2>&1 | grep -E "^i (pass|fail)"; node scripts/build.mjs --check 2>/dev/null && echo OK` })
+  const first = (await stop()) ?? ''
+  expect([first.includes('hooks/a.ts'), first.includes('m.node.mjs'), first.includes('build.mjs')]).toEqual([true, false, false])
+  await stop(true)
+  // A Python script editing a test file whose new case names app.py.
+  await $.tool.call({ tool: 'Bash', command: [
+    `cd "${R}" && python - <<'PY'`,
+    "t='tests/t.test.ts'",
+    "s=open(t,encoding='utf-8').read()",
+    `s=s.replace("})", "  await edit('C:/proj/app.py')\\n})", 1)`,
+    "open(t,'w',encoding='utf-8').write(s)",
+    'PY',
+    `grep -c 'app' tests/t.test.ts`,
+  ].join('\n') })
+  const second = (await stop()) ?? ''
+  expect([second.includes('tests/t.test.ts'), second.includes('app.py')]).toEqual([true, false])
+})
+
+test('writes after a cd into the scratch folder by its variable are scratch, if that folder is there', async ($, on) => {
+  const S = `${TEMP}/claude/x/scratchpad`
+  const status = disk(on, {}, {}, [], [S])
+  const { stop } = cycle($, on)
+  const cd = 'cd "$LOCALAPPDATA/Temp/claude/x/scratchpad"'
+  // This session's two commands (the web call swapped for a stand-in).
+  for (const command of [
+    `${cd} && render README.md > body.html 2>err.txt; echo "exit=$?"; wc -c body.html`,
+    `${cd} && grep -o 'src' body.html | head -3; { printf '<html>'; sed "s#a#b#" body.html; printf '</html>'; } > readme-preview.html && grep -c demo readme-preview.html`,
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    expect([command, await stop()]).toEqual([command, undefined])
+  }
+  expect(status.some(s => s.includes('readme-preview.html'))).toBe(true) // never silent: named as scratch
+  // A folder that is not there (the cd failed, the write landed here), a command that sets the variable,
+  // or a folder that is not Claude's: reviewed.
+  for (const command of [
+    'cd "$LOCALAPPDATA/Temp/claude/y/scratchpad"; render > body.html',
+    'cd "$LOCALAPPDATA/Temp/claude/y/scratchpad"; mkdir -p "$LOCALAPPDATA/Temp/claude/y/scratchpad"; render > body.html', // made after the cd failed
+    `LOCALAPPDATA=C:/proj; ${cd}; render > body.html`,
+    'cd "$LOCALAPPDATA/Temp/other" && render > body.html',
+    `${cd} && render > ../../../../../../proj/body.html`,
+    // A cd the shell would not take there: single quotes expand nothing, double quotes no `~`.
+    "cd '$LOCALAPPDATA/Temp/claude/x/scratchpad'; render > body.html",
+    'cd "~/AppData/Local/Temp/claude/x/scratchpad"; render > body.html',
+    // A change of folder after the cd.
+    `${cd} && python -c "import os; os.chdir('C:/proj'); open('body.html', 'w')" && render > body.html`,
+    `${cd} && git -C C:/proj apply x.diff > body.html`,
+    `${cd} && npm --prefix C:/proj run build > body.html`,
+    `${cd} | render > body.html`, // a piped cd moves only a subshell
+    `${cd} || render > body.html`,
+    `${cd} && render > D:body.html`, // a drive-relative name is on that drive
+    `${cd} && render > link/body.html`, // a folder inside may be a link out of scratch
+    `${cd} && patch -d C:/proj -p1 body.html < x.diff`, // programs given a folder to write in
+    `${cd} && c=c && d=d && $c$d C:/proj && render > body.html`, // a cd by variable
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    expect([command, (await stop())?.includes('body.html')]).toEqual([command, true])
+    await stop(true)
+  }
+})
+
+test('the scratch folder must be there before the command, not made by it; and never for a background run', async ($, on) => {
+  const S = `${TEMP}/claude/x/scratchpad`
+  const dirs: string[] = []
+  disk(on, {}, {}, [], dirs)
+  on('classic.Stop', () => ({}))
+  on('agent.list', () => ({ value: [] }))
+  // The command makes the folder as it runs (`cd X; mkdir -p X; ...`): only after the check.
+  on('tool.call', () => {
+    dirs.push(S)
+    return { result: {} }
+  })
+  const stop = async (active = false) => (await $.classic.Stop({ stop_hook_active: active })).block
+  await $.tool.call({ tool: 'Bash', command: `cd "$LOCALAPPDATA/Temp/claude/x/scratchpad"; mkdir -p "$LOCALAPPDATA/Temp/claude/x/scratchpad"; render > body.html` })
+  expect((await stop())?.includes('body.html')).toBe(true)
+  await stop(true)
+  // Now it is there, but a command run in the background can't be judged.
+  await $.tool.call({ tool: 'Bash', command: 'cd "$LOCALAPPDATA/Temp/claude/x/scratchpad" && render > body.html', run_in_background: true })
+  expect((await stop())?.includes('body.html')).toBe(true)
+  await stop(true)
+  await $.tool.call({ tool: 'Bash', command: 'cd "$LOCALAPPDATA/Temp/claude/x/scratchpad" && render > body.html' })
+  expect(await stop()).toBe(undefined)
+  // PowerShell: `$env:LOCALAPPDATA` is the environment's; `$LOCALAPPDATA` is the session's own variable.
+  await $.tool.call({ tool: 'PowerShell', command: "cd $env:LOCALAPPDATA/Temp/claude/x/scratchpad; 'x' | Set-Content a.ps1" })
+  expect(await stop()).toBe(undefined)
+  for (const command of ["cd $LOCALAPPDATA/Temp/claude/x/scratchpad; 'x' | Set-Content a.ps1", "cd $env:LOCALAPPDATA/Temp/claude/x/scratchpad; Set-Content -Path 'FileSystem::C:/proj/a.ps1' -Value x", "cd $env:LOCALAPPDATA/Temp/claude/x/scratchpad; 'x' > D:a.ps1"]) {
+    await $.tool.call({ tool: 'PowerShell', command })
+    expect([command, (await stop())?.includes('a.ps1')]).toEqual([command, true])
+    await stop(true)
+  }
+})
+
+test('a temp-folder variable is filled in only where the shell fills it in', () => {
+  const vars = { TEMP: 'C:/T', LOCALAPPDATA: 'C:/L', TMPDIR: '/var/folders/x/T/' }
+  const WINV = { windows: true, home: 'C:/Users/pat', userProfile: 'C:/Users/pat', vars }
+  const LINV = { windows: false, home: '/home/pat', vars }
+  expect(startFolder('cd "${TEMP}/a" && x', WINV)).toBe('C:/T/a')
+  expect(startFolder('cd $temp/a && x', WINV)).toBe(undefined) // Bash keeps a variable's case
+  expect(startFolder('cd $TMP/a && x', WINV)).toBe(undefined) // not set
+  expect(startFolder('cd $env:TEMP/a && x', WINV)).toBe(undefined) // PowerShell's spelling, in Bash
+  expect(startFolder('cd $env:temp/a; x', WINV, true)).toBe('C:/T/a')
+  expect(startFolder('cd $TEMP/a; x', WINV, true)).toBe(undefined) // a session variable in PowerShell
+  expect(startFolder('cd $env:tmpdir/a; x', LINV, true)).toBe(undefined) // off Windows names keep their case
+  expect(startFolder('cd "$TMPDIR/claude/s" && x', LINV)).toBe('/var/folders/x/T/claude/s') // no doubled slash
+  // Braces inside quotes are text, and `echo { x }` prints braces: neither is a group.
+  expect(startFolder('cd "C:/a { b }" && x', WINV)).toBe('C:/a { b }')
+  expect([...runOnlyScripts('cd C:/p && echo { python gen.py }', WINV)]).toEqual([])
 })
 
 test('a script only run is left out at every shell call site, the git-checked ones too', async ($, on) => {
@@ -2772,8 +2893,25 @@ test('knows scratch folders, and which scripts a command only runs and where', a
     expect([cd, [...runOnlyScripts(`${cd} C:/p; python gen.py`, WIN, true)]]).toEqual([cd, [['gen.py', 'C:/p/gen.py']]])
   }
   expect([...runOnlyScripts('CD C:/p; python gen.py', WIN)]).toEqual([]) // Bash's cd is lower case
-  // A backslash anywhere can escape a quote the here-document split can't follow: no candidates, so reviewed.
-  expect([...runOnlyScripts('node "C:\\tools\\b.mjs" out.html', WIN)]).toEqual([])
+  // A backslash can escape a quote the here-document split can't follow: with a here-document, no candidates.
+  expect([...runOnlyScripts("node \"C:\\tools\\b.mjs\" out.html; cat <<'E'\nx\nE", WIN)]).toEqual([])
+  // With none, the command's lines are all its own, and bash keeps `\t` inside double quotes.
+  expect([...runOnlyScripts('node "C:\\tools\\b.mjs" out.html', WIN)]).toEqual([['C:\\tools\\b.mjs', 'C:/tools/b.mjs']])
+  // A command substitution runs in a subshell: it moves no folder and hides no run. This session's own
+  // command (a sed on one file, tests run on two others) leaves the two run scripts as candidates.
+  const R = 'C:/Users/pat/proj'
+  const session = `cd "${R}" && n=$(grep -n "JSON.parse" hooks/a.ts | cut -d: -f1) && sed -i "\${n}s/\\xef\\xbb\\xbf/x/" hooks/a.ts && sed -n "\${n}p" hooks/a.ts | cat -A && claude plugin test . 2>&1 | grep -E "^\\(fail\\)|pass$"; node --test tests/m.node.mjs 2>&1 | grep -E "^i (pass|fail)"; node scripts/build.mjs --check 2>/dev/null && echo OK; echo "exit=$?"`
+  expect([...runOnlyScripts(session, WIN)]).toEqual([['tests/m.node.mjs', `${R}/tests/m.node.mjs`], ['scripts/build.mjs', `${R}/scripts/build.mjs`]])
+  expect([...runOnlyScripts('cd C:/p && x=`date` && python gen.py', WIN)]).toEqual([['gen.py', 'C:/p/gen.py']])
+  // But a script also named inside a substitution, a cd there, or one that never ends: no candidate or place.
+  expect([...runOnlyScripts('cd C:/p && python gen.py; x=$(sed -i y gen.py)', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p && x=$(cd sub; pwd) && python gen.py', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p && x=$(pwd && python gen.py', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p && x="$(echo ")")" && python gen.py', WIN)]).toEqual([['gen.py', 'C:/p/gen.py']])
+  // `node --test` takes exactly one file here; with none it runs every test file it finds.
+  expect([...runOnlyScripts('cd C:/p && node --test', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p && node --test a.mjs b.mjs', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p && node --test --watch a.mjs', WIN)]).toEqual([])
   // PowerShell's `~` is the profile folder, not HOME.
   expect([...runOnlyScripts('cd ~/p; python gen.py', { windows: true, home: 'D:/h', userProfile: 'C:/Users/pat' }, true)])
     .toEqual([['gen.py', 'C:/Users/pat/p/gen.py']])
@@ -2781,6 +2919,9 @@ test('knows scratch folders, and which scripts a command only runs and where', a
     .toEqual([['gen.py', 'D:/h/p/gen.py']])
   expect([...runOnlyScripts('python /d/work/gen.py', LINUX)]).toEqual([['/d/work/gen.py', '/d/work/gen.py']]) // a real Linux folder
   expect([...runOnlyScripts('python /d/work/gen.py', WIN)]).toEqual([['/d/work/gen.py', 'D:/work/gen.py']])
+  // A Bash brace group runs in this same shell; a PowerShell one is a script block, which may run anywhere.
+  expect([...runOnlyScripts('cd C:/p && { python gen.py; } > out.txt', WIN)]).toEqual([['gen.py', 'C:/p/gen.py']])
+  expect([...runOnlyScripts('cd C:/p; & { python gen.py }', WIN, true)]).toEqual([])
   for (const command of [
     'python gen.py', // no starting folder
     'cd sub && python gen.py', // a relative folder
@@ -2792,7 +2933,8 @@ test('knows scratch folders, and which scripts a command only runs and where', a
     'cd C:/p && python gen.py && cp gen.py b.py', // named again
     'cd C:/p && python $D/gen.py', // a variable
     'cd C:/p && python `x`', // a backtick
-    'cd C:/p && { python gen.py; }', // a group
+    'cd C:/p && { python gen.py; } &', // a group in the background
+    'cd C:/p && { cd sub; python gen.py; }', // a cd inside a group moves this shell
     'cd C:/p && python -c "import gen"', // inline code
     "cd C:/p && cat <<'EOF'\npython gen.py\nEOF", // a body is not a command
     'cd C:/p && source env.sh && python gen.py', // `source` runs a file in this shell: it may move it
@@ -2803,6 +2945,134 @@ test('knows scratch folders, and which scripts a command only runs and where', a
   ]) {
     expect([...runOnlyScripts(command, { windows: true, userProfile: 'C:/Users/pat' })]).toEqual([])
   }
+})
+
+test('Python that writes only the files its open() calls name: its other strings are only text', () => {
+  // This session's own command, as it ran: a script editing a test file whose new case names app.py.
+  const session = [
+    `cd "C:/Users/pat/proj" && python - <<'PY'`,
+    'import io',
+    "p='hooks/register.ts'",
+    "s=open(p,encoding='utf-8').read()",
+    `s=s.replace("a", "b")`,
+    "open(p,'w',encoding='utf-8',newline='').write(s)",
+    "t='tests/review-guard.test.ts'",
+    "s=open(t,encoding='utf-8').read()",
+    `new='''  test('x', async () => {\n    await edit('C:/proj/app.py')\n  })\n'''`,
+    's=s.replace("})", new, 1)',
+    "open(t,'w',encoding='utf-8').write(s)",
+    'PY',
+    `grep -c 'x' hooks/register.ts`,
+  ].join('\n')
+  expect(shellWrites(session).sort()).toEqual(['hooks/register.ts', 'tests/review-guard.test.ts'])
+  // As it really ran, with the tests after it: they may run what it wrote, so its strings count again.
+  expect(shellWrites(`${session}; claude plugin test . 2>&1 | grep -E "^\\(fail\\)|pass$"`)).toContain('C:/proj/app.py')
+  const py = (code: string, opener = "python - <<'PY'") => `${opener}\n${code}\nPY`
+  // Every real write still counts: a name bound by a loop, built from parts, bound twice, a Path move, a
+  // module that starts programs, an unquoted or piped body.
+  for (const [code, opener] of [
+    ["for n in ['a.py']:\n    open(n, 'w').write('x')"],
+    ["base = 'src/'\nopen(base + 'a.py', 'w').write('x')"],
+    ["p = 'x.ts'\np = 'a.py'\nopen(p, 'w').write('x')"],
+    ["p = 'n.txt'\np = p.replace('n.txt', 'a.py')\nopen(p, 'w').write('x')"],
+    ["p = 'n.txt'\nopen(p, 'w').write(open('a.py').read())\nopen('a.py', 'w')"],
+    ["from pathlib import Path\nPath('a.py').write_text('x')\nopen('n.txt', 'w')"],
+    ["import subprocess\nsubprocess.run('sed -i x a.py', shell=True)"],
+    ["p = 'n.py'\nopen(p, 'w').write('x')\nx = 'a.py'", 'python - <<PY'],
+    ["p = 'n.py'\nopen(p, 'w').write('x')\nx = 'a.py'", "python - <<'PY' | cat"],
+    // `open` used without a call opens what no call names.
+    ["len = open\nlen('a.py', 'w').write('x')"],
+    ["[h.write('x') for h in map(open, ['a.py'], ['w'])]\nopen('n.py', 'w')"],
+    ["def f(p):\n    open(p, 'w')\np = 'n.txt'\nf('a.py')"],
+  ] as [string, string?][]) {
+    expect([code, shellWrites(py(code, opener)).some(w => w.endsWith('a.py'))]).toEqual([code, true])
+  }
+  // A string that only says a name is text: here the script writes n.txt alone.
+  expect(shellWrites(py("open('n.txt', 'w').write('see a.py')"))).toEqual([])
+  expect(shellWrites(py("p = 'n.py'\nopen(p, 'w').write('see a.py')"))).toEqual(['n.py'])
+  // A read-only command after it may name what it wrote.
+  expect(shellWrites(`${py("p = 'n.py'\nopen(p, 'w').write('see a.py')")}\ngrep -c x n.py`)).toEqual(['n.py'])
+  // But a script it writes that the same command then runs: what that script's text does is a write.
+  const writesAndRuns = (after: string) => `${py("open('fix.py', 'w').write('''\nopen('src/app.py', 'w').write('x')\n''')")}\n${after}`
+  for (const after of ['python fix.py', 'S=.; python "$S/fix.py"', "python - <<'P2'\nexec(open('fix.py').read())\nP2", 'cat fix.py | python']) {
+    expect([after, shellWrites(writesAndRuns(after)).includes('src/app.py')]).toEqual([after, true])
+  }
+  // A note or data file it writes may be run later, so nothing is proven and its strings count as before.
+  expect(shellWrites(py("p = 'n.txt'\nopen(p, 'w').write('sed -i x a.py')\nx = 'b.py'")).includes('b.py')).toBe(true)
+  // `io` loads no program: `io.open` is an `open` like any other, so a code file it opens counts.
+  expect(shellWrites(py("import io\nio.open('app.py', 'w').write('x')"))).toEqual(['app.py'])
+  // The git guard is as before: a body that loads any module keeps its text, `io` included.
+  expect(gitAction(py("import io\nprint('git push origin main')"))?.kind).toBe('push')
+  expect(gitAction(py("print('git push origin main')"))).toBe(undefined)
+})
+
+test('a proven Python body never hides a file the same command may run, print into, or spell oddly', () => {
+  const py = (code: string, opener = "python - <<'PY'") => `${opener}\n${code}\nPY`
+  const has = (cmd: string, name: string) => shellWrites(cmd).some(w => w.endsWith(name))
+  const writesFix = py(`open('fix.py', 'w').write("open('src/app.py', 'w').write('x')")`)
+  // Anything after it that runs something, whether or not it spells the file's name.
+  for (const after of ['python -m fix', 'python -c "import fix"', 'python f*.py', 'for f in *.py; do python "$f"; done', 'pytest -q', 'make', 'npm test', 'python "fi"x.py', `python - <<'P2'\nimport fix\nP2`]) {
+    expect([after, has(`${writesFix}\n${after}`, 'src/app.py')]).toEqual([after, true])
+  }
+  // What it prints, sent to a file, into a substitution, or by exec.
+  const prints = `print("cp x src/app.py; true")`
+  for (const cmd of [`${py(prints, "python - <<'PY' > gen.sh")}\nbash gen.sh`, `eval $(${py(prints)}\n)`, `exec > gen.sh\n${py(prints)}`, `echo "$(python fix.py)"\n${py("open('n.py', 'w')\nx = 'src/app.py'")}`]) {
+    expect([cmd, has(cmd, 'src/app.py')]).toEqual([cmd, true])
+  }
+  // A proven target that starts with `-` is a name, not a flag.
+  expect(shellWrites(py("open('-x.py', 'w').write('1')"))).toEqual(['-x.py'])
+  // Escapes: `\N{...}` is not read, so nothing is proven and the strings count; a `\` before a line break goes.
+  expect(has(py("open('\\N{LATIN SMALL LETTER A}pp.py', 'w')\nx = 'src/app.py'"), 'src/app.py')).toBe(true)
+  expect(shellWrites(py("open('a\\\npp.py', 'w').write('x')"))).toContain('app.py')
+  expect(shellWrites(py("open(b'\\u0061pp.py', 'w').write(b'x')"))).not.toContain('app.py')
+  // Python writes by other calls count (they did not before): copies, moves, a mode by name, FileIO, programs.
+  for (const code of ["import shutil\nshutil.copy('/tmp/x.py', 'src/app.py')", "import os\nos.replace('/tmp/x.py', 'src/app.py')",
+    "f = open('src/app.py', mode='w')\nprint('x', file=f)", "import io\nio.FileIO('src/app.py', 'w')",
+    "from pathlib import Path\nPath('/tmp/x.py').rename('src/app.py')", "import subprocess\nsubprocess.run(['sed', '-i', 'x', 'src/app.py'])"]) {
+    expect([code, has(py(code), 'src/app.py')]).toEqual([code, true])
+  }
+  // Windows opens `app.py.`, `app.py ` and `app.py::$DATA` as app.py; `C:app.py` is a drive-relative name.
+  for (const name of ['src/app.py.', 'src/app.py ', 'src/app.py::$DATA', 'src/app.py:s', 'C:app.py']) expect([name, languageOf(name)]).toEqual([name, 'Python'])
+  // Off Windows a colon is part of a name: `notes:fix.py` is a Python file there.
+  expect(languageOf('/home/u/notes:fix.py')).toBe('Python')
+  expect(shellWrites("echo x > 'notes:fix.py'")).toEqual(['notes:fix.py'])
+  // A body that writes Python and imports anything may run what it wrote (`python -` looks here first).
+  expect(has(py("open('json.py', 'w').write(\"open('app.py', 'w').write('x')\")\nimport json"), 'app.py')).toBe(true)
+  // A variable set for a program, a program by path, `rg --pre`: none is read-only.
+  for (const after of ['X=/cat python gen.py', './bin/cat gen.py', 'PATH=. cat gen.py', 'rg --pre python x gen.py', 'rg --pre=python x gen.py']) {
+    const cmd = `${py("open('gen.py', 'w').write(\"open('app.py', 'w').write('x')\")")}\n${after}`
+    expect([after, has(cmd, 'app.py')]).toEqual([after, true])
+  }
+})
+
+test('the start folder and run scripts are read only where the shell reads them the same way', () => {
+  const WIN = { windows: true, home: 'C:/Users/pat', userProfile: 'C:/Users/pat' }
+  expect(startFolder('cd C:/p && x=$(pwd) && python gen.py', WIN)).toBe('C:/p')
+  // Inside double quotes a doubled `\` keeps the quotes where they are; `\"` moves where one ends.
+  expect(startFolder('cd "C:/p" && echo "a\\\\b" && python gen.py', WIN)).toBe('C:/p')
+  expect(startFolder('cd C:/p && echo "a\\"; . x.sh; echo \\"" && python gen.py', WIN)).toBe(undefined)
+  for (const cmd of [
+    'cd C:/proj/$(date +%F) && python gen.py && cp a b', // a substitution in the folder's name
+    'cd "C:/p$(echo /sub)" && python gen.py && cp a b',
+    'cd C:/a\\;b && python gen.py && cp a b', // bash reads `C:/a;b`
+    'cd C:/p && echo \\\' && . ./go.sh && python gen.py', // an escaped quote hides a source
+    "cd C:/p; echo $'\\'' '$(' ; . x.sh ; echo ')' #'", // an ANSI-C string
+    'cd C:/p && "c"d sub && python gen.py', // a quoted cd
+    "cd C:/p && c''d sub && python gen.py",
+    'cd C:/p && eval "c""d sub" && python gen.py',
+    'cd C:/p && x=$(nohup y) && python gen.py', // detaches, inside a substitution
+  ]) {
+    expect([cmd, startFolder(cmd, WIN)]).toEqual([cmd, undefined])
+  }
+  expect([...runOnlyScripts('cd C:/p && python $(x).py', WIN)]).toEqual([])
+  expect([...runOnlyScripts('cd C:/p; echo `pwd`; python gen.py', WIN, true)]).toEqual([]) // PowerShell's backtick escapes
+  // PowerShell's `$()` runs in the same session, so it may move it; and `iex` and aliases run text as a cd.
+  for (const cmd of ["cd C:/p; $(iex ('c'+'d C:/other')); python gen.py", "cd C:/p; $a='c'+'d C:/o'; iex $a; python gen.py", "cd C:/p; Invoke-Expression $a; python gen.py", 'cd C:/p; sal x Set-Location; x C:/o; python gen.py']) {
+    expect([cmd, startFolder(cmd, WIN, true)]).toEqual([cmd, undefined])
+  }
+  // A quote inside a `#` comment opens nothing in bash, but would swallow lines here; an alias makes a new cd.
+  expect(startFolder("cd C:/p\ntrue # '\n\"c\"d C:/o\ntrue # '\npython gen.py", WIN)).toBe(undefined)
+  expect(startFolder("cd C:/p\nalias x='c''d'\nx C:/o\npython gen.py", WIN)).toBe(undefined)
 })
 
 test('knows which code files a shell command writes', async () => {

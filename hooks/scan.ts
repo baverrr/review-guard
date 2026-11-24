@@ -546,11 +546,18 @@ const LANGUAGES: [RegExp, Language][] = [
   [/\.css$/i, 'CSS'],
 ]
 
-/** The language of a code file, or undefined for notes, data and everything else. */
+/**
+ * The language of a code file, or undefined for notes, data and everything else. Read as Windows opens a
+ * name: trailing dots and spaces go, and so does a stream (`app.py.`, `app.py `, `app.py::$DATA` are app.py).
+ */
 export function languageOf(path: string): Language | undefined {
-  const p = path.replace(/\\/g, '/')
-  if (/(^|\/)(\.git|node_modules|\.venv|dist|build|__pycache__)\//.test(p)) return undefined
-  return LANGUAGES.find(([re]) => re.test(p))?.[1]
+  const slashed = path.replace(/\\/g, '/')
+  if (/(^|\/)(\.git|node_modules|\.venv|dist|build|__pycache__)\//.test(slashed)) return undefined
+  const lang = (p: string) => LANGUAGES.find(([re]) => re.test(p))?.[1]
+  // As written first (`notes:fix.py` is a plain name off Windows), then as Windows opens it: the last part,
+  // less a drive with no slash after it (`C:app.py`).
+  const cut = slashed.lastIndexOf('/') + 1 || (/^[A-Za-z]:/.test(slashed) ? 2 : 0)
+  return lang(slashed) ?? lang(slashed.slice(0, cut) + slashed.slice(cut).replace(/:.*$/, '').replace(/[. ]+$/, ''))
 }
 
 // Commands that write files without the Edit or Write tool: in-place editors, copies, patches,
@@ -561,6 +568,11 @@ const SHELL_WRITE = new RegExp([
   String.raw`\b(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item)\b`,
   String.raw`\bwrite_(?:text|bytes)\b`, String.raw`\bwriteFile(?:Sync)?\b`, String.raw`\bWriteAll(?:Text|Lines|Bytes)\b`,
   String.raw`\bopen\([^)]*,\s*["'][wax]`, String.raw`\.write\(`, String.raw`\btruncate(?:Sync)?\b`,
+  // Python that copies, moves or writes by other calls, or starts a program that may: `open(p, mode='w')`,
+  // `io.FileIO`, `shutil.copy`, `os.replace`, `Path(...).rename`, `subprocess.run([...])`, `os.system`.
+  String.raw`\bmode\s*=\s*["'][^"']*[wax+]`, String.raw`\bFileIO\b`, String.raw`\bshutil\s*\.`,
+  String.raw`\bos\s*\.\s*(?:replace|rename|renames|remove|unlink|link|symlink|system|popen|spawn\w*|exec\w*)\b`,
+  String.raw`\bsubprocess\b`, String.raw`\bPath\b[^\n]*\.\s*(?:rename|replace|unlink|touch|symlink_to|hardlink_to|write_bytes)\s*\(`,
   String.raw`\bsort\b[^;&|\n]*\s(?:-[a-zA-Z]*o|--output)`, // `-o`, `-uo`, `--output=`
   // Formatters and fixers rewrite the files they are given.
   String.raw`--write\b`, String.raw`--fix\b`, String.raw`\b(?:black|autopep8|rustfmt)\s`, String.raw`\bgofmt\s+-\w*w`, String.raw`\bdotnet\s+format\b`,
@@ -674,7 +686,8 @@ const OPENS = /\b(?:open|openSync|require|writeFile|writeFileSync|appendFile|app
 // The file names those calls open, read from the unmasked body.
 const OPENED = /\b(?:open|openSync|Path|PurePath|PosixPath|WindowsPath|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream)\s*\(\s*(?:"([^"\n]*)"|'([^'\n]*)')/g
 // Modules a trusted body may load: none of them reaches a process or another file but through the calls below.
-const SAFE_MODULES = new Set(['json', 'datetime', 'pathlib', 'time', 'textwrap', 're', 'sys', 'fs', 'node:fs'])
+// `io` too: it opens files only through `io.open`, which OPENS reads as `open`; its classes are no SAFE_NAMES.
+const SAFE_MODULES = new Set(['json', 'datetime', 'pathlib', 'time', 'textwrap', 're', 'sys', 'io', 'fs', 'node:fs'])
 // The only functions and attributes a trusted body may use. Python and Node have more ways to write a
 // file than any list of them (`io.FileIO`, `fs.WriteStream`, `fs.truncateSync`), so instead every call
 // and every `.name` must be one of these: the openers above (which must take a literal), and calls that
@@ -732,9 +745,18 @@ const PY_QUOTE = /"""|'''|"|'/y
  * left over. A prefix word that Python would refuse (`uu`) is read as one: harmless.
  */
 function pythonCode(text: string): string | undefined {
+  return pythonScan(text)?.code
+}
+
+/**
+ * `pythonCode`, plus each string literal's value by where its `""` stands in the code: escapes read, but
+ * not in a raw string (an `r` in its prefix).
+ */
+function pythonScan(text: string): { code: string; literals: Map<number, string> } | undefined {
   // Python reads a lone `\r` as a line break (ending a `#` comment), and an encoding line in the first two
   // (`# coding: unicode_escape`) changes what code the text is: neither is read here.
   if (/\r(?!\n)/.test(text) || /^(?:[^\n]*\n)?[ \t\f]*#[^\n]*coding[:=]/.test(text)) return undefined
+  const literals = new Map<number, string>()
   let out = ''
   for (let i = 0; i < text.length;) {
     const c = text[i] ?? ''
@@ -759,25 +781,116 @@ function pythonCode(text: string): string | undefined {
       if (j >= text.length || (quote.length === 1 && text[j] === '\n')) return undefined
       j += text[j] === '\\' ? 2 : 1
     }
+    const body = text.slice(i + word.length + quote.length, j)
+    // `\N{...}` names a character by its Unicode name, which is not read here: that string's value is unknown.
+    if (/r/i.test(word)) literals.set(out.length, body)
+    else if (!/\\N\{/.test(body)) literals.set(out.length, pythonUnescape(body, /b/i.test(word)))
     out += '""'
     i = j + quote.length
   }
   // Python reads names NFKC-folded (`ｅｘｅｃ` is `exec`), which the name lists here don't: ASCII only.
-  return /[^\x00-\x7f]/.test(out) ? undefined : out
+  return /[^\x00-\x7f]/.test(out) ? undefined : { code: out, literals }
 }
 
 /**
- * For `blankWrittenScripts`: whether Python code read from a heredoc can start no program, so a git
- * command in its text is only text (a test case, a note). Like `onlyRun`'s allowlist (every call and
- * `.name` in SAFE_NAMES, every module in SAFE_MODULES, nothing in RISKY_CODE), read after `pythonCode`
- * takes out the strings, with STARTS_PROGRAMS on top. Unlike it, the files the code opens are not checked
- * (OPENS), and `replace` (`Path.replace` moves a file) is allowed: what it writes matters only to what runs
- * later, and `blankWrittenScripts` then keeps its text (a module loaded, another script or Python run).
+ * The files Python code from a here-document can write, when that is sure; undefined when not. Sure only
+ * for code that `pythonRunsNothing` shows can start no program, with no `Path` or `pathlib` (`replace`
+ * moves a file there), whose every `open(` takes a string literal, or a name bound once to one (`p = 'a.py'`
+ * on a line of its own) and used nowhere but as the first thing `open(` takes. Then every file it writes is
+ * one of those literals, and the other strings in it (a test case naming `app.py`) are only text.
+ */
+function pythonWriteTargets(text: string): string[] | undefined {
+  const scan = pythonScan(text)
+  if (!scan || !pythonRunsNothing(text)) return undefined
+  const { code, literals } = scan
+  if (/\b(?:Path|PurePath|PosixPath|WindowsPath|pathlib)\b/.test(code)) return undefined
+  // `python -` puts the current folder first on the module path: a body that writes Python and imports
+  // anything may run what it wrote (`open('json.py', 'w')`, then `import json`).
+  const writesPython = [...literals.values()].some(v => /\.(?:py[cdiwz]?|pth)$|(?:^|[\\/])__init__/i.test(v))
+  if (writesPython && loadedModules(code).length > 0) return undefined
+  const targets: string[] = []
+  const bound = new Set<string>()
+  // Every `open` is one of the calls read below: `len = open` or `map(open, ...)` opens what no call names.
+  if (code.match(/\bopen\b/g)?.length !== code.match(/\bopen\s*\(/g)?.length) return undefined
+  for (const m of code.matchAll(/\bopen\s*\(\s*/g)) {
+    const at = (m.index ?? 0) + m[0].length
+    if (code.startsWith('""', at) && /^""\s*[,)]/.test(code.slice(at))) {
+      const value = literals.get(at)
+      if (value === undefined) return undefined
+      targets.push(value)
+      continue
+    }
+    const name = /^([A-Za-z_]\w*)\s*[,)]/.exec(code.slice(at))?.[1]
+    if (name === undefined) return undefined
+    bound.add(name)
+  }
+  for (const name of bound) {
+    // Its one binding, a line of its own: `name = '...'`.
+    const binding = [...code.matchAll(new RegExp(String.raw`^[ \t]*${name}[ \t]*=[ \t]*""[ \t]*$`, 'gm'))]
+    if (binding.length !== 1) return undefined
+    const b = binding[0]
+    const value = literals.get((b?.index ?? 0) + (b?.[0].indexOf('""') ?? 0))
+    if (value === undefined) return undefined
+    // Every other use is the first thing an `open(` takes: nothing can bind it again.
+    const uses = [...code.matchAll(new RegExp(String.raw`\b${name}\b`, 'g'))].length
+    const asOpened = [...code.matchAll(new RegExp(String.raw`\bopen\s*\(\s*${name}\s*[,)]`, 'g'))].length
+    if (uses !== asOpened + 1) return undefined
+    targets.push(value)
+  }
+  // Only code files, which are then reviewed themselves, text and all: a note or data file it writes may
+  // be run later with no review of what that text does (as a `cat >` body's text is kept for that).
+  if (targets.some(t => !languageOf(t))) return undefined
+  return targets
+}
+
+/**
+ * Whether nothing in `command` but `body`'s own Python can run anything: no file it writes is then run,
+ * by name or not (`python -m fix`, a glob, `pytest` or `make` finding it, `eval $(python ...)` running what
+ * it prints). Every other command is read-only (`cd`, `cat`, `grep`, ...); `body` is the command's only
+ * here-document; and there is no substitution, group, subshell, `exec`, background job or input redirect.
+ */
+function outsideRunsNothing(command: string, body: Heredoc): boolean {
+  const docs = heredocs(command)
+  if (!docs.complete || docs.bodies.length !== 1) return false
+  // A substitution inside double quotes runs too (`echo "$(python fix.py)"`): looked for before masking.
+  if (/\$\(|`|\$'/.test(docs.outside)) return false
+  const masked = docs.outside.replace(/"[^"\n]*"|'[^'\n]*'/g, '""')
+  if (/[`(){}<]|\$\(|(?<![&>])&(?![&>])|\bexec\b/.test(masked.replace(/<<-?\s*(?:""|[\w-]+)/g, '').replace(/\d*>&\d+/g, ''))) return false
+  // rg runs a program on each file with `--pre` (and `--hostname-bin`), so it is not read-only then.
+  if (/--pre\b|--hostname-bin\b/.test(docs.outside)) return false
+  const lines = masked.split('\n')
+  for (const [k, line] of lines.entries()) {
+    for (const pipeline of line.split(/&&|\|\||;/)) {
+      for (const part of pipeline.split('|')) {
+        const text = part.replace(/<<-?\s*(?:""|[\w-]+)/g, ' ').replace(REDIRECT, ' ')
+        if (text.trim() === '') continue
+        // The Python that reads the body, on its opener line.
+        if (k === body.line && /<</.test(part) && readsPythonCode(text)) continue
+        // A bare read-only program, with no variable set for it (`X=/cat python gen.py`, `PATH=. cat`) and
+        // no path (`./bin/cat` is any program).
+        const set: string[] = []
+        const program = programWords(text, set)[0] ?? ''
+        if (set.length > 0 || /[\\/]/.test(program) || !READ_ONLY.test(program.toLowerCase())) return false
+      }
+    }
+  }
+  return true
+}
+
+/**
+ * Whether Python code read from a heredoc can start no program. For `blankWrittenScripts`, so a git
+ * command in its text is only text (a test case, a note), and for `pythonWriteTargets`, which also checks
+ * the files it opens. Like `onlyRun`'s allowlist (every call and `.name` in SAFE_NAMES, every module in
+ * SAFE_MODULES, nothing in RISKY_CODE), read after `pythonCode` takes out the strings, with STARTS_PROGRAMS
+ * on top. Unlike it, the files the code opens are not checked here (OPENS), and `replace` (`Path.replace`
+ * moves a file) is allowed: `pythonWriteTargets` refuses `Path` itself, and `blankWrittenScripts` keeps the
+ * text when a module is loaded or another script or Python runs.
  */
 function pythonRunsNothing(text: string): boolean {
   const code = pythonCode(text)
-  // STARTS_PROGRAMS and SAFE_MODULES are a backup: SAFE_NAMES refuses every call they list, and any module
-  // loaded keeps the body anyway (`blankWrittenScripts`).
+  // SAFE_MODULES is a real gate for `pythonWriteTargets` (a module it lets in, like `io`, passes), so
+  // widen it only for a module that reaches no program and no file but through SAFE_NAMES. STARTS_PROGRAMS
+  // is a backup: SAFE_NAMES refuses every call it lists.
   if (code === undefined || RISKY_CODE.test(code) || STARTS_PROGRAMS.test(code)) return false
   if (loadedModules(code).some(m => !SAFE_MODULES.has(m))) return false
   return usedNames(code).every(n => SAFE_NAMES.has(n) || n === 'replace')
@@ -787,10 +900,14 @@ function pythonRunsNothing(text: string): boolean {
 // that (`print(..., file=open(...))` writes with no `.write`).
 const PY_FILES = new Set(['open', 'Path', 'pathlib', 'write', 'write_text', 'mkdir', 'replace', 'writeFileSync', 'appendFileSync', 'mkdirSync', 'fs'])
 
-/** A Python string's text with its escapes read (`app\x2epy` is `app.py`); an unknown one is kept as it is. */
-function pythonUnescape(s: string): string {
-  const named: Record<string, string> = { n: '\n', t: '\t', r: '\r', '\\': '\\', "'": "'", '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', '0': '\0' }
+/**
+ * A Python string's text with its escapes read (`app\x2epy` is `app.py`, a `\` before a line break goes);
+ * an unknown one is kept as it is. In a bytes string (`bytes`) `\u` and `\U` are no escapes.
+ */
+function pythonUnescape(s: string, bytes = false): string {
+  const named: Record<string, string> = { n: '\n', t: '\t', r: '\r', '\\': '\\', "'": "'", '"': '"', a: '\x07', b: '\b', f: '\f', v: '\v', '0': '\0', '\n': '' }
   return s.replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|[\s\S])/g, (all, e: string) => {
+    if (bytes && /^[uU]/.test(e)) return all
     if (/^[xuU]/.test(e)) return String.fromCodePoint(parseInt(e.slice(1), 16))
     if (/^[0-7]/.test(e)) return String.fromCodePoint(parseInt(e, 8))
     return named[e] ?? all
@@ -822,7 +939,7 @@ const REDIRECT = /\d?>[>|]?\s*([^\s<>]+)/g // `>|` too, so its `|` is not read a
 function onlyRun(command: string): { outside: string; runs: Map<string, number> } | undefined {
   const { outside, bodies, complete } = heredocs(command)
   // `--pre`: `rg --pre bash` runs a program on every file it reads, so rg is not read-only then.
-  if (!complete || outside.includes('$') || /--pre\b/.test(outside) || SHELL_WRITE.test(outside) || SHELL_WRITE_PS.test(outside)) return undefined
+  if (!complete || outside.includes('$') || /--pre\b|--hostname-bin\b/.test(outside) || SHELL_WRITE.test(outside) || SHELL_WRITE_PS.test(outside)) return undefined
   const written = new Set<string>() // what the bodies write: running one of these runs new code
   for (const body of bodies) {
     if (body.piped) return undefined // `cat <<EOF | bash`: the body goes on to something else
@@ -1222,7 +1339,9 @@ function blankScratchBodies(command: string, scratchFile: (target: string) => bo
  * alone. When anything else in the command writes, every code file it names counts, which can include
  * one it only reads (`cp a.py b.py`, a loop over files, `ls a.py | xargs sed -i`): an extra review is the
  * safer mistake than a change nobody looked at. In Python code from a heredoc a string's prefix is not part
- * of a name (`r'app.py'` names `app.py` there), and every one-line string is read as a name. Left out:
+ * of a name (`r'app.py'` names `app.py` there), and every one-line string is read as a name, except in a
+ * body shown to write only the code files its `open(` calls name, in a command where nothing else runs
+ * anything (`pythonWriteTargets`, `outsideRunsNothing`): there only those files count. Left out:
  * what ssh runs on another machine (`localPart`), the text of data here-documents nothing here runs
  * (`blankDataBodies`), a script run after here-documents that only write notes (`onlyRun`), and, when
  * `scratchFile` is given (it gets each scratch-script target and run script, leading variables filled
@@ -1249,7 +1368,24 @@ export function shellWrites(fullCommand: string, scratchFile?: (target: string) 
     const trusted = onlyRun(command)
     // Shell words, quotes kept together: "$DST/hooks/a.ts" is one word, not "$DST" and "/hooks/a.ts".
     const mentions = new Map<string, number>()
-    const text = trusted?.outside ?? command
+    // Python code shown to write only the files its `open(` calls name (`pythonWriteTargets`), in a quoted
+    // body read whole, whose split up to its end line is no guess (what follows can't move it): those files
+    // count, and its other strings are only text, so its lines are not read for names.
+    const lines = command.split('\n')
+    const proven = new Set<number>()
+    if (!trusted) {
+      for (const b of heredocs(command).bodies) {
+        // Its output sent to a file (`python - <<'PY' > gen.sh`) writes what it prints: read as before.
+        if (!b.quoted || b.piped || !readsPythonCode(b.reader) || /\d*>/.test(b.reader)) continue
+        if (!heredocs(lines.slice(0, b.to + 1).join('\n')).complete) continue
+        const targets = pythonWriteTargets(b.text)
+        if (targets === undefined || !outsideRunsNothing(command, b)) continue
+        for (let k = b.from; k < b.to; k++) proven.add(k)
+        // A proven target is a file name, never a flag: `-x.py` counts too.
+        for (const t of targets) mentions.set(t, (mentions.get(t) ?? 0) + 1)
+      }
+    }
+    const text = trusted?.outside ?? lines.map((l, k) => (proven.has(k) ? '' : l)).join('\n')
     // The lines of bodies that are Python code (`python - <<'PY'`, `cat > fix.py <<'EOF'`): there
     // `r'C:\a.py'` is a raw string naming `C:\a.py`, not bash's word `rC:\a.py`. Each one-line string in
     // them counts as a name too, wherever it stands (`base + r'a.py'`, `{'k': 'src/a.py'}`). A target is
@@ -1258,11 +1394,13 @@ export function shellWrites(fullCommand: string, scratchFile?: (target: string) 
     const pythonLines = new Set<number>()
     if (!trusted) {
       for (const b of heredocs(command).bodies) {
+        if (proven.has(b.from)) continue
         const writes = [...b.reader.matchAll(REDIRECT)].map(m => m[1] ?? '')
         if (!readsPythonCode(b.reader) && !writes.some(t => /\.pyw?$/i.test(t))) continue
         for (let k = b.from; k < b.to; k++) pythonLines.add(k)
-        for (const m of b.text.matchAll(/(?<![\w])([rRbBuUfF]{0,2})(["'])((?:\\.|(?!\2)[^\\\n])*)\2/g)) {
-          const name = /r/i.test(m[1] ?? '') ? m[3] ?? '' : pythonUnescape(m[3] ?? '')
+        // A `\` before a line break goes on in the same string (Python drops both).
+        for (const m of b.text.matchAll(/(?<![\w])([rRbBuUfF]{0,2})(["'])((?:\\[\s\S]|(?!\2)[^\\\n])*)\2/g)) {
+          const name = /r/i.test(m[1] ?? '') ? m[3] ?? '' : pythonUnescape(m[3] ?? '', /b/i.test(m[1] ?? ''))
           if (name.length > 2 && !name.startsWith('-') && languageOf(name)) mentions.set(name, (mentions.get(name) ?? 0) + 1)
         }
       }
@@ -1312,7 +1450,18 @@ export function shellWrites(fullCommand: string, scratchFile?: (target: string) 
  * How paths are spelled on this machine: Windows (drive letters, `\` and `/` alike, any case) or not. How
  * one tool reads a path there, `/c/...` included, is `rulesFor`.
  */
-export type Paths = { windows: boolean; home?: string; userProfile?: string }
+export type Paths = {
+  windows: boolean; home?: string; userProfile?: string
+  /**
+   * The environment's temp folders as the hooks read them (`TEMP`, `TMP`, `TMPDIR`, `LOCALAPPDATA`), filled
+   * in where a command starts a path with one (`cd "$LOCALAPPDATA/Temp/..."`). Trusted by the user's choice:
+   * a shell profile could set them otherwise. A command that sets one itself gets no start folder.
+   */
+  vars?: Readonly<Record<string, string>>
+}
+
+// The variables `Paths.vars` may fill in.
+const TRUSTED_VARS = ['TEMP', 'TMP', 'TMPDIR', 'LOCALAPPDATA'] as const
 
 /**
  * How a tool spells paths. `posix`: Linux, macOS and WSL, where a `\` is part of a file name and case
@@ -1469,6 +1618,18 @@ function expandPath(p: string, paths: Paths, powershell: boolean): string | unde
   if (/^(?:~|\$HOME|\$\{HOME\})(?=$|[\\/])/.test(e)) e = homeHere ? e.replace(/^(?:~|\$HOME|\$\{HOME\})/, homeHere) : ''
   else if (/^(?:\$USERPROFILE|\$\{USERPROFILE\}|\$env:USERPROFILE)(?=$|[\\/])/i.test(e)) {
     e = paths.userProfile ? e.replace(/^[^\\/]+/, paths.userProfile) : ''
+  } else {
+    // A temp-folder variable at the start: `$LOCALAPPDATA/...` or `${TEMP}/...` in Bash (its case), and
+    // `$env:TEMP\...` in PowerShell (any case; there `$TEMP` is a variable of the session, not the
+    // environment's). One that is not set leaves the name unknown.
+    const m = /^(?:\$\{([A-Za-z_]\w*)\}|\$env:([A-Za-z_]\w*)|\$([A-Za-z_]\w*))(?=$|[\\/])/i.exec(e)
+    const raw = m?.[1] ?? m?.[2] ?? m?.[3] ?? ''
+    const name = m && (m[2] !== undefined) === powershell
+      ? TRUSTED_VARS.find(v => (powershell && paths.windows ? v.toLowerCase() === raw.toLowerCase() : v === raw))
+      : undefined
+    // Less any trailing slash (macOS's TMPDIR ends in one), but a bare root stays.
+    const value = paths.vars?.[name ?? '']?.replace(/(?<=.)[\\/]+$/, '')
+    if (m && name) e = value ? value + e.slice(m[0].length) : ''
   }
   if (!e || /[$`%*?~]/.test(e)) return undefined
   if (!paths.windows) return e // a `\` is part of a file name there
@@ -1482,22 +1643,147 @@ const absoluteHere = (p: string, paths: Paths) => (paths.windows ? /^[A-Za-z]:\/
 /**
  * The folder a shell command starts in: only `cd <full folder>` as its very first part, and nothing else in
  * it that moves the shell (`source` and `.` run a file in this shell; in Bash `c\d` is cd, and `chdir`
- * counts in PowerShell only). A cd that fails is not seen: `runOnlyScripts` uses this only to find the file
- * of a script the command names as nothing but what runs, which no folder makes a write. Undefined
- * otherwise, and for a command whose split is a guess or that detaches a part.
+ * counts in PowerShell only). A cd that fails is not seen here, nor a folder change this does not know
+ * (`os.chdir`, `git -C`): `runOnlyScripts` uses this only to find the file of a script the command names
+ * as nothing but what runs, which the caller then compares before and after; `scratchStart` (register.ts),
+ * which leaves writes out as scratch, checks that the folder is already there and refuses any change of
+ * folder `CHANGES_FOLDER` knows. Undefined otherwise: for a command `readableOutside` won't read (a
+ * here-document split that is a guess, a backslash the shell would read otherwise, `$'...'`), one that
+ * sets a temp-folder variable (a cautious refusal), detaches a part, sources or evals, spells cd another
+ * way (`"c"d`), or has a substitution in the folder's name.
  */
 export function startFolder(command: string, paths: Paths, powershell = false): string | undefined {
-  const docs = heredocs(command)
-  if (!docs.complete) return undefined
-  const outside = docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' ')
+  // A command that sets a temp-folder variable itself: its value here is not the environment's.
+  if (new RegExp(String.raw`(?:^|[^\w$])(?:\$env:)?(?:${TRUSTED_VARS.join('|')})\s*\+?=|\b(?:export|declare|typeset|local|readonly|unset|set|Set-Item|Set-Variable|sv|si)\b[^\n;&|]*\b(?:${TRUSTED_VARS.join('|')})\b`, 'i').test(command)) return undefined
+  const outside = readableOutside(command, powershell)
+  if (outside === undefined) return undefined
   const parts = commandParts(outside)
-  if (!parts || DETACHES.test(outside)) return undefined
-  const moves = [...outside.matchAll(MOVES)].length
+  // Moves, detaches and sourcing are looked for in the unmasked text, substitutions too, and moves in the
+  // parsed programs as well (`"c"d` and `c''d` are cd): more review, never less.
+  const unmasked = heredocs(command).outside
+  if (!parts || DETACHES.test(unmasked) || /(?:^|[;&|\n({]\s*)(?:source|\.)\s/.test(unmasked)) return undefined
+  const MOVE_WORD = /^(?:cd|chdir|pushd|popd|Set-Location|sl|Push-Location|Pop-Location)$/i
+  if (programsOf(parts).filter(w => MOVE_WORD.test(w[0] ?? '')).length > 1) return undefined
+  // Programs that run text as a command (`eval`, PowerShell's `iex`), or make a new name for one (`alias`).
+  if (programsOf(parts).some(w => /^(?:eval|builtin|alias|iex|Invoke-Expression|icm|Invoke-Command|Set-Alias|New-Alias|sal|nal)$/i.test(w[0] ?? ''))) return undefined
+  const moves = [...unmasked.matchAll(MOVES)].length
   const hidden = programsOf(parts).some(w => /^(?:source|\.)$/.test(w[0] ?? '') || (!powershell && (w[0] ?? '').includes('\\')))
   const first = parts[0] ?? []
   if (moves !== 1 || hidden || !(powershell ? /^(?:cd|Set-Location|sl|chdir)$/i : /^cd$/).test(first[0] ?? '') || first.length !== 2) return undefined
+  // A substitution in the folder's name (`cd C:/proj/$(date +%F)`) names no folder known here.
+  if ((first[1] ?? '').includes(MASKED)) return undefined
   const dir = expandPath(first[1] ?? '', paths, powershell)
   return dir && absoluteHere(dir, paths) ? dir.replace(/\/+$/, '') : undefined
+}
+
+// What `maskSubstitutions` puts in place of a substitution: no path holds it, so a word with it in is never
+// a folder or a script (`cd C:/proj/$(date +%F)` names no folder known here).
+const MASKED = '\u0001'
+
+/**
+ * Whether a command's backslashes leave its words where `commandParts` puts them: inside single quotes, or
+ * inside double quotes before anything but `"` or a line break (`"C:\tools"`, `"a\\b"`: a doubled `\` that
+ * bash reads as one only doubles a slash in a path, the same file). Outside quotes bash drops one (`cd C:\p`
+ * goes to `C:p`, `a\;b` is one word), and `\"` or a `\` before a line break moves where a quote ends.
+ * `maskSubstitutions` skips the character after a `\` itself (`\$(` starts no substitution).
+ */
+function plainBackslashes(text: string): boolean {
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] ?? ''
+    if (quote === "'") {
+      if (ch === "'") quote = ''
+    } else if (ch === '\\') {
+      if (quote !== '"' || /["\n]/.test(text[i + 1] ?? '\n')) return false
+      i++
+    } else if (ch === "'" && !quote) quote = "'"
+    else if (ch === '"') quote = quote ? '' : '"'
+  }
+  return true
+}
+
+/**
+ * A command's text with each command substitution (`$(...)`, a backtick pair) made the mark MASKED, read with
+ * bash's quotes and backslashes, for `startFolder` and `runOnlyScripts` only: what a Bash substitution runs
+ * runs in a subshell, which moves no folder of this shell (moves are counted in the unmasked text anyway,
+ * PowerShell's `$()` included, and a PowerShell backtick is refused before this), a word holding the mark
+ * is never a folder or a script, and a script a substitution runs is not counted as only
+ * run (it is named once more than the runs found, so it stays in the review). Undefined when a
+ * substitution or a quote never ends: then nothing is read from the text.
+ */
+function maskSubstitutions(text: string): string | undefined {
+  let out = ''
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] ?? ''
+    if (quote === "'") {
+      out += ch
+      if (ch === "'") quote = ''
+      continue
+    }
+    if (ch === '\\') {
+      out += text.slice(i, i + 2)
+      i++
+      continue
+    }
+    if (ch === "'" && !quote) quote = "'"
+    else if (ch === '"') quote = quote ? '' : '"'
+    else if (ch === '`') {
+      const end = text.indexOf('`', i + 1)
+      if (end < 0) return undefined
+      out += MASKED
+      i = end
+      continue
+    } else if (ch === '$' && text[i + 1] === '(') {
+      // To the matching `)`, through quotes and nested parentheses.
+      let depth = 0
+      let q = ''
+      let j = i + 1
+      for (; j < text.length; j++) {
+        const c = text[j] ?? ''
+        if (q === "'") {
+          if (c === "'") q = ''
+        } else if (c === '\\') j++
+        else if (q === '"') {
+          if (c === '"') q = ''
+        } else if (c === "'" || c === '"') q = c
+        else if (c === '(') depth++
+        else if (c === ')' && --depth === 0) break
+      }
+      if (j >= text.length) return undefined
+      out += MASKED
+      i = j
+      continue
+    }
+    out += ch
+  }
+  return quote ? undefined : out
+}
+
+/**
+ * The command text `startFolder` and `runOnlyScripts` read: outside its here-documents, with substitutions
+ * masked. A command whose here-document split is a guess is read only when it opens none at all (not even
+ * a `<<` in a quote), as its lines are then all its own: a backslash or a quote over two lines makes the
+ * heredoc split a guess, but `commandParts` still reads the quotes, or gives up.
+ */
+function readableOutside(command: string, powershell: boolean): string | undefined {
+  const docs = heredocs(command)
+  if (!docs.complete && (docs.bodies.length > 0 || /(?<!<)<<(?!<)/.test(command))) return undefined
+  // Read only what `commandParts` reads as the shell does: no backslash bash would drop (`cd C:\p` is
+  // `C:p`), no ANSI-C string (`$'\''` holds a quote), no `#` comment (a quote in one opens nothing, but
+  // `commandParts` would read on), and in PowerShell no backtick (its escape character) and no `$(...)`,
+  // which runs in the same session there and may change its folder.
+  if (/\$'/.test(docs.outside) || !plainBackslashes(docs.outside) || /(?:^|\s)#/.test(docs.outside)) return undefined
+  if (powershell && /`|\$\(/.test(docs.outside)) return undefined
+  const masked = maskSubstitutions(docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' '))
+  // A Bash brace group (`{ a; b; } > f`) runs in this same shell: its braces read as separators, so the
+  // commands inside are seen like any other (a cd there is still a move, `} &` still a background job).
+  // In PowerShell braces are script blocks, which may run anywhere: still refused there.
+  if (masked === undefined || powershell) return masked
+  // Only braces outside quotes (`cd "C:/a { b"` names a folder, `echo '{ x }'` prints text).
+  return masked.replace(/"[^"]*"|'[^']*'|[^"']+/g, piece =>
+    // A group opens only where a command starts (`echo { x }` prints braces) and closes after a `;` or a line.
+    /^["']/.test(piece) ? piece : piece.replace(/(^|[;&|\n]\s*)\{(?=\s)/g, '$1;').replace(/([;\n]\s*)\}(?=$|[\s;&|<>])/g, '$1;'))
 }
 
 // The programs of a command's parts, after `sudo`, `env` and VAR=value.
@@ -1523,11 +1809,10 @@ const programsOf = (parts: string[][]) =>
  */
 export function runOnlyScripts(command: string, paths: Paths, powershell = false): Map<string, string> {
   const out = new Map<string, string>()
-  const docs = heredocs(command)
-  if (!docs.complete) return out
-  const outside = docs.outside.replace(/<<-?\s*(?:"[^"]*"|'[^']*'|[\w-]+)/g, ' ')
+  const outside = readableOutside(command, powershell)
+  if (outside === undefined) return out
   const parts = commandParts(outside)
-  if (!parts || DETACHES.test(outside)) return out
+  if (!parts || DETACHES.test(heredocs(command).outside)) return out
   const expand = (p: string) => expandPath(p, paths, powershell)
   const absolute = (p: string) => absoluteHere(p, paths)
   const programs = programsOf(parts)
@@ -1535,8 +1820,13 @@ export function runOnlyScripts(command: string, paths: Paths, powershell = false
   const runs = new Map<string, number>()
   for (const words of programs) {
     if (!INTERPRETER.test(commandName(words[0] ?? ''))) continue
-    const target = runTarget(words.filter(w => !/^\d*[<>]/.test(w)))
-    if (target && target !== '-') runs.set(target, (runs.get(target) ?? 0) + 1)
+    const argv = words.filter(w => !/^\d*[<>]/.test(w))
+    // `node --test <one file>` runs that file as tests. Only here: elsewhere `runTarget`'s `''` means stdin,
+    // and `node --test` with no file runs every test file it finds.
+    const nodeTest = /^(?:node|bun)$/.test(commandName(argv[0] ?? '')) && argv[1] === '--test' && argv.length === 3 && !(argv[2] ?? '-').startsWith('-')
+    const target = nodeTest ? argv[2] : runTarget(argv)
+    // A script named with a substitution in it (`python $(x).py`) is no file known here.
+    if (target && target !== '-' && !target.includes(MASKED)) runs.set(target, (runs.get(target) ?? 0) + 1)
   }
   for (const [script, n] of runs) {
     // Named anywhere else, in the command or a here-document body, as a word or inside one: it may be written.

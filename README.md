@@ -113,11 +113,18 @@ except in `churn`, which then uses the default and says so in the log.
 **"review-guard could not check this command."** Git could not open the folder the command names, or the
 config file has a mistake. The message gives the reason. Run git with `git -C <full path>` or fix the file.
 
-**"It asks for a review I don't need."** Notes and other non-code files are never reviewed, nor are
-Claude's own scratch files (unless a command copies them into the project) or a script a command only runs
-and leaves unchanged. When a command only writes scripts into Claude's scratch folder and runs them, the
-files those scripts name are not reviewed either, by your choice. The status line names each file left out. To turn the mod off for a while, set
-`"review-guard@review-guard": false` under `enabledPlugins` in `~/.claude/settings.json`.
+**"It asks for a review I don't need."** These are never reviewed:
+
+- notes and other non-code files;
+- Claude's own scratch files, unless a command copies them into the project. That includes files a
+  command writes after a `cd` into the scratch folder, even one spelled with `$TEMP` or `$LOCALAPPDATA`;
+- a script a command only runs and leaves unchanged;
+- the files named in scripts that a command only writes into the scratch folder and runs, by your choice.
+
+A `python - <<'PY'` script that starts no program, only opens code files it names, and runs alone (nothing
+else in the command runs anything) counts only those files, not every file name in its text. The status
+line names each file left out. To turn the mod off for a while, set `"review-guard@review-guard": false`
+under `enabledPlugins` in `~/.claude/settings.json`.
 
 **"It checked a commit or push I didn't make."** A command that writes a file holding a git command (a test,
 a note) and also runs a script is checked, since the guard can't tell whether the script runs it. A test
