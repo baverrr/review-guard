@@ -137,7 +137,9 @@ spelling: slashes and the drive letter's case are evened out and a relative path
 session's folder, but other case still counts, and a path with a `..` step is kept as it was written.
 When a file under review has been in the rule's number of reviews within its hours, the review prompt gets
 a paragraph: no new features in those files this turn, tests that pin them down, and a question for the
-user about their design. The check never holds a review back for long: if it fails, or takes over five
-seconds (two for recording a review), the review goes on without it, and the log says why. A history file
+user about their design, with Claude's own recommendation (redesign yes, no or not yet, a short reason from
+what the reviews found, and the smallest redesign when yes), the user deciding. The check never holds a
+review back for long: if it fails, or takes over five seconds (two for recording a review), the review goes
+on without it, and the log says why. A history file
 that is not valid JSON, or of another version, is logged and started again. Two sessions writing at the
 same moment may lose one entry, which only means a churning file is noticed a review later.

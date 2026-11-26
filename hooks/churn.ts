@@ -136,6 +136,9 @@ export function churnNote(found: readonly Churned[], rule: ChurnRule): string {
     '- Add no new features to these files in this turn.',
     '- Write or extend tests that pin down what each of them should do, around the bugs this review found.',
     '- Tell the user these files keep coming back, and ask whether their design needs another look before more',
-    '  work goes into them (write the exact question).',
+    '  work goes into them (write the exact question). With the question, give your own recommendation, in your',
+    '  own words: redesign yes, no, or not yet, with a one- or two-line reason grounded in what the reviews found',
+    '  (the same kind of bug coming back in one area points to yes; unrelated one-off bugs in a busy file point to',
+    '  no). When yes, sketch the smallest redesign that would fix it. Then the user decides.',
   ].join('\n')
 }

@@ -4073,6 +4073,19 @@ describe('churn', () => {
     expect(text.includes('ask whether their design needs another look')).toBe(true)
   })
 
+  test('with the design question, the note asks Claude for its own redesign recommendation and leaves the call to the user', () => {
+    const text = flat(churnNote([{ path: 'C:/proj/a.py', reviews: 5 }], RULE))
+    expect(text.includes('give your own recommendation')).toBe(true)
+    expect(text.includes('redesign yes, no, or not yet')).toBe(true)
+    expect(text.includes('a one- or two-line reason grounded in what the reviews found')).toBe(true)
+    expect(text.includes('the same kind of bug coming back in one area points to yes')).toBe(true)
+    expect(text.includes('unrelated one-off bugs in a busy file point to no')).toBe(true)
+    expect(text.includes('When yes, sketch the smallest redesign that would fix it')).toBe(true)
+    expect(text.includes('Then the user decides.')).toBe(true)
+    // The recommendation comes with the question, not in place of it.
+    expect(text.indexOf('write the exact question')).toBeLessThan(text.indexOf('give your own recommendation'))
+  })
+
   /**
    * A Windows session in C:/proj whose history files live in `files`; `written` lists each write to one,
    * `logged` each log line. `config`: the config file's text (none: no file). `readFails`: history reads fail.
@@ -4178,6 +4191,7 @@ describe('churn', () => {
     expect(third.includes('c:/proj/app.py (3 reviews)')).toBe(true)
     expect(third.includes('other.py (')).toBe(false)
     expect(third.includes('Add no new features to these files')).toBe(true)
+    expect(third.includes('redesign yes, no, or not yet')).toBe(true)
     expect(logged.some(l => l.includes('1 file(s) keep coming back'))).toBe(true)
     await stop(true)
     expect(reviews().length).toBe(3)
