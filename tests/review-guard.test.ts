@@ -8,6 +8,7 @@ import { churned, churnNote, historyFileName, historyFrom, withReview } from '..
 import { REVIEW_AGENTS } from '../hooks/agents.ts'
 import { afterHandOn, agentsListed, blankedSafely, cycleFrom, isWindows, ownFolderFrom, ownFolderOf, savedDamaged, recipient, reviewFailed, reviewHeldOpen, keyOf, samePath, say, stillOthers, underWayFor, whyOf } from '../hooks/register.ts'
 import { statusFrom } from '../hooks/status.ts'
+import { changedBetween, committedWrites, compareWithGuess, GIT_TIMEOUT_MS, gitSubcommands, headMove, isFullPath, normalPath, parseStatus, relativeTo, repoFor } from '../hooks/worktree.ts'
 import { candidates, gitleaksFindings, scannerCommand, scannersFor, scannerSteps } from '../hooks/scanners.ts'
 
 // The review prompt is wrapped at a fixed width; tests read it as one line so a rewrap breaks nothing.
@@ -3896,7 +3897,8 @@ describe('the git guard', () => {
   test('a Python test written with a heredoc and run is not a commit: no check, no stop', async ($, on) => {
     const seen = world(on)
     const r = await $.tool.call({ tool: 'Bash', command: "cd /c/proj && cat > /tmp/t/fix.py <<'PYEOF'\ngit(repo, 'commit', '-q', '-m', 'first')\nPYEOF\npython -I /tmp/t/fix.py ." })
-    expect([r.deny, seen.ran, seen.calls.filter(c => c.startsWith('git ')).length]).toEqual([undefined, true, 0])
+    // The shadow look may ask which repository the folder is in (`rev-parse`): that is no commit check.
+    expect([r.deny, seen.ran, seen.calls.filter(c => c.startsWith('git ') && !c.includes(' rev-parse --show-toplevel')).length]).toEqual([undefined, true, 0])
   })
 
   test('a clean commit runs', async ($, on) => {
@@ -4439,5 +4441,256 @@ describe('churn', () => {
     await stop(true)
     expect(reviews().length).toBe(1)
     expect(logged.some(l => l.includes('"churn" must be') && l.includes('default rule'))).toBe(true)
+  })
+})
+
+describe('shadow look', () => {
+  const C = ['git', 'commit'].join(' ') // spelled apart, so the guard never reads this file's commands as one
+  const rec = (letters: string, path: string) => `1 ${letters} N... 100644 100644 100644 h1 h2 ${path}`
+  const status = (head: string, ...records: string[]) => [`# branch.oid ${head}`, '# branch.head main', ...records].map(r => `${r}\0`).join('')
+  const snap = (out: string, stats: Record<string, number>, texts: Record<string, string> = {}) => {
+    const state = parseStatus(out)
+    return { repo: 'C:/r', state, stats: new Map([...state.entries.keys()].map(p => [p, p in stats ? { mtimeMs: stats[p] ?? 0, size: 1, text: texts[p] } : undefined])) }
+  }
+
+  test('git status v2 is read: each kind of record, a renamed file\'s old path skipped, a name with spaces, no commit yet', () => {
+    const out = status('abc', rec('.M', 'src/a b.ts'), '2 R. N... 100644 100644 100644 h1 h2 R100 new.ts', 'old.ts',
+      'u UU N... 100644 100644 100644 100644 h1 h2 h3 both.ts', '? notes.py', '! build/x.js', rec('D.', 'f.py'), '? f.py')
+    const { head, entries } = parseStatus(out)
+    // A path listed twice (`git rm --cached`) keeps its tracked record.
+    expect([head, [...entries]]).toEqual(['abc', [['src/a b.ts', '.M'], ['new.ts', 'R.'], ['both.ts', 'UU'], ['notes.py', '??'], ['f.py', 'D.']]])
+    expect(parseStatus(status('(initial)', '? a.py')).head).toBe(undefined)
+    expect(() => parseStatus(status('abc', 'X what'))).toThrow()
+    expect(() => parseStatus(`${rec('.M', 'a.ts')}\0`)).toThrow() // no commit named
+  })
+
+  test('only work-tree evidence is a write: new, newly changed, or changed again; not staging, not a deletion', () => {
+    const before = snap(status('h', rec('.M', 'again.ts'), rec('.M', 'same.ts'), rec('.M', 'staged.ts'), rec('.M', 'copied.ts')),
+      { 'again.ts': 1, 'same.ts': 1, 'staged.ts': 1, 'copied.ts': 1 }, { 'copied.ts': 'old' })
+    const after = snap(status('h', rec('.M', 'again.ts'), rec('.M', 'same.ts'), rec('M.', 'staged.ts'), rec('.M', 'copied.ts'), rec('.M', 'edited.ts'), '? new.py', rec('.D', 'gone.ts'), rec('.M', 'nolonger.ts')),
+      { 'again.ts': 2, 'same.ts': 1, 'staged.ts': 1, 'copied.ts': 1, 'edited.ts': 5, 'new.py': 5, 'gone.ts': 5 }, { 'copied.ts': 'new' })
+    // copied.ts kept its time and size (`cp -p`), but its text changed.
+    expect(changedBetween(before, after)).toEqual(['again.ts', 'copied.ts', 'edited.ts', 'new.py'])
+  })
+
+  test('a commit counts only what the command itself wrote, never a file changed before it and untouched', () => {
+    const before = snap(status('a', rec('.M', 'earlier.ts'), rec('.M', 'formatted.ts')), { 'earlier.ts': 1, 'formatted.ts': 1 })
+    const now = (t: number) => ({ mtimeMs: t, size: 1 })
+    expect(committedWrites(before, [['earlier.ts', now(1)], ['formatted.ts', now(2)], ['fresh.ts', now(1)], ['gone.ts', undefined]])).toEqual(['formatted.ts', 'fresh.ts'])
+  })
+
+  test('HEAD moved by a commit counts the commit\'s files; any git command that moves it or brings in work is not compared', () => {
+    expect(headMove(`${C} -am x`, 'a', 'a')).toBe('none')
+    expect(headMove(`sed -i s/a/b/ x.py && git add -A && ${C} -am x`, 'a', 'b')).toBe('commit')
+    expect(headMove(`git -C /r ${C.slice(4)} -qm x`, 'a', 'b')).toBe('commit')
+    // The usual way to commit: add, commit, push (push and fetch leave the work tree alone).
+    expect(headMove(`git add -A && ${C} -m x && git push && git fetch`, 'a', 'b')).toBe('commit')
+    expect(headMove(`git pull && ${C} -am x`, 'a', 'b')).toBe('other')
+    expect(headMove('git pull', 'a', 'b')).toBe('other')
+    expect(headMove(`${C} -m first`, undefined, 'b')).toBe('other') // the first commit
+    expect(headMove('git -C /r am < fix.patch', 'a', 'b')).toBe('other')
+    // Other work brought in with HEAD where it was.
+    expect(headMove('git stash pop', 'a', 'a')).toBe('other')
+    expect(headMove('git checkout main -- src/a.ts', 'a', 'a')).toBe('other')
+    // An alias, a quoted folder with a space, `gh pr checkout`: not read as only a commit.
+    expect(headMove(`git co main && ${C} -am x`, 'a', 'b')).toBe('other')
+    expect(headMove(`git -C "/a b" pull && ${C} -am x`, 'a', 'b')).toBe('other')
+    expect(headMove(`gh pr checkout 5 && ${C} -am x`, 'a', 'b')).toBe('other')
+    // A long line of options is read word by word, never by a pattern that could take exponential time.
+    const long = `git ${'-C -C '.repeat(5_000)}x`
+    const t0 = Date.now()
+    expect(headMove(long, 'a', 'b')).toBe('other')
+    expect(Date.now() - t0 < 1_000).toBe(true)
+  })
+
+  test('the git commands of a line are found after git\'s own options, never in a command\'s options', () => {
+    expect(gitSubcommands(`cd /r && git -C /r -c a=b --no-pager --git-dir x/.git ${C.slice(4)} -am x; /usr/bin/git pull`)).toEqual(['commit', 'pull'])
+    expect(gitSubcommands('git -C "C:/my repo" status')).toEqual(['status'])
+    expect(gitSubcommands('echo digit && gitk')).toEqual([])
+  })
+
+  test('paths are compared as the platform reads them: slashes, Git Bash drives, `.` and `..` steps, case on Windows', () => {
+    expect(normalPath('/c/Work//Repo/./src/../a.ts', true)).toBe('c:/work/repo/a.ts')
+    expect(normalPath('C:\\Work\\Repo\\a.ts', true, false)).toBe('C:/Work/Repo/a.ts')
+    expect(normalPath('/home/u/./x/../a.py', false)).toBe('/home/u/a.py')
+    expect(relativeTo('C:/R', 'c:/r//src/a.ts', true)).toBe('src/a.ts')
+    expect(relativeTo('C:/R', 'C:/R/../x.ts', true)).toBe(undefined)
+    expect(relativeTo('C:/R', '/c/R/sub/b.py', true)).toBe('sub/b.py')
+    expect(relativeTo('/r', '/R/a.py', false)).toBe(undefined)
+    // A network path keeps its two slashes; a `..` above a root is dropped, as the system does.
+    expect(normalPath('\\\\srv\\share\\repo\\a.ts', true, false)).toBe('//srv/share/repo/a.ts')
+    expect(isFullPath('\\\\srv\\share\\a.ts', true)).toBe(true)
+    expect(normalPath('C:/../a.ts', true, false)).toBe('C:/a.ts')
+    expect(normalPath('/../a.py', false)).toBe('/a.py')
+    expect(normalPath('//home/u/a.py', false)).toBe('/home/u/a.py') // `//` is a network path on Windows only
+    expect(relativeTo('C:', 'C:/a.ts', true)).toBe('a.ts')
+    // A file of a repository nested in another goes to the inner one.
+    expect(repoFor(['C:/R', 'C:/R/vendor/lib'], 'C:/R/vendor/lib/a.ts', true)).toBe('C:/R/vendor/lib')
+  })
+
+  test('the comparison counts code files only, by their place in the repository, and nothing under .claude on either side', () => {
+    const isCode = (p: string) => /\.(?:ts|py)$/.test(p) && !/(^|\/)build\//.test(p)
+    // A repository inside a `build` folder still has code.
+    const r = compareWithGuess('C:/build/R', ['src/A.ts', 'run.log', '.claude/x.py', 'new.py'], ['c:\\build\\r\\src\\a.ts', 'C:/build/R/b.ts', 'C:/build/R/.claude/y.py'], true, isCode)
+    expect(r).toEqual({ gitOnly: ['C:/build/R/new.py'], guessOnly: ['C:/build/R/b.ts'] })
+  })
+
+  // Repositories at R (the session's) and O, as git and the disk show them, with the shadow record kept in
+  // `written` (its texts as written, and read back). A file's first look is before the command, each later
+  // one after: only src/dirty.ts's time changes.
+  function repoWorld(on: On, statuses: Record<string, string[]>, opts: { fail?: string; ignored?: string; diff?: string; record?: string; oneAtATime?: boolean } = {}) {
+    const R = 'C:/work/repo'
+    const O = 'C:/work/other'
+    mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP, LOCALAPPDATA: 'C:/Users/pat/AppData/Local' })
+    const files = [R, O].flatMap(root => ['src/dirty.ts', 'src/a.ts', 'src/new.py', 'logs/run.log', '.claude/x.py', 'src/b.ts', 'src/committed.ts'].map(f => `${root}/${f}`))
+    const looks = new Map<string, number>()
+    const norm = (raw: unknown) => String(raw).replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/)/, '')
+    const SHADOW = 'C:/Users/pat/.claude/review-guard/shadow.jsonl'
+    on('fs.stat', (_$, e) => {
+      const path = norm(e.path).replace(/\/\.$/, '')
+      if (path === R || path === O || path === TEMP) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: path } }
+      if (!files.includes(path)) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+      const n = (looks.get(path) ?? 0) + 1
+      looks.set(path, n)
+      return { value: { kind: 'file' as const, size: 10, mtimeMs: path.endsWith('dirty.ts') && n > 1 ? 2 : 1, isLink: false } }
+    })
+    on('session.cwd', () => ({ value: R }))
+    const seen = { calls: [] as string[], timeouts: [] as (number | undefined)[], written: [] as string[], logged: [] as string[] }
+    const record = () => seen.written.at(-1) ?? opts.record ?? ''
+    on('fs.read', (_$, e) => {
+      if (norm(e.path) === SHADOW) return { value: record() }
+      if (files.includes(norm(e.path))) return { value: 'x = 1' }
+      throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+    })
+    on('fs.exists', (_$, e) => ({ value: norm(e.path) === SHADOW && record() !== '' }))
+    on('fs.write', (_$, e) => {
+      if (norm(e.path) === SHADOW) seen.written.push(e.text)
+      return { value: undefined }
+    })
+    on('process.run', (_$, e) => {
+      const line = e.argv.join(' ')
+      seen.calls.push(line)
+      seen.timeouts.push(e.init?.timeoutMs)
+      const ok = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+      const root = line.includes(O) ? O : R
+      if (line.includes('rev-parse --show-toplevel')) return ok(`${root}\n`)
+      if (line.includes('get-regexp')) return ok('', 1)
+      if (line.includes(' status ')) {
+        if (opts.fail) return ok('', 128, `fatal: ${opts.fail}`)
+        return ok(statuses[root]?.shift() ?? '')
+      }
+      if (line.includes('check-ignore')) {
+        const names = String(e.init?.stdin ?? '').split('\0').filter(n => n !== '')
+        // As for a name in a submodule: git refuses the whole call.
+        if (opts.oneAtATime && names.length > 1) return ok('', 128, 'fatal: Pathspec is in submodule')
+        const hits = (opts.ignored ?? '').split('\0').filter(n => names.includes(n))
+        return ok(hits.map(h => `${h}\0`).join(''), hits.length > 0 ? 0 : 1)
+      }
+      if (line.includes(' diff ')) return ok(opts.diff ?? '')
+      return ok('')
+    })
+    on('ui.log', (_$, e) => {
+      seen.logged.push(String(e.text))
+      return { value: undefined }
+    })
+    const lines = () => record().trim().split('\n').filter(l => l !== '').map(l => JSON.parse(l))
+    return { R, O, seen, lines }
+  }
+
+  test('a command the guess cannot be sure of is looked at with git, and the record says where the two differ; the review is unchanged', async ($, on) => {
+    const before = status('h', rec('.M', 'src/dirty.ts'), rec('.M', 'src/a.ts'))
+    const after = status('h', rec('.M', 'src/dirty.ts'), rec('.M', 'src/a.ts'), '? src/new.py', '? logs/run.log', '? .claude/x.py')
+    const { R, seen, lines } = repoWorld(on, { 'C:/work/repo': [before, after] }, { ignored: 'src/b.ts\0' })
+    const { stop } = cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix && sed -i s/a/b/ src/b.ts` })
+    const prompt = (await stop()) ?? ''
+    // The review is the guess's: b.ts, not what only git saw.
+    expect([prompt.includes(`${R}/src/b.ts`), prompt.includes('src/a.ts'), prompt.includes('new.py')]).toEqual([true, false, false])
+    const list = (...paths: string[]) => ({ count: paths.length, paths })
+    expect(lines().at(-1)?.repos).toEqual([{ repo: R, agree: false, gitOnly: list(`${R}/src/dirty.ts`, `${R}/src/new.py`), guessOnly: list(), ignored: list(`${R}/src/b.ts`) }])
+    expect(lines().at(-1)?.unplaced).toBe(0)
+    // Every git run the look makes is held to its short limit, the filter check included.
+    const gitRuns = seen.timeouts.filter((_t, i) => seen.calls[i]?.startsWith('git '))
+    expect(gitRuns.length > 0 && gitRuns.every(t => t !== undefined && t <= GIT_TIMEOUT_MS)).toBe(true)
+  })
+
+  test('a commit adds what it took in that the command wrote, not files changed before it; a pull is not compared', async ($, on) => {
+    const { R, lines } = repoWorld(on, { 'C:/work/repo': [status('a', rec('.M', 'src/a.ts')), status('b'), status('b'), status('c')] }, { diff: 'src/a.ts\0src/committed.ts\0' })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && git add -A && ${C} -qm x` })
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && git pull` })
+    const [committed, pulled] = lines().slice(-2).map(l => l.repos)
+    expect(committed?.[0]?.gitOnly?.paths).toEqual([`${R}/src/committed.ts`])
+    expect(pulled?.[0]?.skipped).toContain('moves HEAD')
+  })
+
+  test('a cd into another repository looks at both, and each guessed name is compared in its own', async ($, on) => {
+    const { R, O, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h')], 'C:/work/other': [status('h'), status('h', rec('.M', 'src/b.ts'))] })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${O}" && npm run fix && sed -i s/a/b/ src/b.ts` })
+    const repos = lines().at(-1)?.repos ?? []
+    expect(repos.map((r: { repo: string; agree: boolean }) => [r.repo, r.agree])).toEqual([[R, true], [O, true]])
+  })
+
+  test('a guessed name outside the repository or with a `..` step loses no record; a name the guess could not place is only counted', async ($, on) => {
+    const { R, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h'), status('h'), status('h')] })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix && sed -i s/a/b/ /tmp/x.py ../x.ts` })
+    expect(lines().at(-1)?.repos?.[0]?.agree).toBe(true)
+    // A second cd the guess can't follow: its relative name is not compared against the session's folder.
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && cd sub && npm run fix && sed -i s/a/b/ lib.py` })
+    expect([lines().at(-1)?.repos?.[0]?.agree, lines().at(-1)?.unplaced]).toEqual([true, 1])
+  })
+
+  test('when git refuses to say which of several names it ignores, each is asked on its own', async ($, on) => {
+    const { R, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h')] }, { ignored: 'src/b.ts\0', oneAtATime: true })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix && sed -i s/a/b/ src/b.ts src/a.ts` })
+    const repo = lines().at(-1)?.repos?.[0]
+    expect([repo?.ignored?.paths, repo?.guessOnly?.paths]).toEqual([[`${R}/src/b.ts`], [`${R}/src/a.ts`]])
+  })
+
+  test('a commit beside a script or tool that may pull is not compared; a background command marks later records', async ($, on) => {
+    const { R, lines } = repoWorld(on, { 'C:/work/repo': [status('a'), status('b'), status('b'), status('b')] }, { diff: 'src/committed.ts\0' })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run update && ${C} -am x` })
+    expect(lines().at(-1)?.repos?.[0]?.skipped).toContain('moves HEAD')
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run watch`, run_in_background: true })
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix` })
+    expect(lines().at(-1)?.othersWriting).toBe(true)
+  })
+
+  test('PowerShell is looked at too', async ($, on) => {
+    const { R, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h')] })
+    cycle($, on)
+    await $.tool.call({ tool: 'PowerShell', command: `Set-Location "${R}"; npx prettier --write .` })
+    expect(lines().at(-1)?.shell).toBe('powershell')
+  })
+
+  test('plain commands and background ones are not looked at: no git runs', async ($, on) => {
+    const { R, seen } = repoWorld(on, {})
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `ls ${R} && sed -i s/a/b/ ${R}/src/b.ts && echo "make sure"` })
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix`, run_in_background: true })
+    expect(seen.calls.filter(c => c.startsWith('git '))).toEqual([])
+  })
+
+  test('a look that fails is logged once for its reason and recorded each time, and the review goes on', async ($, on) => {
+    const { R, seen, lines } = repoWorld(on, {}, { fail: 'git timed out (shadow test)' })
+    const { stop } = cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix && sed -i s/a/b/ src/b.ts` })
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix` })
+    expect((await stop())?.includes(`${R}/src/b.ts`)).toBe(true)
+    expect(seen.logged.filter(l => l.includes('(shadow test)')).length).toBe(1)
+    expect(lines().filter(l => String(l.failed ?? '').includes('(shadow test)')).length).toBe(2)
+  })
+
+  test('the record keeps only its last megabyte, so it can always be read back', async ($, on) => {
+    const old = `${JSON.stringify({ at: 'x', pad: 'y'.repeat(1_000) })}\n`.repeat(3_000) // about 3 MB
+    const { R, seen, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h')] }, { record: old })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix` })
+    expect((seen.written.at(-1)?.length ?? 0) <= 1024 * 1024).toBe(true)
+    expect(lines().at(-1)?.shell).toBe('bash')
   })
 })

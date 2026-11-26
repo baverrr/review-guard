@@ -160,3 +160,42 @@ If it is still not valid, or of the wrong shape, it is logged (every time, as ar
 started again. A history another version of the mod wrote is left alone, and that review is not recorded
 (the log says so). Two sessions writing at the same moment may lose one entry, which only means a churning
 file is noticed a review later.
+
+## Checking shell writes against git (trial)
+
+A shell command's writes are found by reading its text, which has to guess where each name lands. For a
+command whose writes that guess can't be sure of, review-guard also asks git. That covers a command that
+changes folder, runs a script, runs a writing tool (a formatter, `npm run`, `make`), commits, or in
+PowerShell calls .NET. It takes `git status` just before the command runs and again after, in two
+repositories: the session folder's, and the one a leading `cd` goes into.
+
+**What counts as written:**
+- a file that is newly changed or untracked;
+- a file that was changed already and now looks different (its time, its size, or for a small file its
+  text).
+
+**What doesn't count:**
+- staging alone (`git add`, `git reset`);
+- a deleted file;
+- a file changed before the command that a commit in it only took in.
+
+**What isn't compared:**
+- a repository where the command ran a git command other than ones that only commit, read, or talk to a
+  remote (`add`, `commit`, `push`, `fetch`, `status`, `diff`, `log` and the like): a pull, a checkout,
+  `stash pop`, `apply` or an alias may move `HEAD` or bring in other work; `gh pr checkout` too;
+- a relative name the guess couldn't place (it is only counted);
+- anything that isn't a code file (the same filter as the guess), and anything under `.claude/`.
+
+Each compared command adds a line to `~/.claude/review-guard/shadow.jsonl`. The file keeps its last
+megabyte, so it can always be read back. Each line has, per repository, up to 50 of the files only git
+saw, of the files only the guess named, and of the guessed ones git ignores (git never lists those), each
+with its count. It also says when other edits or commands were running at the same time, since their files
+show as this command's.
+
+**When a look fails:** each git run is limited to 1.5 seconds, the look before the command and the one
+after it to 4 seconds each, and the paths to 2,000. Small files are read for their text up to 4 MB in all. A look that fails is recorded too, and each reason is logged once. One
+repository that fails doesn't lose the other's comparison.
+
+Nothing here changes what is reviewed. Once the record shows git's list is right, it will replace the
+guess inside repositories (`docs/shell-writes-redesign.md`). Plain commands, and ones run in the
+background, are never looked at.

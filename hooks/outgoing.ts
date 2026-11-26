@@ -281,8 +281,8 @@ const READS_WORK_TREE = new Set(['diff', 'status'])
  * `.process`): `git diff` and `git status` run a file's clean filter, a command the repository chooses,
  * to compare it. Throws when the names can't be read, or a name can't be written as a `-c` option.
  */
-async function noFilters(host: Host, base: string[]): Promise<string[]> {
-  const r = await host.run([...base, 'config', '--name-only', '--get-regexp', '^filter\\..+\\.(clean|smudge|process)$'], { timeoutMs: 30_000 })
+async function noFilters(host: Host, base: string[], timeoutMs = 30_000): Promise<string[]> {
+  const r = await host.run([...base, 'config', '--name-only', '--get-regexp', '^filter\\..+\\.(clean|smudge|process)$'], { timeoutMs })
   if (r.exitCode === 1 && !r.stdout.trim()) return [] // no filter driver set
   if (r.exitCode !== 0) throw new Error(`git config failed (exit ${r.exitCode}): ${r.stderr.trim().slice(0, 200) || 'no message'}`)
   const names = new Set(r.stdout.split('\n').flatMap(k => /^filter\.(.+)\.(?:clean|smudge|process)$/i.exec(k.trim())?.[1] ?? []))
@@ -290,11 +290,14 @@ async function noFilters(host: Host, base: string[]): Promise<string[]> {
   return [...names].flatMap(n => ['clean', 'smudge', 'process'].flatMap(k => ['-c', `filter.${n}.${k}=`]).concat(['-c', `filter.${n}.required=false`]))
 }
 
-/** Runs git with what it must not do turned off (see SAFE_GIT and noFilters). */
-export async function git(host: Host, dir: string | undefined, args: string[], timeoutMs = 60_000) {
+/**
+ * Runs git with what it must not do turned off (see SAFE_GIT and noFilters), with `stdin` as its input when
+ * given. `timeoutMs` bounds each of its runs (a `diff` or `status` is two: the filter check, then itself).
+ */
+export async function git(host: Host, dir: string | undefined, args: string[], timeoutMs = 60_000, stdin?: string) {
   const base = dir ? ['git', '-C', dir, ...SAFE_GIT] : ['git', ...SAFE_GIT]
-  const filters = READS_WORK_TREE.has(args[0] ?? '') ? await noFilters(host, base) : []
-  return host.run([...base, ...filters, ...args], { timeoutMs })
+  const filters = READS_WORK_TREE.has(args[0] ?? '') ? await noFilters(host, base, Math.min(timeoutMs, 30_000)) : []
+  return host.run([...base, ...filters, ...args], stdin === undefined ? { timeoutMs } : { stdin, timeoutMs })
 }
 
 /** The repository's GitHub remote URLs, or [] when it has none (then nothing goes to GitHub). */

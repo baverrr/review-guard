@@ -1,4 +1,4 @@
-// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: e55ce173b8800d8e1fdc85e907de03c97624b52caa548a1f79eaa6665c5769e8 built-sha256: 29f49c8f65115c0aee7a94ee46d713f639a7a0b79b52fc941dbd8a8bf95d47fc
+// Generated from hooks/outgoing.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: b409c2da2ace65da2e02a68feeb1ec29697a3331b426f8817432f924a1f82ef0 built-sha256: c8421c612662253135f38b8d7e4c2195b05199a3310fc37e7b1e26b3ea6ff0e4
 // review-guard's check of what leaves this machine: what a git commit or push would send, and the
 // user's config of personal terms. It runs git and gitleaks through `Host`, so the hooks (through the
 // engine's `$`) and the MCP server (through Node) run the same code.
@@ -282,8 +282,8 @@ const READS_WORK_TREE = new Set(['diff', 'status'])
  * `.process`): `git diff` and `git status` run a file's clean filter, a command the repository chooses,
  * to compare it. Throws when the names can't be read, or a name can't be written as a `-c` option.
  */
-async function noFilters(host      , base          )                    {
-  const r = await host.run([...base, 'config', '--name-only', '--get-regexp', '^filter\\..+\\.(clean|smudge|process)$'], { timeoutMs: 30_000 })
+async function noFilters(host      , base          , timeoutMs = 30_000)                    {
+  const r = await host.run([...base, 'config', '--name-only', '--get-regexp', '^filter\\..+\\.(clean|smudge|process)$'], { timeoutMs })
   if (r.exitCode === 1 && !r.stdout.trim()) return [] // no filter driver set
   if (r.exitCode !== 0) throw new Error(`git config failed (exit ${r.exitCode}): ${r.stderr.trim().slice(0, 200) || 'no message'}`)
   const names = new Set(r.stdout.split('\n').flatMap(k => /^filter\.(.+)\.(?:clean|smudge|process)$/i.exec(k.trim())?.[1] ?? []))
@@ -291,11 +291,14 @@ async function noFilters(host      , base          )                    {
   return [...names].flatMap(n => ['clean', 'smudge', 'process'].flatMap(k => ['-c', `filter.${n}.${k}=`]).concat(['-c', `filter.${n}.required=false`]))
 }
 
-/** Runs git with what it must not do turned off (see SAFE_GIT and noFilters). */
-export async function git(host      , dir                    , args          , timeoutMs = 60_000) {
+/**
+ * Runs git with what it must not do turned off (see SAFE_GIT and noFilters), with `stdin` as its input when
+ * given. `timeoutMs` bounds each of its runs (a `diff` or `status` is two: the filter check, then itself).
+ */
+export async function git(host      , dir                    , args          , timeoutMs = 60_000, stdin         ) {
   const base = dir ? ['git', '-C', dir, ...SAFE_GIT] : ['git', ...SAFE_GIT]
-  const filters = READS_WORK_TREE.has(args[0] ?? '') ? await noFilters(host, base) : []
-  return host.run([...base, ...filters, ...args], { timeoutMs })
+  const filters = READS_WORK_TREE.has(args[0] ?? '') ? await noFilters(host, base, Math.min(timeoutMs, 30_000)) : []
+  return host.run([...base, ...filters, ...args], stdin === undefined ? { timeoutMs } : { stdin, timeoutMs })
 }
 
 /** The repository's GitHub remote URLs, or [] when it has none (then nothing goes to GitHub). */
