@@ -2372,7 +2372,7 @@ type FileState = { mtimeMs: number; size: number; text: string }
  * fields changed after it: the command changed it. A path in `links` is a symbolic link. Any other path is
  * missing. Returns the status lines shown.
  */
-function disk(on: On, files: Record<string, number>, changes: Record<string, Partial<FileState>> = {}, links: string[] = [], dirs: string[] = []) {
+function disk(on: On, files: Record<string, number>, changes: Record<string, Partial<FileState>> = {}, links: string[] = [], dirs: string[] = [], realPaths: Record<string, string> = {}, locked: string[] = []) {
   mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP, LOCALAPPDATA: 'C:/Users/pat/AppData/Local' })
   // A file is "after" once it has been looked at: its first stat (and read) are the snapshot before.
   const looked = new Set<string>()
@@ -2386,9 +2386,12 @@ function disk(on: On, files: Record<string, number>, changes: Record<string, Par
     return first || !(path in changes) ? base : { ...base, ...changes[path] }
   }
   on('fs.stat', (_$, e) => {
-    const path = norm(e.path)
+    // `folder/.` is the folder, reached only with the right to pass through it (none for a `locked` one).
+    const inner = norm(e.path).endsWith('/.') ? norm(e.path).slice(0, -2) : undefined
+    if (inner !== undefined && locked.includes(inner)) throw Object.assign(new Error(`EACCES: ${e.path}`), { code: 'EACCES' })
+    const path = inner ?? norm(e.path)
     // A folder, as the engine answers (`dir`), with where it really is when asked.
-    if (dirs.includes(path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: path } }
+    if (dirs.includes(path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: path in realPaths, realPath: realPaths[path] ?? path } }
     if (path === TEMP) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: TEMP } }
     const s = state(path, !looked.has(path))
     if (s === undefined) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
@@ -2635,6 +2638,84 @@ test('writes after a cd into the scratch folder by its variable are scratch, if 
     expect([command, (await stop())?.includes('body.html')]).toEqual([command, true])
     await stop(true)
   }
+})
+
+test('names written after a cd into another folder are reviewed as that folder\'s files, not the session\'s', async ($, on) => {
+  const R = 'C:/Users/pat/Tools/repo'
+  disk(on, {}, {}, [], [R, 'C:/Users/pat/Tools/locked'], {}, ['C:/Users/pat/Tools/locked'])
+  const { stop } = cycle($, on)
+  // The session is in C:/proj; the command works in another repo, as this session's own commands did.
+  for (const [command, file] of [
+    [`cd "${R}" && sed -i 's/a/b/' hooks/churn.ts`, `${R}/hooks/churn.ts`],
+    [`cd ${R} && python - <<'PY'\nopen('tests/t.test.ts','w').write('x')\nPY`, `${R}/tests/t.test.ts`],
+    [`cd "${R}" && sed -i 's/a/b/' ./app.py`, `${R}/app.py`],
+    // The folder is there and can be read, so the cd can't fail: a write after `;` lands there too.
+    [`cd "${R}"; sed -i 's/a/b/' lib.py`, `${R}/lib.py`],
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    const prompt = (await stop()) ?? ''
+    expect([command, prompt.includes(file)]).toEqual([command, true])
+    await stop(true)
+  }
+  // A folder that is not there (the cd failed, the write landed in the session's folder) or can't be read
+  // (the cd may fail), a name with a `..` step or a drive, a cd piped on, or a change of folder after it
+  // (a program run with `cwd=` too): the name stays as written.
+  for (const [command, name] of [
+    ['cd "C:/Users/pat/Tools/gone" && sed -i s/a/b/ app.py', 'app.py'],
+    ['cd "C:/Users/pat/Tools/locked"; sed -i s/a/b/ app.py', 'app.py'],
+    [`cd "${R}" && sed -i s/a/b/ app.py && python -c "run(['make'], cwd='C:/proj')"`, 'app.py'],
+    [`cd "${R}" && sed -i s/a/b/ app.py && python -c "run(['make'], **{'cwd': 'C:/proj'})"`, 'app.py'],
+    [`cd "${R}" && sed -i s/a/b/ app.py && node -e "execSync('make', { cwd })"`, 'app.py'],
+    [`cd "${R}" && sed -i s/a/b/ ../other/app.py`, '../other/app.py'],
+    [`cd "${R}" && sed -i s/a/b/ D:app.py`, 'D:app.py'],
+    [`cd "${R}" | sed -i s/a/b/ app.py`, 'app.py'],
+    [`cd "${R}" && git -C C:/proj apply x.diff && sed -i s/a/b/ app.py`, 'app.py'],
+  ]) {
+    await $.tool.call({ tool: 'Bash', command })
+    const prompt = (await stop()) ?? ''
+    // Nothing placed under the folder at all (`R/../other/app.py` and `R/D:app.py` would still hold the name).
+    expect([command, prompt.includes(name), prompt.includes(`${R}/`)]).toEqual([command, true, false])
+    await stop(true)
+  }
+})
+
+test('in PowerShell a Set-Location places cmdlet writes there, but never .NET ones, which keep the process folder', async ($, on) => {
+  const R = 'C:/Users/pat/Tools/repo'
+  disk(on, {}, {}, [], [R])
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'PowerShell', command: `Set-Location "${R}"; Set-Content -Path hooks/a.ps1 -Value x` } as never)
+  expect(((await stop()) ?? '').includes(`${R}/hooks/a.ps1`)).toBe(true)
+  await stop(true)
+  // A backslash outside quotes is not read here (a shell may read it otherwise): the name stays as written.
+  await $.tool.call({ tool: 'PowerShell', command: `Set-Location "${R}" && Set-Content -Path hooks\\b.ps1 -Value x` } as never)
+  const kept = (await stop()) ?? ''
+  expect([kept.includes('b.ps1'), kept.includes(`${R}/hooks`)]).toEqual([true, false])
+  await stop(true)
+  await $.tool.call({ tool: 'PowerShell', command: `Set-Location "${R}" && [IO.File]::WriteAllText('a.py', 'x')` } as never)
+  const prompt = (await stop()) ?? ''
+  expect([prompt.includes('a.py'), prompt.includes(`${R}/a.py`)]).toEqual([true, false])
+})
+
+test('a cd into a folder spelled as scratch that leads out of it places nothing, so nothing is dropped as scratch', async ($, on) => {
+  const S = `${TEMP}/claude/x/scratchpad`
+  disk(on, {}, {}, [], [S], { [S]: 'C:/proj' })
+  const { stop } = cycle($, on)
+  // By its variable: a full path with `Local/Temp` in it is refused anyway (`startFolder` reads it as setting TEMP).
+  const cd = 'cd "$LOCALAPPDATA/Temp/claude/x/scratchpad"'
+  for (const command of [`${cd} && render > a.py`, `${cd} && render > sub/a.py`]) {
+    await $.tool.call({ tool: 'Bash', command })
+    const prompt = (await stop()) ?? ''
+    expect([command, prompt.includes('a.py'), prompt.includes(`${S}/`)]).toEqual([command, true, false])
+    await stop(true)
+  }
+})
+
+test('in the scratch folder a name with folders is reviewed under its full name, never left out as scratch', async ($, on) => {
+  const S = `${TEMP}/claude/x/scratchpad`
+  disk(on, {}, {}, [], [S])
+  const { stop } = cycle($, on)
+  await $.tool.call({ tool: 'Bash', command: 'cd "$LOCALAPPDATA/Temp/claude/x/scratchpad" && render > link/a.py' })
+  expect(((await stop()) ?? '').includes(`${S}/link/a.py`)).toBe(true)
 })
 
 test('the scratch folder must be there before the command, not made by it; and never for a background run', async ($, on) => {

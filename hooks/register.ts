@@ -960,19 +960,27 @@ async function scratchTargets($: EngineInterface): Promise<(target: string) => b
 }
 
 /**
- * Before a shell command runs: the scratch folder it starts in, when it surely does. That is a command
- * whose first part is `cd` into Claude's scratch folder (`cd "$LOCALAPPDATA/Temp/claude/.../scratchpad" &&
- * ... > body.html`, `startFolder`), where that folder is already there (so the cd can't fail and leave a
- * later write in the project, even after a `;`, and the command can't make it first), the cd's word is
- * one the shell expands as `startFolder` reads it (no `$` or `~` in single quotes, no `~` in double
- * quotes), and nothing after it changes folder in any way `CHANGES_FOLDER` knows (`os.chdir`, `git -C`,
- * `--cwd`, another cd). Undefined otherwise, for a command run in the background, or on any failure: then
- * every name stays as written. Never throws.
+ * Before a shell command runs: the folder it starts in, when it surely does, and whether that is Claude's
+ * scratch folder. That is a command whose first part is `cd` into a full folder (`cd "C:/repo" && ... >
+ * a.py`, `cd "$LOCALAPPDATA/Temp/claude/.../scratchpad" && ... > body.html`, `startFolder`), where that
+ * folder is already there and can be entered (so the cd can't fail and leave a later write in the folder
+ * the shell was in, even after a `;`, and the command can't make it first), the cd's word is one the shell expands as
+ * `startFolder` reads it (no `$` or `~` in single quotes, no `~` in double quotes), and nothing after it
+ * changes folder in any way `CHANGES_FOLDER` knows (`os.chdir`, `git -C`, `--cwd`, another cd). `scratch`
+ * is whether the folder is Claude's scratch folder both as written and with every link followed.
+ * Undefined otherwise, for a command run in the background, or on any failure: then every name stays as
+ * written. Never throws.
  */
-let scratchStartFailSaid = false // a scratch check that threw is logged once per load of the module
+let startDirFailSaid = false // a start-folder check that threw is logged once per load of the module
 
-async function scratchStart($: EngineInterface, command: string, powershell: boolean, background: boolean): Promise<string | undefined> {
+/** The folder a shell command surely starts in (`startDir`), whether it is scratch, and how its paths read. */
+type Start = { base: string; scratch: boolean; windows: boolean }
+
+async function startDir($: EngineInterface, command: string, powershell: boolean, background: boolean): Promise<Start | undefined> {
   if (background) return undefined
+  // .NET calls in PowerShell (`[IO.File]::WriteAllText('a.py', ...)`) read a relative name against the
+  // process's own folder, which a Set-Location does not move: such a name is not in the start folder.
+  if (powershell && /\[(?:System\.)?IO\.|WriteAll(?:Text|Lines|Bytes)|Environment\]::CurrentDirectory/i.test(command)) return undefined
   try {
     const paths = await pathsHere($)
     const base = startFolder(command, paths, powershell)
@@ -996,29 +1004,57 @@ async function scratchStart($: EngineInterface, command: string, powershell: boo
     const rules = rulesFor(powershell ? 'powershell' : 'bash', paths.windows)
     const stat = await real(base)
     if (stat?.kind !== 'dir' || stat.realPath === undefined) return undefined
-    return inScratch(`${base}/x`, roots, rules) && inScratch(`${stat.realPath.replace(/\\/g, '/')}/x`, roots, rules) ? base : undefined
+    // A folder the cd can't enter (no right to pass through it, which listing does not need on Linux):
+    // then a write after a `;` or a new line would land in the folder the shell was in. Reaching `base/.`
+    // needs that right, and reads no entries.
+    if (!(await Promise.resolve().then(() => $.fs.stat(`${base}/.`)).then(() => true, () => false))) return undefined
+    // Scratch as written and as it really is, or neither: a folder spelled as scratch that leads out of it
+    // (or one whose real place can't be told apart) places nothing, so its writes are never dropped as scratch.
+    const asWritten = inScratch(`${base}/x`, roots, rules)
+    if (asWritten !== inScratch(`${stat.realPath.replace(/\\/g, '/')}/x`, roots, rules)) return undefined
+    return { base, scratch: asWritten, windows: paths.windows }
   } catch (err) {
-    if (!scratchStartFailSaid) {
-      scratchStartFailSaid = true
-      logLine($, `review-guard: could not tell whether a command starts in the scratch folder (${whyOf(err)}), so its files are reviewed`)
+    if (!startDirFailSaid) {
+      startDirFailSaid = true
+      logLine($, `review-guard: could not tell which folder a command starts in (${whyOf(err)}), so its files are reviewed under the names it wrote`)
     }
     return undefined
   }
 }
 
 /**
- * The names a command wrote, its plain ones placed in `scratchBase` (`scratchStart`), so `remember` leaves
- * them out as scratch and says so. Only a bare file name (`body.html`, `./notes.py`): one with a folder in
- * it may go through a link out of the scratch folder (`link/a.py`), and one with a `:` names a drive or a
- * provider (`D:a.ts` is in D's own current folder, `FileSystem::D:/x`); those, and full names, stay as written.
+ * The names a command wrote, its relative ones placed in the folder it starts in (`startDir`), so the
+ * review and the project's history name the file there, not one in the session's folder. In the scratch
+ * folder a bare file name (`body.html`, `./notes.py`) goes in `names`, so `remember` leaves it out as
+ * scratch and says so; one with a folder in it may go through a link out of the scratch folder
+ * (`link/a.py`), so it goes in `keep`, to be reviewed. Outside scratch a name with folders (`hooks/a.ts`)
+ * is placed too, and goes in `keep` like every name placed there, so it is never left out as scratch. Never a
+ * name with a `:` (`D:a.ts` is in D's own current folder, `FileSystem::D:/x`), a `.` or `..` step after a
+ * leading `./` (through a link `..` may be elsewhere), a `~` or `$` (not filled in here), or off Windows a
+ * `\`; those, and full names, stay as written.
  */
-function placeInScratch(names: string[], scratchBase: string | undefined): string[] {
-  if (scratchBase === undefined) return names
-  const bare = (p: string) => /^[^\\/:~]+$/.test(p) && p !== '..' && p !== '.'
-  return names.map(p => {
-    const name = p.replace(/^(?:\.[\\/])+/, '')
-    return bare(name) ? `${scratchBase}/${name}` : p
-  })
+function placeInStart(names: string[], start: Start | undefined): { names: string[]; keep: string[] } {
+  if (start === undefined) return { names, keep: [] }
+  // A `\` divides folders only on Windows; elsewhere it is part of a file name, and such a name stays as written.
+  const sep = start.windows ? /[\\/]/ : /\//
+  const bare = (p: string) => /^[^\\/:~$]+$/.test(p) && p !== '..' && p !== '.'
+  const relative = (p: string) =>
+    /^[^\\/:~$][^:~$]*$/.test(p) && (start.windows || !p.includes('\\')) && !p.split(sep).some(part => part === '..' || part === '.' || part === '')
+  const lead = start.windows ? /^(?:\.[\\/])+/ : /^(?:\.\/)+/
+  const placed: string[] = []
+  const keep: string[] = []
+  for (const p of names) {
+    const name = p.replace(lead, '')
+    const full = `${start.base}/${start.windows ? name.replace(/\\/g, '/') : name}`
+    if (start.scratch && bare(name)) placed.push(full)
+    // In scratch, a name with folders may go through a link out of it (`link/a.py`): it is reviewed, under
+    // its name in the scratch folder, never left out as scratch.
+    // Outside scratch a placed name is kept too: through a folder of its own it may be spelled as scratch
+    // (`cd /tmp && ... claude/x/a.py`), and it is still the command's own write, to be reviewed.
+    else if (relative(name)) keep.push(full)
+    else placed.push(p)
+  }
+  return { names: placed, keep }
 }
 
 /**
@@ -1029,7 +1065,7 @@ function placeInScratch(names: string[], scratchBase: string | undefined): strin
  * What is left out is named on the status line, after `said` when the guard already put a line there.
  * Never throws: it only remembers.
  */
-async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string, scratchBase?: string): Promise<R> {
+async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string, start?: Start): Promise<R> {
   try {
     if (result.deny === undefined) {
       // A command that changes folder (`CHANGES_FOLDER`): its relative paths are not the session's. A shell
@@ -1057,9 +1093,12 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
           return new Set<string>()
         })
         : new Set<string>()
-      const kept = placeInScratch(written.filter(path => !onlyRun.has(path)), scratchBase)
+      const { names: kept, keep } = placeInStart(written.filter(path => !onlyRun.has(path)), start)
+      const lang = (path: string): [string, string] => [path, languageOf(path) ?? 'other code']
       // A scratch file named by a copy or move may be the source of a write into the project: keep it.
-      const scratch = await remember($, kept.map(path => [path, languageOf(path) ?? 'other code']), writer, COPIES.test(command), agentId, !CHANGES_FOLDER.test(command))
+      // The names to keep first: should that throw, nothing has been left out as scratch without a word.
+      await remember($, keep.map(lang), writer, true, agentId, !CHANGES_FOLDER.test(command))
+      const scratch = await remember($, kept.map(lang), writer, COPIES.test(command), agentId, !CHANGES_FOLDER.test(command))
       await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said, inScript)
     }
   } catch (err) {
@@ -1714,8 +1753,8 @@ export const register: Register = on => {
     // The scripts this command only runs, as they are before it runs, to compare afterwards.
     const powershell = e.tool === 'PowerShell'
     const before = await snapshotRunScripts($, e.command, e.run_in_background === true, powershell)
-    // The scratch folder it surely starts in, checked before it runs (`scratchStart`).
-    const scratchBase = await scratchStart($, e.command, powershell, e.run_in_background === true)
+    // The folder it surely starts in, and whether that is scratch, checked before it runs (`startDir`).
+    const start = await startDir($, e.command, powershell, e.run_in_background === true)
     // What ssh runs on another machine is left alone (the user's choice): it cannot be checked from here.
     const local = localPart(e.command)
     const action = gitAction(e.command)
@@ -1726,7 +1765,7 @@ export const register: Register = on => {
         said = 'review-guard: a git commit or push sent over SSH runs on another machine and was NOT checked here'
         say($, said)
       }
-      return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId, scratchBase)
+      return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId, start)
     }
     let remotes: string[] = []
     let toGitHub = false
@@ -1737,7 +1776,7 @@ export const register: Register = on => {
       // The command itself can name GitHub: `gh repo create`, a push to a URL, a remote added just before the push.
       toGitHub = remotes.length > 0 || /\bgh\s+repo\s+create\b|github\.com/i.test(local)
     }
-    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell, undefined, e.agentId, scratchBase)
+    if (!toGitHub && !gh) return rememberShellWrites($, await next(e), e.command, before, powershell, undefined, e.agentId, start)
     const { config, note } = await loadConfig(hostOf($))
     const notes = note ? [note] : []
     const found: Finding[] = []
@@ -1751,7 +1790,7 @@ export const register: Register = on => {
       ? `review-guard: ${what} checked, but ${notes.join('; ')}`
       : `review-guard: ${what} checked, nothing personal or secret found`
     say($, said)
-    return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId, scratchBase)
+    return rememberShellWrites($, await next(e), e.command, before, powershell, said, e.agentId, start)
   }).catch(($, e, next) =>
     next.called ? next(e) : {
       deny: `review-guard could not check this command, so it stopped it (${whyOf(next.error)}). If the command names ` +

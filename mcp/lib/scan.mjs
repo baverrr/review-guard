@@ -1,4 +1,4 @@
-// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 51bb80161a3f9ff55316bbd853164fdaf6e03d0fc0f1d8a7c5963d70145fac1c built-sha256: fcd847cd3a31468c923ba421acb3e0cd4a5fe946a221cb86a99e4716b8251a6b
+// Generated from hooks/scan.ts by scripts/build-mcp.mjs. Do not edit. source-sha256: 950dd2a80f424acdea72aa29a126d9145f02c39961807b6cf5b55bfa723d8dac built-sha256: 42dcc3cc82d4b7967c07d5363e687a280e0170fc0fc911557eff5661531c260e
 // review-guard's scanner: pure functions over text, no engine calls, so they are easy to test.
 //
 // What it looks for in what is about to reach GitHub: keys and tokens, private keys, secret
@@ -1546,12 +1546,13 @@ const MOVES = new RegExp(MOVES_SOURCE, 'gi')
  * Whether a command may run something in another folder: a word above, a call that changes folder
  * (`os.chdir(`, `process.chdir(`), or an option or setting that names one (`git -C`, `make -Csub`,
  * `env --chdir`, `sudo -D`, `make --directory`, `pnpm --dir`, `-WorkingDirectory`, `CurrentDirectory`,
- * `--cwd`, `--prefix`, `--work-tree`). Used to tell when a command's relative paths are not surely the
+ * `--cwd`, `--prefix`, `--work-tree`, and `cwd=`, `cwd:`, `"cwd":` or `{ cwd }` as Python's subprocess
+ * and Node's child_process take it, and `os.fchdir(`). Used to tell when a command's relative paths are not surely the
  * session's; a false match only means more review.
  */
 export const CHANGES_FOLDER                                     = {
   test: command =>
-    new RegExp(String.raw`${MOVES_SOURCE}|\.chdir\s*\(|-WorkingDirectory\b|CurrentDirectory\b|--(?:cwd|prefix|work-tree|chdir|directory|dir)\b`, 'i').test(command)
+    new RegExp(String.raw`${MOVES_SOURCE}|\.chdir\s*\(|-WorkingDirectory\b|CurrentDirectory\b|--(?:cwd|prefix|work-tree|chdir|directory|dir)\b|\bcwd\b["']?\s*[=:]|\{\s*cwd\s*[,}]|\bf?chdir\s*\(`, 'i').test(command)
     // In their own case (`python -c` runs code), and joined to the folder only after the programs that
     // take it so: PowerShell's `-Command`, `-Confirm` and `-Destination` change no folder.
     || /(?:^|\s)-C\s|\b(?:git|make|tar)\b[^;&|\n]*\s-C\S|\bsudo\b[^;&|\n]*\s-D\s/.test(command),
@@ -1646,9 +1647,9 @@ const absoluteHere = (p        , paths       ) => (paths.windows ? /^[A-Za-z]:\/
  * it that moves the shell (`source` and `.` run a file in this shell; in Bash `c\d` is cd, and `chdir`
  * counts in PowerShell only). A cd that fails is not seen here, nor a folder change this does not know
  * (`os.chdir`, `git -C`): `runOnlyScripts` uses this only to find the file of a script the command names
- * as nothing but what runs, which the caller then compares before and after; `scratchStart` (register.ts),
- * which leaves writes out as scratch, checks that the folder is already there and refuses any change of
- * folder `CHANGES_FOLDER` knows. Undefined otherwise: for a command `readableOutside` won't read (a
+ * as nothing but what runs, which the caller then compares before and after; `startDir` (register.ts),
+ * which places the command's relative names in that folder (and leaves scratch ones out), checks that the
+ * folder is already there and refuses any change of folder `CHANGES_FOLDER` knows. Undefined otherwise: for a command `readableOutside` won't read (a
  * here-document split that is a guess, a backslash the shell would read otherwise, `$'...'`), one that
  * sets a temp-folder variable (a cautious refusal), detaches a part, sources or evals, spells cd another
  * way (`"c"d`), or has a substitution in the folder's name.

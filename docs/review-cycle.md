@@ -46,7 +46,7 @@ page says when that review counts as over, and what happens to the edits made wh
   are filled in as everywhere), writes its bare file names there (`body.html`, not `sub/a.py`, `D:a.ts` or
   `..`), so they are left out as scratch and named on the status line. Trusting those variables was the
   user's choice: a shell profile (or Git Bash's own, for `TMPDIR`) could set them otherwise. Only when:
-  the folder is already there before the command runs, and is Claude's scratch folder both as written and
+  the folder is already there before the command runs and can be entered, and is Claude's scratch folder both as written and
   with every link followed (so the cd can't fail, and a write after a `;` lands there too); the cd's word
   is one the shell expands as written (no `$` or `~` in single quotes, no `~` in double quotes, no
   unquoted variable holding a space); the cd is not piped on (`cd X | ...`, `cd X || ...`); nothing after
@@ -55,6 +55,18 @@ page says when that review counts as over, and what happens to the edits made wh
   background. Scratch names are still kept when the command copies or moves (`cp`, `mv`). The start
   folder is read as under "Scripts only run". (The rule for scratch scripts above is unchanged: there a
   variable is not filled in.)
+- **A cd into another folder.** Under the same conditions as above (the folder already there and enterable,
+  the cd's word expanded as written, the cd not piped on, nothing after it changes folder, a `cwd=` given
+  to a program included, not run in the background), a command that starts with `cd` into any other full
+  folder has its relative file names read in that folder (`cd C:/repo && sed -i ... hooks/a.ts` is
+  `C:/repo/hooks/a.ts`), so the review and the project's history name the real file. These are always
+  reviewed, never left out as scratch. A name with a `.` or `..` step after a leading `./`, a drive
+  (`D:a.ts`), a `~`, a `$`, or off Windows a `\` stays as written. In PowerShell, .NET calls
+  (`[IO.File]::WriteAllText`) keep the process's own folder, and a name with a `\` is read only in
+  quotes, which Set-Location does not move, so a
+  command with one places nothing. A folder spelled as scratch that leads out of it (a link) places
+  nothing either. A full path with `Local/Temp` in it is read as a command that sets `TEMP`, so it is not
+  trusted as a start folder; by its variable (`$LOCALAPPDATA/Temp/...`) it is.
 - **Scripts only run.** A script a command names only as what an interpreter runs (`python gen.py`,
   `node --test a.mjs` with exactly one file) and that is the same before and after the command is not
   reviewed. A command substitution (`$(...)` or backticks) runs in a subshell and does not stop this; a

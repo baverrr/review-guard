@@ -1545,12 +1545,13 @@ const MOVES = new RegExp(MOVES_SOURCE, 'gi')
  * Whether a command may run something in another folder: a word above, a call that changes folder
  * (`os.chdir(`, `process.chdir(`), or an option or setting that names one (`git -C`, `make -Csub`,
  * `env --chdir`, `sudo -D`, `make --directory`, `pnpm --dir`, `-WorkingDirectory`, `CurrentDirectory`,
- * `--cwd`, `--prefix`, `--work-tree`). Used to tell when a command's relative paths are not surely the
+ * `--cwd`, `--prefix`, `--work-tree`, and `cwd=`, `cwd:`, `"cwd":` or `{ cwd }` as Python's subprocess
+ * and Node's child_process take it, and `os.fchdir(`). Used to tell when a command's relative paths are not surely the
  * session's; a false match only means more review.
  */
 export const CHANGES_FOLDER: { test(command: string): boolean } = {
   test: command =>
-    new RegExp(String.raw`${MOVES_SOURCE}|\.chdir\s*\(|-WorkingDirectory\b|CurrentDirectory\b|--(?:cwd|prefix|work-tree|chdir|directory|dir)\b`, 'i').test(command)
+    new RegExp(String.raw`${MOVES_SOURCE}|\.chdir\s*\(|-WorkingDirectory\b|CurrentDirectory\b|--(?:cwd|prefix|work-tree|chdir|directory|dir)\b|\bcwd\b["']?\s*[=:]|\{\s*cwd\s*[,}]|\bf?chdir\s*\(`, 'i').test(command)
     // In their own case (`python -c` runs code), and joined to the folder only after the programs that
     // take it so: PowerShell's `-Command`, `-Confirm` and `-Destination` change no folder.
     || /(?:^|\s)-C\s|\b(?:git|make|tar)\b[^;&|\n]*\s-C\S|\bsudo\b[^;&|\n]*\s-D\s/.test(command),
@@ -1645,9 +1646,9 @@ const absoluteHere = (p: string, paths: Paths) => (paths.windows ? /^[A-Za-z]:\/
  * it that moves the shell (`source` and `.` run a file in this shell; in Bash `c\d` is cd, and `chdir`
  * counts in PowerShell only). A cd that fails is not seen here, nor a folder change this does not know
  * (`os.chdir`, `git -C`): `runOnlyScripts` uses this only to find the file of a script the command names
- * as nothing but what runs, which the caller then compares before and after; `scratchStart` (register.ts),
- * which leaves writes out as scratch, checks that the folder is already there and refuses any change of
- * folder `CHANGES_FOLDER` knows. Undefined otherwise: for a command `readableOutside` won't read (a
+ * as nothing but what runs, which the caller then compares before and after; `startDir` (register.ts),
+ * which places the command's relative names in that folder (and leaves scratch ones out), checks that the
+ * folder is already there and refuses any change of folder `CHANGES_FOLDER` knows. Undefined otherwise: for a command `readableOutside` won't read (a
  * here-document split that is a guess, a backslash the shell would read otherwise, `$'...'`), one that
  * sets a temp-folder variable (a cautious refusal), detaches a part, sources or evals, spells cd another
  * way (`"c"d`), or has a substitution in the folder's name.
