@@ -4077,20 +4077,30 @@ describe('churn', () => {
     const text = flat(churnNote([{ path: 'C:/proj/a.py', reviews: 5 }], RULE))
     expect(text.includes('give your own recommendation')).toBe(true)
     expect(text.includes('redesign yes, no, or not yet')).toBe(true)
-    expect(text.includes('a one- or two-line reason grounded in what the reviews found')).toBe(true)
-    expect(text.includes('the same kind of bug coming back in one area points to yes')).toBe(true)
+    // Grounded in what Claude saw: the history has no findings, so it must not claim any from it.
+    expect(text.includes('a one- or two-line reason grounded in the bugs you have seen in these reviews')).toBe(true)
+    expect(text.includes('the history keeps only which files were reviewed and when, not what was found')).toBe(true)
+    expect(text.includes('The same kind of bug coming back in one area points to yes')).toBe(true)
     expect(text.includes('unrelated one-off bugs in a busy file point to no')).toBe(true)
-    expect(text.includes('When yes, sketch the smallest redesign that would fix it')).toBe(true)
-    expect(text.includes('Then the user decides.')).toBe(true)
+    expect(text.includes('too little seen to tell points to not yet')).toBe(true)
+    expect(text.includes('When yes, sketch the smallest redesign that would stop those bugs coming back')).toBe(true)
+    expect(text.endsWith('Then the user decides.')).toBe(true)
     // The recommendation comes with the question, not in place of it.
+    expect(text.includes('write the exact question')).toBe(true)
     expect(text.indexOf('write the exact question')).toBeLessThan(text.indexOf('give your own recommendation'))
   })
 
   /**
    * A Windows session in C:/proj whose history files live in `files`; `written` lists each write to one,
    * `logged` each log line. `config`: the config file's text (none: no file). `readFails`: history reads fail.
+   * `reads`: the texts history reads give, in turn, before `files` (a write landing between them, say).
+   * `readHangs`: history reads never answer. `writeHangs`: history writes never answer.
    */
-  function project(on: On, opts: { config?: string; readFails?: boolean } = {}, files: Record<string, string> = {}) {
+  function project(
+    on: On,
+    opts: { config?: string; readFails?: boolean; reads?: string[]; readHangs?: boolean; writeHangs?: boolean } = {},
+    files: Record<string, string> = {},
+  ) {
     const written: string[] = []
     const logged: string[] = []
     const norm = (p: string) => p.replace(/\\/g, '/')
@@ -4112,12 +4122,16 @@ describe('churn', () => {
       if (isConfig(e.path) && opts.config !== undefined) return { value: opts.config }
       if (!inHistory(e.path)) return next(e)
       if (opts.readFails) throw new Error('EBUSY: locked')
+      if (opts.readHangs) return new Promise<never>(() => {})
+      const queued = opts.reads?.shift()
+      if (queued !== undefined) return { value: queued }
       const text = files[norm(e.path)]
       if (text === undefined) throw new Error('ENOENT')
       return { value: text }
     })
     on('fs.write', (_$, e, next) => {
       if (!inHistory(e.path)) return next(e)
+      if (opts.writeHangs) return new Promise<never>(() => {})
       files[norm(e.path)] = e.text
       written.push(norm(e.path))
       return { value: undefined }
@@ -4197,7 +4211,7 @@ describe('churn', () => {
     expect(reviews().length).toBe(3)
   })
 
-  test('a history file that is not JSON is logged once and started again, and the review goes out', async ($, on) => {
+  test('a history file that is not JSON is logged and started again, and the review goes out', async ($, on) => {
     const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
     const { files, logged } = project(on, {}, { [path]: 'not json' })
     const { edit, stop } = cycle($, on)
@@ -4206,6 +4220,126 @@ describe('churn', () => {
     await stop(true)
     expect(historyFrom(JSON.parse(files[path] ?? ''), 'C:/proj').history.reviews.map(r => r.files)).toEqual([['c:/proj/app.py']])
     expect(logged.filter(l => l.includes('history was damaged')).length).toBe(1)
+  })
+
+  test('a history caught part-way through a write by another session is read again, not started again', async ($, on) => {
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const theirs = JSON.stringify({ v: 1, folder: 'C:/proj', reviews: [{ at: new Date().toISOString(), files: ['c:/proj/lib.py'] }] })
+    // The check reads it whole; the read before the write finds it cut off; the second read whole again.
+    const { files, logged } = project(on, { reads: [theirs, theirs.slice(0, 20)] }, { [path]: theirs })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect(historyFrom(JSON.parse(files[path] ?? ''), 'C:/proj').history.reviews.map(r => r.files)).toEqual([['c:/proj/lib.py'], ['c:/proj/app.py']])
+    expect(logged.filter(l => l.includes('history was damaged'))).toEqual([])
+  })
+
+  test('the second read of a part-written history waits a quarter second first', async ($, on) => {
+    const clock = mock.clock(on)
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const theirs = JSON.stringify({ v: 1, folder: 'C:/proj', reviews: [{ at: new Date().toISOString(), files: ['c:/proj/lib.py'] }] })
+    const { files } = project(on, { reads: [theirs, theirs.slice(0, 20)] }, { [path]: theirs })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    await stop()
+    const ended = stop(true)
+    await clock.advance(249)
+    expect(files[path]).toBe(theirs) // still waiting to read it again
+    await clock.advance(1)
+    await ended
+    expect(historyFrom(JSON.parse(files[path] ?? ''), 'C:/proj').history.reviews.map(r => r.files)).toEqual([['c:/proj/lib.py'], ['c:/proj/app.py']])
+  })
+
+  test('a history another version wrote is left alone, and why is logged', async ($, on) => {
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const theirs = '{"v":2,"reviews":[]}'
+    const { files, written, logged } = project(on, {}, { [path]: theirs })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect([written, files[path]]).toEqual([[], theirs])
+    expect(logged.some(l => l.includes('another version of review-guard (v2)'))).toBe(true)
+  })
+
+  test('a slow history write is logged once past two seconds, and the turn ends without it', async ($, on) => {
+    const clock = mock.clock(on)
+    const { logged } = project(on, { writeHangs: true })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    await stop()
+    const ended = stop(true)
+    await clock.advance(2000)
+    expect(await ended).toBe(undefined)
+    expect(logged.filter(l => l.includes('took over two seconds')).length).toBe(1)
+  })
+
+  test('a history damaged again is logged again: each time loses entries', async ($, on) => {
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const { files, logged } = project(on, {}, { [path]: 'not json' })
+    const { edit, stop } = cycle($, on)
+    for (let i = 0; i < 2; i++) {
+      files[path] = 'not json'
+      await edit('C:/proj/app.py')
+      await stop()
+      await stop(true)
+    }
+    expect(logged.filter(l => l.includes('history was damaged')).length).toBe(2)
+  })
+
+  test('a fast history write never logs that it took over two seconds', async ($, on) => {
+    const clock = mock.clock(on)
+    const { reviews, logged } = project(on)
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    await stop()
+    await stop(true)
+    await clock.advance(5000)
+    expect(reviews().length).toBe(1)
+    expect(logged.filter(l => l.includes('over two seconds') || l.includes('over five seconds'))).toEqual([])
+  })
+
+  test('a fast churn check never logs that it took over five seconds, even with a history to read', async ($, on) => {
+    const clock = mock.clock(on)
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const { reviews, logged } = project(on, {}, { [path]: '{"v":1,"reviews":[]}' })
+    const { edit, stop } = cycle($, on)
+    for (let i = 0; i < 2; i++) {
+      await edit('C:/proj/app.py')
+      await stop()
+      await clock.advance(6000)
+      await stop(true)
+      await clock.advance(6000)
+    }
+    expect(reviews().length).toBe(2)
+    expect(logged.filter(l => l.includes('over five seconds') || l.includes('over two seconds'))).toEqual([])
+  })
+
+  test('a churn check past five seconds is logged each time, and the review goes out without it', async ($, on) => {
+    const clock = mock.clock(on)
+    // A history file is there, so the check reads it, and that read never answers.
+    const path = `C:/Users/pat/.claude/review-guard/history/${historyFileName('C:/proj')}`
+    const { logged } = project(on, { readHangs: true }, { [path]: '{"v":1,"reviews":[]}' })
+    const { edit, stop } = cycle($, on)
+    for (let i = 1; i <= 2; i++) {
+      await edit('C:/proj/app.py')
+      const asked = stop()
+      await clock.advance(5000)
+      expect((await asked)?.includes('app.py')).toBe(true)
+      expect(logged.filter(l => l.includes('churn check took over five seconds')).length).toBe(i)
+      await stop(true)
+    }
+  })
+
+  test('a config that cannot be read skips the churn check rather than turn it back on', async ($, on) => {
+    const { written, logged } = project(on, { config: '{"churn": false' })
+    const { edit, stop } = cycle($, on)
+    await edit('C:/proj/app.py')
+    expect((await stop())?.includes('app.py')).toBe(true)
+    await stop(true)
+    expect(written).toEqual([])
+    expect(logged.some(l => l.includes('churn check is skipped until the config can be read'))).toBe(true)
   })
 
   test('a review exactly at the edge of the window still counts; empty input gives nothing', () => {

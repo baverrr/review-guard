@@ -34,8 +34,9 @@ and your personal details from going out.
   problem in a file outside the review). Then it reruns the tests and scanners and tells you the outcome.
 - **Notices when fixes keep making bugs.** When the same files of a project keep coming back for review
   (4 reviews in 24 hours by default), the review asks Claude to stop adding features to them, write tests
-  that pin them down, and ask you whether their design needs another look, with its own recommendation
-  (redesign yes, no or not yet, and why). You decide.
+  that pin them down, and ask you whether their design needs another look. With the question, Claude
+  says whether it recommends a redesign (yes, no or not yet), why, based on the bugs it has seen, and when
+  yes, the smallest redesign that would help. You decide.
 - **Brings its own reviewers.** It ships five review agents, so it works without the pr-review-toolkit plugin.
 - **Stops leaks to GitHub.** A commit, push or GitHub write that would send a key, a token, an IP or MAC
   address, or one of your personal terms is stopped, and Claude is told what and where, never the value.
@@ -106,7 +107,8 @@ and your personal details from going out.
 | `churn` | When files count as coming back too often: `{ "reviews": 4, "hours": 24 }` (the default), or `false` to turn it off. `reviews` is 2 to 200, `hours` above 0 |
 
 Claude cannot edit this file; the mod stops it from trying. A typo in it stops commits until it is fixed,
-except in `churn`, which then uses the default and says so in the log.
+except in `churn`, which then uses the default and says so in the log. While the file can't be read at
+all, the churn check is skipped, so a typo elsewhere in it never turns a `"churn": false` back on.
 </details>
 
 ## Help

@@ -32,7 +32,7 @@ import {
   type Writer,
 } from './scan.ts'
 import { scannerSteps } from './scanners.ts'
-import { type ChurnRule, type Config, DEFAULT_CHURN, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
+import { type ChurnRule, type Config, findingsFor, findScanners, githubRemotes, gitleaksScan, homeFrom, type Host, loadConfig } from './outgoing.ts'
 import { churned, churnNote, historyDir, historyFileName, historyFrom, withReview } from './churn.ts'
 import { type LeftOut, type StatusFile, statusDir, statusFileName } from './status.ts'
 
@@ -1256,10 +1256,27 @@ async function stopAsk($: EngineInterface, hookActive: boolean, signal: AbortSig
   sayLost(ask?.kind === 'review')
   if (ask?.kind === 'review') {
     // The churn check never holds the turn's end up for long: past five seconds, or once the dispatch is
-    // over, the review goes without it. A clock that fails leaves only the check's own time.
+    // abandoned (an interrupt, the budget), the review goes without it. A clock that fails leaves the
+    // check's own time, still cut short by an abandon. The sleep runs on after a check that wins (it
+    // stops only on an abandon), so it logs only when the check is in fact still going.
+    let checked = false
+    const checking = churnCheck($, ask.files).finally(() => {
+      checked = true
+    })
+    const abandoned = () => new Promise<string>(resolve => {
+      if (signal.aborted) resolve('')
+      else signal.addEventListener('abort', () => resolve(''), { once: true })
+    })
     const note = await Promise.race([
-      churnCheck($, ask.files),
-      $.clock.sleep(5000, { signal }).then(() => '', () => (signal.aborted ? '' : new Promise<string>(() => {}))),
+      checking,
+      $.clock.sleep(5000, { signal }).then(
+        () => {
+          // Each time, not once per load: each one is a review that may go uncounted.
+          if (!checked) logLine($, "review-guard: the churn check took over five seconds, so the review went without it; this review may not be counted in the project's history")
+          return ''
+        },
+        abandoned,
+      ),
     ])
     if (signal.aborted) return putBack()
     return { ...ask, prompt: ask.prompt + note }
@@ -1301,24 +1318,42 @@ function churnPath(k: string, folder: string): string {
   return hasUpStep(k) ? k : samePath(k, folder, keySpelling)
 }
 
+/** How long `readHistory` waits before reading text that is not JSON a second time. */
+const HISTORY_REREAD_MS = 250
+
 /**
  * The project's review history (churn.ts), or why it can't be used: a read that fails throws (to the
  * caller's catch, which leaves the file alone). Text that is not JSON, or JSON of the wrong shape (another
- * version's `v` included), counts as damaged: it is logged and the history starts again.
+ * version's `v` included), counts as damaged and the history starts again, except that before a write a
+ * history of another version throws instead (see below). With `forWrite` (the read
+ * before a write over the file), text that is not JSON is read once more after a short wait first, since
+ * another session may be part-way through writing the file and starting again then would wipe its whole
+ * history; and damage is logged, every time rather than once per load, since each time loses entries. A
+ * read only for the check logs nothing: it writes nothing, and any write that follows logs what it finds.
  */
-async function readHistory($: EngineInterface, path: string, folder: string) {
-  let raw: unknown
-  if (await $.fs.exists(path)) {
+async function readHistory($: EngineInterface, path: string, folder: string, forWrite = false) {
+  const parse = async (): Promise<{ raw: unknown; ok: boolean }> => {
+    if (!(await $.fs.exists(path))) return { raw: undefined, ok: true }
     const text = await $.fs.read(path)
     try {
-      raw = JSON.parse(text.replace(/^﻿/, ''))
+      return { raw: JSON.parse(text.replace(/^﻿/, '')), ok: true }
     } catch {
-      raw = null
+      return { raw: null, ok: false }
     }
   }
+  let { raw, ok } = await parse()
+  if (!ok && forWrite) {
+    // A clock that fails reads again at once, which still catches a write that has just finished.
+    await $.clock.sleep(HISTORY_REREAD_MS).catch(() => undefined)
+    ;({ raw, ok } = await parse())
+  }
+  // A history another version of the mod wrote (another session may run one) is never written over: that
+  // would wipe it at every review. The caller's catch leaves the file alone and logs why.
+  const v = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as { v?: unknown }).v : undefined
+  if (forWrite && typeof v === 'number' && v !== 1) throw new Error(`it was written by another version of review-guard (v${v}), so it is left alone`)
   const read = historyFrom(raw, folder)
-  if (read.damaged) churnLog($, "review-guard: this project's review history was damaged, so the churn check started it again")
-  if (read.dropped > 0) churnLog($, `review-guard: ${read.dropped} damaged entr${read.dropped === 1 ? 'y was' : 'ies were'} dropped from this project's review history`)
+  if (forWrite && read.damaged) logLine($, "review-guard: this project's review history was damaged, so the churn check started it again")
+  if (forWrite && read.dropped > 0) logLine($, `review-guard: ${read.dropped} damaged entr${read.dropped === 1 ? 'y was' : 'ies were'} dropped from this project's review history`)
   return read.history
 }
 
@@ -1326,17 +1361,21 @@ async function readHistory($: EngineInterface, path: string, folder: string) {
  * Whether some of `files` churn under the user's rule, judged on the project's history plus this review,
  * and if so the paragraph to add to the review prompt (otherwise ''). The review itself is recorded only
  * once its prompt has reached Claude (`churnPending`, `recordChurn`). Never throws: the review goes out
- * either way, and a problem is logged once (`churnLog`).
+ * either way, and a problem here is logged once per load (`churnLog`). A check its caller stops waiting for
+ * past five seconds, and a damaged history found before a write, are logged every time instead.
  */
 async function churnCheck($: EngineInterface, files: readonly string[]): Promise<string> {
   clearChurn()
   const epoch = churnEpoch
   try {
-    const { config } = await loadConfig(hostOf($)).catch((err: unknown) => {
-      // A broken config stops commits (said there); here the review gets the default rule.
-      churnLog($, `review-guard: ${whyOf(err)}; the churn check uses its default rule`)
-      return { config: { churn: DEFAULT_CHURN, churnProblem: undefined } }
+    const loaded = await loadConfig(hostOf($)).catch((err: unknown) => {
+      // A broken config stops commits (said there). Here the churn check is skipped, not run on its
+      // default rule: the user may have turned it off in the file that can't be read.
+      churnLog($, `review-guard: ${whyOf(err)}; the churn check is skipped until the config can be read`)
+      return undefined
     })
+    if (loaded === undefined) return ''
+    const { config } = loaded
     if (config.churnProblem !== undefined) churnLog($, `review-guard: ${config.churnProblem}; the churn check uses its default rule`)
     const rule = config.churn
     if (rule === false) return ''
@@ -1369,18 +1408,27 @@ async function recordChurn($: EngineInterface): Promise<void> {
   if (!pending) return
   const record = async () => {
     try {
-      const history = withReview(await readHistory($, pending.path, pending.folder), pending.files, pending.at, new Date(), pending.rule)
+      const history = withReview(await readHistory($, pending.path, pending.folder, true), pending.files, pending.at, new Date(), pending.rule)
       await $.fs.write(pending.path, `${JSON.stringify(history, null, 2)}\n`)
     } catch (err) {
       churnLog($, `review-guard: could not record a review in this project's history (${whyOf(err)}); churning files may be noticed later`)
     }
   }
   // Never holds a turn's end or a prompt up for long: past two seconds it goes on without waiting (the
-  // write may still land). A clock that fails leaves only the write's own time.
+  // write may still land). A clock that fails leaves only the write's own time. The note is logged only
+  // when the write is in fact still going, and its timer stops once the write is over.
+  let done = false
+  const over = new AbortController()
+  const writing = record().finally(() => {
+    done = true
+    over.abort()
+  })
   await Promise.race([
-    record(),
-    $.clock.sleep(2000).then(
-      () => churnLog($, "review-guard: recording a review in this project's history took over two seconds; it was not waited for"),
+    writing,
+    $.clock.sleep(2000, { signal: over.signal }).then(
+      () => {
+        if (!done) churnLog($, "review-guard: recording a review in this project's history took over two seconds; it was not waited for")
+      },
       () => new Promise<void>(() => {}),
     ),
   ])

@@ -2,11 +2,14 @@
 // new bugs faster than reviews remove them. Each project (the session's folder) keeps a short history of
 // its reviews in ~/.claude/review-guard/history/, shared by every session in that folder. When a file has
 // been in too many reviews lately (the "churn" rule in review-guard.json), the review prompt asks Claude to
-// steady it (tests, a design check with the user) before adding more to it.
+// steady it (tests, and a design question for the user with Claude's own recommendation) before adding
+// more to it.
 //
 // The pure parts are here; register.ts reads and writes the file. Two sessions in one folder that record
 // a review at the same moment may lose one of the two entries (there is no lock): that only means a
-// churning file is noticed a review later, never a review skipped.
+// churning file is noticed a review later, never a review skipped. A file caught part-way through such a
+// write is read once more, a quarter second later, before it is written over (register.ts `readHistory`),
+// so it is seldom wiped.
 
 import { CHURN_HISTORY_KEPT, type ChurnRule } from './outgoing.ts'
 
@@ -137,8 +140,10 @@ export function churnNote(found: readonly Churned[], rule: ChurnRule): string {
     '- Write or extend tests that pin down what each of them should do, around the bugs this review found.',
     '- Tell the user these files keep coming back, and ask whether their design needs another look before more',
     '  work goes into them (write the exact question). With the question, give your own recommendation, in your',
-    '  own words: redesign yes, no, or not yet, with a one- or two-line reason grounded in what the reviews found',
-    '  (the same kind of bug coming back in one area points to yes; unrelated one-off bugs in a busy file point to',
-    '  no). When yes, sketch the smallest redesign that would fix it. Then the user decides.',
+    '  own words: redesign yes, no, or not yet, with a one- or two-line reason grounded in the bugs you have seen',
+    '  in these reviews (the history keeps only which files were reviewed and when, not what was found). The same',
+    '  kind of bug coming back in one area points to yes; unrelated one-off bugs in a busy file point to no; too',
+    '  little seen to tell points to not yet. When yes, sketch the smallest redesign that would stop those bugs',
+    '  coming back. Then the user decides.',
   ].join('\n')
 }

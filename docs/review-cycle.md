@@ -137,9 +137,14 @@ spelling: slashes and the drive letter's case are evened out and a relative path
 session's folder, but other case still counts, and a path with a `..` step is kept as it was written.
 When a file under review has been in the rule's number of reviews within its hours, the review prompt gets
 a paragraph: no new features in those files this turn, tests that pin them down, and a question for the
-user about their design, with Claude's own recommendation (redesign yes, no or not yet, a short reason from
-what the reviews found, and the smallest redesign when yes), the user deciding. The check never holds a
-review back for long: if it fails, or takes over five seconds (two for recording a review), the review goes
-on without it, and the log says why. A history file
-that is not valid JSON, or of another version, is logged and started again. Two sessions writing at the
-same moment may lose one entry, which only means a churning file is noticed a review later.
+user about their design, with Claude's own recommendation: redesign yes, no or not yet, a short reason from
+the bugs it has seen (the history keeps no findings), and the smallest redesign when yes. The user decides.
+The check never holds a review back for long: if it fails, or takes over five seconds (two for recording a
+review), the review goes on without it, and the log says why (a check over five seconds is logged every
+time, since that review may go uncounted). A config file that can't be read skips the check, so a
+`"churn": false` in it is never undone. Before a review is written in, a history file that is not valid
+JSON is read once more after a quarter second, since another session may be part-way through writing it.
+If it is still not valid, or of the wrong shape, it is logged (every time, as are dropped entries) and
+started again. A history another version of the mod wrote is left alone, and that review is not recorded
+(the log says so). Two sessions writing at the same moment may lose one entry, which only means a churning
+file is noticed a review later.
