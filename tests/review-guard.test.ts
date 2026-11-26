@@ -4184,7 +4184,8 @@ describe('churn', () => {
   ) {
     const written: string[] = []
     const logged: string[] = []
-    const norm = (p: string) => p.replace(/\\/g, '/')
+    // On Linux the engine reads a Windows path as relative and puts its own folder first: drop that part.
+    const norm = (p: string) => p.replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/)/, '')
     const inHistory = (p: string) => norm(p).includes('/.claude/review-guard/history/')
     const isConfig = (p: string) => norm(p).endsWith('/.claude/review-guard.json')
     mock.env(on, { USERPROFILE: 'C:/Users/pat' })
