@@ -39,8 +39,9 @@ and your personal details from going out.
   yes, the smallest redesign that would help. You decide.
 - **Checks its own file list against git (trial).** For a shell command whose writes it can't be sure of
   (a `cd`, a script or a formatter that runs, a commit), it also asks git what changed before and after,
-  and keeps a note in `~/.claude/review-guard/shadow.jsonl` of where git and its own list differ. For now
-  the review still uses its own list; once the notes show git is right, git's list will be used.
+  and keeps a note in `~/.claude/review-guard/shadow.jsonl` of where git and its own list differ, and how
+  long each look took. For now the review still uses its own list; once the notes show git is right, git's
+  list will be used.
 - **Brings its own reviewers.** It ships five review agents, so it works without the pr-review-toolkit plugin.
 - **Stops leaks to GitHub.** A commit, push or GitHub write that would send a key, a token, an IP or MAC
   address, or one of your personal terms is stopped, and Claude is told what and where, never the value.

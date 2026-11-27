@@ -192,9 +192,22 @@ saw, of the files only the guess named, and of the guessed ones git ignores (git
 with its count. It also says when other edits or commands were running at the same time, since their files
 show as this command's.
 
+Every line also has `steps`, with `before` and `after` lists that say where each look's time went. Each
+step is one git run (`git status`, the filter check `git config` before a status or diff, `git rev-parse`,
+`git diff`, `git check-ignore`) or one repository's whole look (`look`, its file reads included), with
+when it started and how long it took. A look that ran out of time keeps its steps as they were at that
+moment: one with no time was still running. Past 120 steps the rest are only counted (`stepsDropped`).
+
+When a command touches two repositories, they are looked at side by side, not one after the other. On
+Windows most of a look is starting git, so the wait is about that of the slower repository, not both.
+
 **When a look fails:** each git run is limited to 1.5 seconds, the look before the command and the one
-after it to 4 seconds each, and the paths to 2,000. Small files are read for their text up to 4 MB in all. A look that fails is recorded too, and each reason is logged once. One
-repository that fails doesn't lose the other's comparison.
+after it to 4 seconds each (one that is already writing its record gets up to 1 second more), and the
+paths to 2,000. Small files are read for their text up to 4 MB per batch of files looked at. A look that
+fails is recorded too, and each reason is logged once, also when only one repository fails. One
+repository that fails doesn't lose the other's comparison. When something failed before a command and
+nothing is looked at after it (it was refused, or may still be running), that failure is still recorded.
+A folder git couldn't open is not tried again for 30 seconds; the record says the failure is cached.
 
 Nothing here changes what is reviewed. Once the record shows git's list is right, it will replace the
 guess inside repositories (`docs/shell-writes-redesign.md`). Plain commands, and ones run in the

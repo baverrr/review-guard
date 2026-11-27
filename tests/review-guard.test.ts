@@ -4538,7 +4538,7 @@ describe('shadow look', () => {
   // Repositories at R (the session's) and O, as git and the disk show them, with the shadow record kept in
   // `written` (its texts as written, and read back). A file's first look is before the command, each later
   // one after: only src/dirty.ts's time changes.
-  function repoWorld(on: On, statuses: Record<string, string[]>, opts: { fail?: string; ignored?: string; diff?: string; record?: string; oneAtATime?: boolean } = {}) {
+  function repoWorld(on: On, statuses: Record<string, string[]>, opts: { fail?: string; ignored?: string; diff?: string; record?: string; oneAtATime?: boolean; together?: boolean; hang?: boolean; failOther?: boolean } = {}) {
     const R = 'C:/work/repo'
     const O = 'C:/work/other'
     mock.env(on, { USERPROFILE: 'C:/Users/pat', TEMP, LOCALAPPDATA: 'C:/Users/pat/AppData/Local' })
@@ -4555,7 +4555,8 @@ describe('shadow look', () => {
       return { value: { kind: 'file' as const, size: 10, mtimeMs: path.endsWith('dirty.ts') && n > 1 ? 2 : 1, isLink: false } }
     })
     on('session.cwd', () => ({ value: R }))
-    const seen = { calls: [] as string[], timeouts: [] as (number | undefined)[], written: [] as string[], logged: [] as string[] }
+    const seen = { calls: [] as string[], timeouts: [] as (number | undefined)[], written: [] as string[], logged: [] as string[], overlapped: [] as boolean[] }
+    let otherAsked = 0
     const record = () => seen.written.at(-1) ?? opts.record ?? ''
     on('fs.read', (_$, e) => {
       if (norm(e.path) === SHADOW) return { value: record() }
@@ -4567,7 +4568,7 @@ describe('shadow look', () => {
       if (norm(e.path) === SHADOW) seen.written.push(e.text)
       return { value: undefined }
     })
-    on('process.run', (_$, e) => {
+    on('process.run', async (_$, e) => {
       const line = e.argv.join(' ')
       seen.calls.push(line)
       seen.timeouts.push(e.init?.timeoutMs)
@@ -4577,6 +4578,16 @@ describe('shadow look', () => {
       if (line.includes('get-regexp')) return ok('', 1)
       if (line.includes(' status ')) {
         if (opts.fail) return ok('', 128, `fatal: ${opts.fail}`)
+        if (opts.failOther && root === O) return ok('', 128, 'fatal: cannot read (other test)')
+        // A git status that never answers: the look runs out of time while it is still running.
+        if (opts.hang) return new Promise<never>(() => {})
+        if (opts.together && root === O) otherAsked++
+        if (opts.together && root === R) {
+          // The session's repository answers late: was the other one asked meanwhile (side by side)?
+          const asked = otherAsked
+          await new Promise(r => setTimeout(r, 50))
+          seen.overlapped.push(otherAsked > asked)
+        }
         return ok(statuses[root]?.shift() ?? '')
       }
       if (line.includes('check-ignore')) {
@@ -4630,6 +4641,47 @@ describe('shadow look', () => {
     await $.tool.call({ tool: 'Bash', command: `cd "${O}" && npm run fix && sed -i s/a/b/ src/b.ts` })
     const repos = lines().at(-1)?.repos ?? []
     expect(repos.map((r: { repo: string; agree: boolean }) => [r.repo, r.agree])).toEqual([[R, true], [O, true]])
+  })
+
+  test('both repositories are looked at side by side, and each step of the look is timed in the record', async ($, on) => {
+    const { R, O, seen, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h')], 'C:/work/other': [status('h'), status('h')] }, { together: true })
+    cycle($, on)
+    await $.tool.call({ tool: 'Bash', command: `cd "${O}" && npm run fix` })
+    // Before and after the command, the other repository's status was asked while the session's waited.
+    expect(seen.overlapped).toEqual([true, true])
+    const last = lines().at(-1)
+    expect(last?.repos?.map((r: { repo: string }) => r.repo)).toEqual([R, O])
+    type Step = { what: string; in?: string; at: number; ms?: number }
+    const timed = (steps: Step[] | undefined, what: string, where: string) =>
+      (steps ?? []).some(s => s.what === what && s.in === where && s.at >= 0 && s.at < 60_000 && typeof s.ms === 'number' && s.ms >= 0)
+    const { before, after } = last?.steps ?? {}
+    // The filter check runs after the command too: it may have set a filter up without running it.
+    expect([R, O].flatMap(where => [timed(before, 'git status', where), timed(before, 'git config', where), timed(before, 'look', where), timed(after, 'git status', where), timed(after, 'git config', where), timed(after, 'look', where)]))
+      .toEqual(Array(12).fill(true))
+  })
+
+  test('a repository git cannot open is recorded and logged, and the other is still compared', async ($, on) => {
+    const { R, O, seen, lines } = repoWorld(on, { 'C:/work/repo': [status('h'), status('h'), status('h'), status('h')] }, { failOther: true })
+    cycle($, on)
+    for (let i = 0; i < 2; i++) await $.tool.call({ tool: 'Bash', command: `cd "${O}" && npm run fix` })
+    // The one that failed comes first (it failed before the command), then each compared one.
+    const repos = lines().at(-1)?.repos ?? []
+    expect(repos.map((r: { repo: string; agree?: boolean; failed?: string }) => [r.repo, r.agree ?? r.failed?.includes('(other test)')])).toEqual([[O, true], [R, true]])
+    // Recorded each time, logged once.
+    expect(seen.logged.filter(l => l.includes('(other test)')).length).toBe(1)
+  })
+
+  test('a look that runs out of time is recorded with its steps, the one still running with no time', async ($, on) => {
+    const clock = mock.clock(on)
+    const { R, lines } = repoWorld(on, {}, { hang: true })
+    cycle($, on)
+    const call = $.tool.call({ tool: 'Bash', command: `cd "${R}" && npm run fix` })
+    for (let i = 0; i < 10 && !lines().some(l => l.failed); i++) await clock.advance(1000)
+    await call
+    const late = lines().find(l => String(l.failed ?? '').includes('took over 4 seconds'))
+    const steps: { what: string; in?: string; ms?: number }[] = late?.steps?.before ?? []
+    expect(steps.some(s => s.what === 'git status' && s.in === R && s.ms === undefined)).toBe(true)
+    expect(steps.some(s => s.what === 'git config' && s.in === R && typeof s.ms === 'number')).toBe(true)
   })
 
   test('a guessed name outside the repository or with a `..` step loses no record; a name the guess could not place is only counted', async ($, on) => {

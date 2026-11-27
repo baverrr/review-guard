@@ -2,7 +2,7 @@
 // after the command, compared. It gives the real paths, whatever folder the command ran in and however it
 // spelled them, where the text guess (`shellWrites` in scan.ts) has to work out both.
 //
-// For now (0.5.0) this only runs alongside the guess, as a shadow: register.ts records how the two compare
+// For now (0.5.x) this only runs alongside the guess, as a shadow: register.ts records how the two compare
 // in ~/.claude/review-guard/shadow.jsonl, and the review still uses the guess. Pure functions here, apart
 // from `repoOf`, `snapshot`, `committedFiles` and `ignoredOf`, which run git through `Host`.
 import { git, type Host } from './outgoing.ts'

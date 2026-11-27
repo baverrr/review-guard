@@ -1081,6 +1081,7 @@ function placeInStart(names: string[], start: Start | undefined): { names: strin
 
 // --- The shadow look (0.5.0): what git says a shell command changed, next to the text guess -------------
 //
+// Since 0.5.1 the repositories are looked at side by side, and each record says where its time went (`Step`).
 // For a command whose writes the guess can't be sure of (`unsure`), `shadowBefore` takes `git status` of the
 // repositories it may touch, and `shadowAfter` takes it again once the command is done, compares the two
 // (worktree.ts), and records how that compares with the guess in ~/.claude/review-guard/shadow.jsonl. The
@@ -1089,9 +1090,10 @@ function placeInStart(names: string[], start: Start | undefined): { names: strin
 
 /**
  * The repositories a command may touch, as they were just before it ran, and what else was writing then:
- * `running`, the other edits and shell commands under way; `done`, how many had finished (`asWriter`).
+ * `running`, the other edits and shell commands under way; `done`, how many had finished (`asWriter`). And
+ * the before look's steps (all finished), with how many were not kept (`MAX_STEPS`).
  */
-type Shadow = { snaps: RepoSnapshot[]; failed: { folder: string; why: string }[]; running: number; done: number; runsOthers: boolean }
+type Shadow = { snaps: RepoSnapshot[]; failed: { folder: string; why: string }[]; running: number; done: number; runsOthers: boolean; steps: Step[]; dropped: number }
 
 // Edits and shell commands under way, and finished, in this session (`asWriter`): a file another one wrote
 // while a command ran shows in git as that command's, so the record says when that may have happened.
@@ -1125,16 +1127,27 @@ function unsure(command: string, powershell: boolean, runScripts: readonly Snaps
 // less, so a `git init` there is soon seen.
 const REPO_CACHE_MS = 5 * 60_000
 const NO_REPO_CACHE_MS = 30_000
-const repoCache = new Map<string, { root: string | undefined; at: number }>()
+// A lookup that failed (git missing or too slow) is kept as long as "no repository", and fails again from
+// the cache: each command records it, but doesn't wait on git again for it.
+const repoCache = new Map<string, { root: string | undefined; at: number; error?: unknown }>()
 
 async function cachedRepo(host: Host, folder: string, windows: boolean): Promise<string | undefined> {
   const key = normalPath(folder, windows)
   const hit = repoCache.get(key)
-  if (hit && Date.now() - hit.at < (hit.root === undefined ? NO_REPO_CACHE_MS : REPO_CACHE_MS)) return hit.root
-  const root = await repoOf(host, folder)
+  if (hit && Date.now() - hit.at < (hit.root === undefined ? NO_REPO_CACHE_MS : REPO_CACHE_MS)) {
+    // Said as cached, so the record doesn't count one failure as many.
+    if (hit.error !== undefined) throw new Error(`${whyOf(hit.error)} (cached from an earlier look)`)
+    return hit.root
+  }
   if (repoCache.size > 200) repoCache.clear()
-  repoCache.set(key, { root, at: Date.now() })
-  return root
+  try {
+    const root = await repoOf(host, folder)
+    repoCache.set(key, { root, at: Date.now() })
+    return root
+  } catch (err) {
+    repoCache.set(key, { root: undefined, at: Date.now(), error: err })
+    throw err
+  }
 }
 
 // What went wrong with the shadow look, each kind of trouble logged once per load of the module (it is
@@ -1185,18 +1198,79 @@ async function recordShadow($: EngineInterface, entry: Record<string, unknown>):
   }
 }
 
-async function shadowFailed($: EngineInterface, stage: string, err: unknown): Promise<undefined> {
+/** `extra` goes into the record too: the steps (`StepsOf`), and the repositories that failed before. */
+async function shadowFailed($: EngineInterface, stage: string, err: unknown, extra: Record<string, unknown> = {}): Promise<undefined> {
   sayShadowOnce($, `look ${stage} ${reasonKind(whyOf(err))}`, `review-guard: the shadow look at what a command changed failed ${stage} (${whyOf(err)}); the review is not affected`)
-  await recordShadow($, { failed: `${stage}: ${whyOf(err)}` })
+  await recordShadow($, { failed: `${stage}: ${whyOf(err)}`, ...extra })
   return undefined
 }
 
 // A look never holds a command up longer than this, before it or after: past it, the command goes on
 // unlooked at, and the look stops at its next step (`Stop`) without recording anything more.
 const SHADOW_LOOK_MS = 4_000
+// How much longer a look that is already writing its record holds the command up, at most.
+const SHADOW_RECORD_GRACE_MS = 1_000
 
-/** Set once a look ran out of time (`shadowInTime`): it then reads and records nothing more. */
-type Stop = { over: boolean }
+/**
+ * One timed step of a look, for the record: what ran (each git run, as `git status`, `git config` (the
+ * filter check before a status or diff), `git rev-parse`, `git diff` or `git check-ignore`; and `look`, one
+ * repository's whole look, its file reads included), in which folder, when it started (`at`, milliseconds
+ * into the look) and how long it took (`ms`; none when the look ran out of time while it was still running).
+ * Times are the wall clock's, whatever clock the engine gives. At most `MAX_STEPS` are kept, the rest counted.
+ */
+type Step = { what: string; in?: string; at: number; ms?: number }
+const MAX_STEPS = 120
+
+/**
+ * A look under way: `over` once it ran out of time (`shadowInTime`), when it reads and records nothing more;
+ * `recording` once it has started writing its record, which then finishes, cap or not (so no second, late
+ * line). Its steps so far, timed from `startedAt`, and how many more there were than `MAX_STEPS`.
+ */
+type Stop = { over: boolean; recording: boolean; startedAt: number; steps: Step[]; dropped: number }
+
+/** What a record keeps of a look's steps: copies, so a step still running when it was taken stays without `ms`. */
+type StepsOf = { steps: { before?: Step[]; after?: Step[] }; stepsDropped?: number }
+const frozen = (steps: readonly Step[]): Step[] => steps.map(s => ({ ...s }))
+function stepsOf(stop: Stop, which: 'before' | 'after', before?: Shadow): StepsOf {
+  const dropped = stop.dropped + (before?.dropped ?? 0)
+  return { steps: { ...(before ? { before: before.steps } : {}), [which]: frozen(stop.steps) }, ...(dropped > 0 ? { stepsDropped: dropped } : {}) }
+}
+
+/** Runs `f` as a step of the look `stop`, timed. */
+async function timed<T>(stop: Stop, what: string, where: string | undefined, f: () => Promise<T>): Promise<T> {
+  const step: Step = { what, ...(where !== undefined ? { in: where } : {}), at: Date.now() - stop.startedAt }
+  if (stop.steps.length < MAX_STEPS) stop.steps.push(step)
+  else stop.dropped++
+  try {
+    return await f()
+  } finally {
+    step.ms = Date.now() - stop.startedAt - step.at
+  }
+}
+
+/** The git subcommand and folder (`-C`) of a git argv, past its options; undefined for another program. */
+function gitStep(argv: readonly string[]): { what: string; in?: string } | undefined {
+  if (!/(?:^|[\\/])git(?:\.exe)?$/i.test(argv[0] ?? '')) return undefined
+  let dir: string | undefined
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i] ?? ''
+    if (a === '-C') dir = argv[++i]
+    else if (a === '-c') i++
+    else if (!a.startsWith('-')) return { what: `git ${a}`, ...(dir !== undefined ? { in: dir } : {}) }
+  }
+  return { what: 'git', ...(dir !== undefined ? { in: dir } : {}) }
+}
+
+/** `host` with each git run timed as a step of `stop`. */
+function timedHost(host: Host, stop: Stop): Host {
+  return {
+    ...host,
+    run: (argv, init) => {
+      const step = gitStep(argv)
+      return step ? timed(stop, step.what, step.in, () => host.run(argv, init)) : host.run(argv, init)
+    },
+  }
+}
 
 /** What an after look gives back when it finished in time (it has nothing else to give). */
 const SHADOW_DONE = Symbol('shadow look done')
@@ -1204,22 +1278,45 @@ const SHADOW_LATE = Symbol('shadow look late')
 
 /**
  * `look(stop)`, or undefined once `SHADOW_LOOK_MS` have passed: then `stop.over` is set, and that is
- * recorded and logged once. Never throws.
+ * recorded (with `late(stop)` too) and logged once. A look already writing its record is waited for instead.
+ * Never throws.
  */
-async function shadowInTime<T>($: EngineInterface, stage: string, look: (stop: Stop) => Promise<T>): Promise<T | undefined> {
-  const stop: Stop = { over: false }
+async function shadowInTime<T>($: EngineInterface, stage: string, look: (stop: Stop) => Promise<T>, late: (stop: Stop) => Record<string, unknown>): Promise<T | undefined> {
+  const stop: Stop = { over: false, recording: false, startedAt: Date.now(), steps: [], dropped: 0 }
   const over = new AbortController()
   const timer = Promise.resolve()
     .then(() => $.clock.sleep(SHADOW_LOOK_MS, { signal: over.signal }))
-    .then(() => SHADOW_LATE, () => new Promise<never>(() => {})) // aborted (the look was first) or no clock: never wins
+    .then(() => SHADOW_LATE, err => {
+      // Aborted: the look was first. Any other failure leaves the look with no time limit but its git runs' own.
+      if (!over.signal.aborted) sayShadowOnce($, 'clock', `review-guard: the shadow look has no time limit: the clock failed (${whyOf(err)}); the review is not affected`)
+      return new Promise<never>(() => {})
+    })
   try {
-    const won = await Promise.race([look(stop), timer])
+    const looking = look(stop)
+    const won = await Promise.race([looking, timer])
     if (won !== SHADOW_LATE) return won as T
+    // Past its writing of the record, the look is as good as done: one line for this command, not two. It
+    // gets a little longer to write it, then the command goes on and the write finishes on its own.
+    if (stop.recording) {
+      const grace = new AbortController()
+      try {
+        const late = Promise.resolve()
+          .then(() => $.clock.sleep(SHADOW_RECORD_GRACE_MS, { signal: grace.signal }))
+          .then(() => SHADOW_LATE, () => new Promise<never>(() => {}))
+        const done = await Promise.race([looking, late])
+        return done === SHADOW_LATE ? undefined : (done as T)
+      } finally {
+        grace.abort()
+      }
+    }
     stop.over = true
-    // Recorded while the command goes on: writing the record is no reason to hold it up longer.
-    void shadowFailed($, stage, new Error(`it took over ${SHADOW_LOOK_MS / 1000} seconds`))
+    // Recorded while the command goes on: writing the record is no reason to hold it up longer. Its steps,
+    // as they were now, say where the time went (one with no `ms` was still running).
+    void shadowFailed($, stage, new Error(`it took over ${SHADOW_LOOK_MS / 1000} seconds`), late(stop))
     return undefined
-  } catch {
+  } catch (err) {
+    // The looks catch everything themselves; should one throw all the same, it is said, not lost.
+    sayShadowOnce($, 'look threw', `review-guard: the shadow look failed ${stage} (${whyOf(err)}); the review is not affected`)
     return undefined
   } finally {
     over.abort()
@@ -1247,40 +1344,56 @@ async function lookAt($: EngineInterface, path: string, withText: boolean, stop:
 async function shadowBefore($: EngineInterface, command: string, powershell: boolean, background: boolean, runScripts: readonly Snapshot[], stop: Stop): Promise<Shadow | undefined> {
   try {
     if (background || !unsure(command, powershell, runScripts)) return undefined
-    const host = hostOf($)
+    const host = timedHost(hostOf($), stop)
     const paths = await pathsHere($)
     const running = writersRunning
     const done = writersDone
-    const folders = [await sessionFolder($), startFolder(command, paths, powershell)].filter((f): f is string => f !== undefined)
+    const named = [await sessionFolder($), startFolder(command, paths, powershell)].filter((f): f is string => f !== undefined)
+    const folders = named.filter((f, i) => named.findIndex(g => normalPath(g, paths.windows) === normalPath(f, paths.windows)) === i)
+    // Side by side: on Windows most of a look is starting git, so each folder and repository waits for the
+    // slowest one, not for all of them in turn. The results keep the folders' order (the session's first).
+    const found = await Promise.all(folders.map(folder => cachedRepo(host, folder, paths.windows).then(
+      root => ({ folder, root }),
+      err => ({ folder, root: undefined, why: whyOf(err) }),
+    )))
     const roots: string[] = []
     const failed: { folder: string; why: string }[] = []
-    for (const folder of folders) {
-      const root = await cachedRepo(host, folder, paths.windows).catch(err => {
-        failed.push({ folder, why: whyOf(err) })
-        return undefined
-      })
+    for (const f of found) {
+      if ('why' in f) failed.push({ folder: f.folder, why: f.why })
+      const root = f.root
       if (root !== undefined && !roots.some(r => normalPath(r, paths.windows) === normalPath(root, paths.windows))) roots.push(root)
     }
+    const looked = await Promise.all(roots.map(root => timed(stop, 'look', root, () => snapshot(host, (p, t) => lookAt($, p, t, stop), root)).then(
+      snap => ({ snap }),
+      err => ({ root, why: whyOf(err) }),
+    )))
     const snaps: RepoSnapshot[] = []
-    for (const root of roots) {
-      try {
-        snaps.push(await snapshot(host, (p, t) => lookAt($, p, t, stop), root))
-      } catch (err) {
-        failed.push({ folder: root, why: whyOf(err) })
-      }
+    for (const l of looked) {
+      if ('snap' in l) snaps.push(l.snap)
+      else failed.push({ folder: l.root, why: l.why })
     }
     if (stop.over || (snaps.length === 0 && failed.length === 0)) return undefined
+    for (const f of failed) sayShadowOnce($, `look before ${reasonKind(f.why)}`, `review-guard: the shadow look could not read ${f.folder} (${f.why}); the review is not affected`)
     if (snaps.length === 0) {
-      for (const f of failed) sayShadowOnce($, `look before ${reasonKind(f.why)}`, `review-guard: the shadow look could not read ${f.folder} (${f.why}); the review is not affected`)
-      await recordShadow($, { failed: failed.map(f => `before the command, ${f.folder}: ${f.why}`).join('; ') })
+      stop.recording = true
+      await recordShadow($, { failed: failed.map(f => `before the command, ${f.folder}: ${f.why}`).join('; '), ...stepsOf(stop, 'before') })
       return undefined
     }
-    // A script or tool it runs may run git itself (a pull), out of sight of `headMove`.
-    return { snaps, failed, running, done, runsOthers: runScripts.length > 0 || WRITING_TOOLS.test(command) }
+    // A script or tool it runs may run git itself (a pull), out of sight of `headMove`. Every step is over
+    // here (each look above settled), so the copy is final.
+    return { snaps, failed, running, done, runsOthers: runScripts.length > 0 || WRITING_TOOLS.test(command), steps: frozen(stop.steps), dropped: stop.dropped }
   } catch (err) {
-    return stop.over ? undefined : shadowFailed($, 'before the command', err)
+    if (stop.over) return undefined
+    stop.recording = true
+    return shadowFailed($, 'before the command', err, stepsOf(stop, 'before'))
   }
 }
+
+/** The repositories that failed before the command, as a record's `repos` (none: nothing). */
+const failedBefore = (shadow: Shadow) => (shadow.failed.length > 0 ? { repos: shadow.failed.map(f => ({ repo: f.folder, failed: f.why })) } : {})
+
+/** What a record of an after look that did not finish keeps: what failed before it, and both looks' steps. */
+const shadowLate = (shadow: Shadow) => (stop: Stop): Record<string, unknown> => ({ ...failedBefore(shadow), ...stepsOf(stop, 'after', shadow) })
 
 /**
  * After the command: `git status` again, what changed (`changedBetween`, plus what a commit it made took
@@ -1291,24 +1404,22 @@ async function shadowBefore($: EngineInterface, command: string, powershell: boo
  */
 async function shadowAfter($: EngineInterface, shadow: Shadow, command: string, powershell: boolean, guessed: readonly string[], stop: Stop): Promise<void> {
   try {
-    const host = hostOf($)
+    const host = timedHost(hostOf($), stop)
     const { windows } = await pathsHere($)
     const full = (p: string) => isFullPath(p, windows)
     const placed = guessed.filter(full)
     const unplaced = guessed.filter(p => !full(p))
     const roots = shadow.snaps.map(s => s.repo)
-    const repos: Record<string, unknown>[] = shadow.failed.map(f => ({ repo: f.folder, failed: f.why }))
-    for (const before of shadow.snaps) {
+    // Each repository on its own and side by side (as before the command); its lines stay together, in order.
+    const compared = await Promise.all(shadow.snaps.map(async (before): Promise<Record<string, unknown>[]> => {
       const repo = before.repo
+      const repos: Record<string, unknown>[] = []
       try {
-        const after = await snapshot(host, (p, t) => lookAt($, p, t, stop), repo, before)
+        const after = await timed(stop, 'look', repo, () => snapshot(host, (p, t) => lookAt($, p, t, stop), repo, before))
         const read = headMove(command, before.state.head, after.state.head)
         // A commit beside a script or tool that may itself run git (a pull): the new commits may be others' work.
         const move = read === 'commit' && shadow.runsOthers ? 'other' : read
-        if (move === 'other') {
-          repos.push({ repo, skipped: 'a git command in it moves HEAD or brings in other work' })
-          continue
-        }
+        if (move === 'other') return [{ repo, skipped: 'a git command in it moves HEAD or brings in other work' }]
         const seen = changedBetween(before, after)
         if (move === 'commit' && before.state.head !== undefined && after.state.head !== undefined) {
           const files = (await committedFiles(host, repo, before.state.head, after.state.head)).filter(p => !seen.includes(p))
@@ -1335,7 +1446,10 @@ async function shadowAfter($: EngineInterface, shadow: Shadow, command: string, 
             })) each.add(hit)
           }
           const skipped = Math.max(0, names.length - SHADOW_PATHS)
-          if (refused + skipped > 0) repos.push({ repo, partial: `git would not say whether ${refused + skipped} name(s) are ignored (${whyOf(err)})` })
+          if (refused + skipped > 0) {
+            repos.push({ repo, partial: `git would not say whether ${refused + skipped} name(s) are ignored (${whyOf(err)})` })
+            sayShadowOnce($, `ignored ${reasonKind(whyOf(err))}`, `review-guard: git would not say which names it ignores in ${repo} (${whyOf(err)}); the shadow record marks that comparison partial`)
+          }
           return each
         })
         const notIgnored = guessOnly.filter(p => !ignored.has(rel.get(p) ?? ''))
@@ -1348,15 +1462,27 @@ async function shadowAfter($: EngineInterface, shadow: Shadow, command: string, 
         })
       } catch (err) {
         repos.push({ repo, failed: whyOf(err) })
+        sayShadowOnce($, `look after ${reasonKind(whyOf(err))}`, `review-guard: the shadow look could not read ${repo} after a command (${whyOf(err)}); the review is not affected`)
       }
-    }
+      return repos
+    }))
+    const repos: Record<string, unknown>[] = [...shadow.failed.map(f => ({ repo: f.folder, failed: f.why })), ...compared.flat()]
     // Other edits or commands under way while this one ran (or still), or a shell command left running
     // lately: their files may show as this one's.
     const others = shadow.running > 0 || writersRunning > 0 || writersDone - shadow.done > 1 || Date.now() - backgroundAt < BACKGROUND_WRITES_MS
     if (stop.over) return
-    await recordShadow($, { shell: powershell ? 'powershell' : 'bash', repos, unplaced: unplaced.length, ...(others ? { othersWriting: true } : {}) })
+    stop.recording = true
+    await recordShadow($, {
+      shell: powershell ? 'powershell' : 'bash',
+      repos,
+      unplaced: unplaced.length,
+      ...(others ? { othersWriting: true } : {}),
+      ...stepsOf(stop, 'after', shadow),
+    })
   } catch (err) {
-    if (!stop.over) await shadowFailed($, 'after the command', err)
+    if (stop.over) return
+    stop.recording = true
+    await shadowFailed($, 'after the command', err, shadowLate(shadow)(stop))
   }
 }
 
@@ -1370,6 +1496,8 @@ async function shadowAfter($: EngineInterface, shadow: Shadow, command: string, 
  * Never throws: it only remembers.
  */
 async function rememberShellWrites<R extends { deny?: unknown; result?: unknown }>($: EngineInterface, result: R, command: string, before: readonly Snapshot[], powershell: boolean, said?: string, agentId?: string, start?: Start, shadow?: Shadow): Promise<R> {
+  // Whether the after look ran (it records what failed before it): if not, those failures are recorded here.
+  let lookedAfter = false
   try {
     if (result.deny === undefined) {
       // A command that changes folder (`CHANGES_FOLDER`): its relative paths are not the session's. A shell
@@ -1406,11 +1534,20 @@ async function rememberShellWrites<R extends { deny?: unknown; result?: unknown 
       await sayLeftOut($, scratch, written.filter(path => onlyRun.has(path)), said, inScript)
       // The shadow look, once the review has what the guess found: recorded, never acted on.
       if (mayStillRun(result)) backgroundAt = Date.now()
-      else if (shadow !== undefined) await shadowInTime($, 'after the command', stop => shadowAfter($, shadow, command, powershell, [...kept, ...keep], stop).then(() => SHADOW_DONE))
+      else if (shadow !== undefined) {
+        lookedAfter = true
+        await shadowInTime($, 'after the command', stop => shadowAfter($, shadow, command, powershell, [...kept, ...keep], stop).then(() => SHADOW_DONE), shadowLate(shadow))
+      }
     }
   } catch (err) {
     // A command whose writes could not be read or recorded is one fewer file in the review, not a stopped command, but say so.
     say($, `review-guard: could not record the files a shell command wrote (${whyOf(err)}); ask for a review by hand`)
+  }
+  // No after look (the command was refused, may still be running, or its writes could not be read): what
+  // failed before it is recorded all the same.
+  if (shadow !== undefined && !lookedAfter && shadow.failed.length > 0) {
+    const why = result.deny !== undefined ? 'the command was refused' : mayStillRun(result) ? 'the command may still be running' : 'its writes could not be read'
+    await recordShadow($, { failed: `after the command: not looked at (${why})`, ...failedBefore(shadow), steps: { before: shadow.steps }, ...(shadow.dropped > 0 ? { stepsDropped: shadow.dropped } : {}) })
   }
   return result
 }
@@ -2069,7 +2206,7 @@ export const register: Register = on => {
     // Runs the command, then remembers what it wrote. Just before it runs: the repositories it may touch, for
     // the shadow look (`shadowBefore`, only when the guess can't be sure), after the guard's own checks.
     const run = async (said: string | undefined) => {
-      const shadow = await shadowInTime($, 'before the command', stop => shadowBefore($, e.command, powershell, e.run_in_background === true, before, stop))
+      const shadow = await shadowInTime($, 'before the command', stop => shadowBefore($, e.command, powershell, e.run_in_background === true, before, stop), stop => stepsOf(stop, 'before'))
       if (e.run_in_background === true) backgroundAt = Date.now() // it runs now, past its call
       return rememberShellWrites($, await asWriter(() => next(e)), e.command, before, powershell, said, e.agentId, start, shadow)
     }

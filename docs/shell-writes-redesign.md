@@ -1,13 +1,16 @@
 # Plan: find a shell command's writes by looking, not guessing
 
-Status: approved. Step 3, the shadow release, is built (0.5.0); the switch (step 4) waits on its record.
+Status: approved. Step 3, the shadow release, is built (0.5.0; 0.5.1 looks at both repositories side by
+side and records each step's time); the switch (step 4, now 0.5.2) waits on its record.
 What was built differs from the plan below in places, and `docs/review-cycle.md` ("Checking shell writes
 against git") describes it as it is:
 - It watches the session folder's repository and the one a leading `cd` goes into, but not repositories
   named by `git -C` or by full paths.
 - It gives up past 2,000 changed paths, not 50,000.
 - Nothing is cached per repository except the repository's root, so a status costs two runs of git
-  (the filter check, then the status).
+  (the filter check, then the status). The after look checks the filters again: the command may have
+  set one up without running it (a pull that changes an included config file), and the check is what
+  keeps git from running it.
 - It records every compared command, agreeing or not, in `~/.claude/review-guard/shadow.jsonl`, not
   only the ones that disagree, in the log.
 - It also looks when a formatter, a task runner or a PowerShell .NET call runs.
@@ -121,7 +124,7 @@ for plain commands, where it is cheap and right.
 3. **Shadow release (0.5.0):** wire it into the Bash/PowerShell hook, but keep using the guess. For a few
    days of normal work, log each command where the snapshot and the guess disagree to the review-guard
    log (which files, never their text).
-4. **Switch (0.5.1):** once the log shows only the guess's known misses, combine as in "How it works"
+4. **Switch (0.5.2):** once the log shows only the guess's known misses, combine as in "How it works"
    step 3.
 5. **Tests,** with `process.run` mocked:
    - a cd into another repo;
